@@ -27,6 +27,8 @@ else
     install -m 644 "$source_dir/$file" "$plugin_dir/$file"
   done
   install -m 755 "$source_dir/bin/eld-unifi-protect" "$plugin_dir/bin/eld-unifi-protect"
+  mkdir -p "$plugin_dir/mpv"
+  install -m 644 "$source_dir/mpv/input.conf" "$plugin_dir/mpv/input.conf"
   mkdir -p "$plugin_dir/wall"
   install -m 644 "$source_dir/wall/shell.qml" "$plugin_dir/wall/shell.qml"
 fi
