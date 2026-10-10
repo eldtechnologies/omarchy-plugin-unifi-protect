@@ -10,6 +10,7 @@ authenticated with a console API key (X-API-KEY).
 """
 
 import argparse
+import base64
 import asyncio
 import fcntl
 import getpass
@@ -708,6 +709,327 @@ def is_complete_jpeg(data):
     return bool(data) and data[:2] == b"\xff\xd8" and data.rstrip(b"\x00")[-2:] == b"\xff\xd9"
 
 
+# ---- alerts --------------------------------------------------------------
+#
+# Protect publishes events (motion, smart detections, doorbell rings) on a
+# WebSocket of the Integration API. The `events` listener holds one such
+# connection per console that has an armed camera, over the same pinned TLS
+# as every other request, and records matching events in alerts.json for
+# the bar and panel. It only listens: detection itself is configured in
+# Protect, per camera.
+
+ALERT_TRIGGERS = ("person", "vehicle", "animal", "package", "ring", "motion")
+DEFAULT_TRIGGERS = ["person", "vehicle", "ring"]
+SMART_EVENT_TYPES = ("smartDetectZone", "smartDetectLine", "smartDetectLoiter")
+EVENTS_WS_PATH = API_BASE + "/subscribe/events"
+ALERTS_PATH = os.path.join(RUNTIME_DIR, "alerts.json")
+ALERTS_ACK_PATH = os.path.join(RUNTIME_DIR, "alerts-ack.json")
+EVENTS_LOCK = os.path.join(RUNTIME_DIR, "events.lock")
+ALERTS_KEEP = 50
+ALERTS_MAX_AGE = 24 * 3600
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def alert_kind(event, triggers):
+    """The armed trigger an event matches, or None."""
+    kind = event.get("type")
+    if kind == "ring":
+        return "ring" if "ring" in triggers else None
+    if kind == "motion":
+        return "motion" if "motion" in triggers else None
+    if kind in SMART_EVENT_TYPES:
+        for detected in event.get("smartDetectTypes") or []:
+            if detected in triggers:
+                return detected
+    return None
+
+
+def event_time(value):
+    """Protect timestamps are epoch milliseconds; return epoch seconds."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value / 1000 if value > 1e11 else value
+
+
+def ws_frame(opcode, payload=b""):
+    """One client-to-server frame. Clients must mask what they send."""
+    mask = os.urandom(4)
+    length = len(payload)
+    if length < 126:
+        header = bytes([0x80 | opcode, 0x80 | length])
+    elif length < 65536:
+        header = bytes([0x80 | opcode, 0x80 | 126]) + length.to_bytes(2, "big")
+    else:
+        header = bytes([0x80 | opcode, 0x80 | 127]) + length.to_bytes(8, "big")
+    return header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+async def ws_open(console, path, timeout=10):
+    """Open a WebSocket to a console over pinned TLS, authenticated by API key."""
+    if not console.get("apiKey"):
+        raise ProtectError(console.get("keyError", "no API key configured"))
+    name, port = split_host(console["host"])
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(name, port, ssl=context, server_hostname=name), timeout)
+    der = writer.get_extra_info("ssl_object").getpeercert(binary_form=True)
+    if hashlib.sha256(der).hexdigest() != console.get("certSha256"):
+        writer.close()
+        raise ProtectError("console certificate changed; if expected, run `eld-unifi-protect trust-cert`")
+    key = base64.b64encode(os.urandom(16)).decode()
+    writer.write((f"GET {path} HTTP/1.1\r\nHost: {name}\r\nUpgrade: websocket\r\n"
+                  f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                  f"Sec-WebSocket-Version: 13\r\nX-API-KEY: {console['apiKey']}\r\n\r\n").encode())
+    await writer.drain()
+    head = (await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout)).decode("latin-1")
+    lines = head.split("\r\n")
+    status = lines[0].split(" ")
+    if len(status) < 2 or status[1] != "101":
+        writer.close()
+        if len(status) > 1 and status[1] in ("401", "403"):
+            raise ProtectError("console rejected the API key for events")
+        raise ProtectError(f"event stream refused: {lines[0]}")
+    expected = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+    accept = next((l.split(":", 1)[1].strip() for l in lines[1:]
+                   if l.lower().startswith("sec-websocket-accept:")), "")
+    if accept != expected:
+        writer.close()
+        raise ProtectError("event stream handshake failed")
+    return reader, writer
+
+
+async def ws_messages(reader, writer, idle=60):
+    """Yield text messages; answer pings; stop on close.
+
+    If nothing arrives for `idle` seconds, ping once; a second silent
+    period means the connection is dead and raises TimeoutError.
+    """
+    fragments = bytearray()
+    pinged = False
+    while True:
+        try:
+            head = await asyncio.wait_for(reader.readexactly(2), idle)
+        except asyncio.TimeoutError:
+            if pinged:
+                raise
+            writer.write(ws_frame(0x9, b"keepalive"))
+            await writer.drain()
+            pinged = True
+            continue
+        pinged = False
+        fin, opcode = head[0] & 0x80, head[0] & 0x0F
+        masked, length = head[1] & 0x80, head[1] & 0x7F
+        if length == 126:
+            length = int.from_bytes(await reader.readexactly(2), "big")
+        elif length == 127:
+            length = int.from_bytes(await reader.readexactly(8), "big")
+        if length > 1 << 20:
+            raise ProtectError("event message too large")
+        mask = await reader.readexactly(4) if masked else None
+        payload = await reader.readexactly(length)
+        if mask:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        if opcode == 0x9:
+            writer.write(ws_frame(0xA, payload))
+            await writer.drain()
+        elif opcode == 0x8:
+            return
+        elif opcode in (0x0, 0x1):
+            fragments += payload
+            if fin:
+                text, fragments = fragments.decode("utf-8", "replace"), bytearray()
+                yield text
+
+
+def armed_cameras(config, prefs):
+    """console id -> {camera id: camera summary} for armed cameras.
+
+    Read from the last camera list, so the listener needs no extra API
+    calls; arming a camera polls first, so the list is current.
+    """
+    armed = {}
+    for camera in previous_state().get("cameras", []):
+        triggers = prefs["alerts"].get(camera_key(camera))
+        if triggers:
+            armed.setdefault(camera["console"], {})[camera["id"]] = dict(camera, alerts=triggers)
+    known = {c["id"] for c in config["consoles"]}
+    return {k: v for k, v in armed.items() if k in known}
+
+
+def load_alerts():
+    try:
+        with open(ALERTS_PATH) as handle:
+            return json.load(handle).get("alerts", [])
+    except (OSError, ValueError):
+        return []
+
+
+class AlertListener:
+    def __init__(self, follow_parent=False):
+        self.parent = os.getppid() if follow_parent else None
+        self.alerts = load_alerts()
+        self.status = {}
+        self.event_cameras = {}      # event id -> camera id, for sparse updates
+        self.armed = {}
+        self.config = None
+        self.prefs_stamp = None
+        self.tasks = {}
+
+    def refresh(self):
+        """Re-read config and arming when cameras.json has changed."""
+        try:
+            stamp = os.stat(PREFS_PATH).st_mtime_ns
+        except OSError:
+            stamp = None
+        if stamp == self.prefs_stamp and self.config is not None:
+            return
+        self.prefs_stamp = stamp
+        self.config = load_config() or {"consoles": []}
+        self.armed = armed_cameras(self.config, load_prefs())
+
+    def save(self):
+        cutoff = time.time() - ALERTS_MAX_AGE
+        self.alerts = [a for a in self.alerts if (a.get("start") or 0) > cutoff][-ALERTS_KEEP:]
+        write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": self.alerts,
+                                 "consoles": self.status})
+
+    def handle(self, console_id, message):
+        item = message.get("item") or {}
+        if item.get("modelKey", "event") != "event" or not item.get("id"):
+            return
+        event_id = str(item["id"])
+        camera_id = item.get("device") or self.event_cameras.get(event_id)
+        if not camera_id:
+            return
+        self.event_cameras[event_id] = camera_id
+        if len(self.event_cameras) > 1000:
+            self.event_cameras.pop(next(iter(self.event_cameras)))
+        self.refresh()
+        camera = self.armed.get(console_id, {}).get(camera_id)
+        existing = next((a for a in self.alerts if a["id"] == event_id), None)
+        kind = alert_kind(item, camera["alerts"]) if camera else None
+        changed = False
+        if kind and existing is None:
+            # Smart detections often arrive as an empty "add" followed by an
+            # "update" naming what was seen, so either can open an alert.
+            existing = {
+                "id": event_id, "uid": camera["uid"], "camera": camera["name"],
+                "consoleName": camera["consoleName"], "kind": kind,
+                "start": event_time(item.get("start")) or time.time(), "end": None,
+            }
+            self.alerts.append(existing)
+            changed = True
+        if existing is not None and item.get("end") and not existing.get("end"):
+            existing["end"] = event_time(item["end"])
+            changed = True
+        if changed:
+            self.save()
+
+    async def watch_console(self, console_id):
+        backoff = 2
+        while True:
+            console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
+            if console is None:
+                return
+            try:
+                reader, writer = await ws_open(console, EVENTS_WS_PATH)
+                self.status[console_id] = {"connected": True, "error": None}
+                self.save()
+                backoff = 2
+                try:
+                    async for text in ws_messages(reader, writer):
+                        try:
+                            self.handle(console_id, json.loads(text))
+                        except ValueError:
+                            continue
+                finally:
+                    writer.close()
+                error = "event stream closed"
+            except (OSError, ProtectError, asyncio.TimeoutError, asyncio.IncompleteReadError,
+                    asyncio.LimitOverrunError) as exc:
+                error = str(exc) or type(exc).__name__
+            self.status[console_id] = {"connected": False, "error": error}
+            self.save()
+            await asyncio.sleep(backoff)
+            backoff = min(60, backoff * 2)
+
+    async def run(self):
+        while True:
+            if self.parent is not None and os.getppid() != self.parent:
+                return  # the shell that started us is gone
+            self.refresh()
+            if not self.armed:
+                self.status = {}
+                self.save()
+                return  # nothing armed: nothing to listen for
+            for console_id in self.armed:
+                if console_id not in self.tasks or self.tasks[console_id].done():
+                    self.tasks[console_id] = asyncio.create_task(self.watch_console(console_id))
+            for console_id in list(self.tasks):
+                if console_id not in self.armed:
+                    self.tasks.pop(console_id).cancel()
+                    self.status.pop(console_id, None)
+            await asyncio.sleep(5)
+
+
+def cmd_events(args):
+    """Listen for alerts on armed cameras until none are armed."""
+    lock = open(EVENTS_LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return  # another listener is already running
+    try:
+        asyncio.run(AlertListener(follow_parent=args.follow_parent).run())
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_alert(args):
+    prefs = load_prefs()
+    if args.ack:
+        write_json(ALERTS_ACK_PATH, {"ackedAt": time.time()})
+        return
+    if args.notify:
+        prefs["notify"] = args.notify == "on"
+        save_prefs(prefs)
+        print("alert notifications " + ("on" if prefs["notify"] else "off"))
+        return
+    if not args.camera:
+        state = poll_cameras(require_config())
+        armed = [c for c in state["cameras"] if c.get("alerts")]
+        if not armed:
+            print("no cameras armed; arm one with: eld-unifi-protect alert <camera>")
+        for camera in armed:
+            print(f"{camera['name']}  ·  {camera['consoleName']}: {', '.join(camera['alerts'])}")
+        for alert in load_alerts()[-10:]:
+            when = time.strftime("%H:%M:%S", time.localtime(alert["start"]))
+            print(f"  {when}  {alert['kind']:8} {alert['camera']}")
+        return
+    state = poll_cameras(require_config())
+    matches = find_cameras(state["cameras"], args.camera)
+    if len(matches) != 1:
+        raise ProtectError(f"{args.camera!r} matches {len(matches)} cameras; use its id "
+                           "from `eld-unifi-protect cameras`")
+    camera = matches[0]
+    if args.off:
+        prefs["alerts"].pop(camera_key(camera), None)
+        print(f"alerts off: {camera['name']}")
+    else:
+        triggers = [t.strip() for t in (args.on or ",".join(DEFAULT_TRIGGERS)).split(",") if t.strip()]
+        unknown = [t for t in triggers if t not in ALERT_TRIGGERS]
+        if unknown:
+            raise ProtectError(f"unknown trigger {unknown[0]!r}; choose from {', '.join(ALERT_TRIGGERS)}")
+        prefs["alerts"][camera_key(camera)] = triggers
+        print(f"alerts on: {camera['name']} ({', '.join(triggers)})")
+    save_prefs(prefs)
+    poll_cameras()
+
+
 class Protect:
     def __init__(self, console, config=None):
         self.console = console
@@ -892,7 +1214,11 @@ def load_prefs():
     return {"hideOffline": bool(prefs.get("hideOffline", False)),
             "hidden": list(prefs.get("hidden", [])),
             "readOnly": bool(prefs.get("readOnly", False)),
-            "favorite": str(prefs.get("favorite") or "")}
+            "favorite": str(prefs.get("favorite") or ""),
+            # Armed cameras: camera key (MAC) -> list of triggers.
+            "alerts": {str(k): [t for t in v if t in ALERT_TRIGGERS]
+                       for k, v in dict(prefs.get("alerts") or {}).items()},
+            "notify": bool(prefs.get("notify", True))}
 
 
 def save_prefs(prefs):
@@ -909,6 +1235,7 @@ def apply_prefs(cameras, prefs):
     for camera in cameras:
         camera["hidden"] = camera_key(camera) in hidden
         camera["favorite"] = bool(favorite) and camera_key(camera) == favorite
+        camera["alerts"] = list(prefs.get("alerts", {}).get(camera_key(camera), []))
     # The favourite leads the grid and the keyboard order.
     cameras.sort(key=lambda c: not c["favorite"])
     return cameras
@@ -1703,6 +2030,17 @@ def main():
     p = sub.add_parser("read-only", help="never change anything on the consoles (no enabling streams)")
     p.add_argument("mode", choices=("on", "off", "status"), nargs="?", default="status")
     p.set_defaults(func=cmd_read_only)
+    p = sub.add_parser("alert", help="arm a camera for alerts, list armed cameras, or --ack")
+    p.add_argument("camera", nargs="?")
+    p.add_argument("--on", help=f"comma-separated triggers ({', '.join(ALERT_TRIGGERS)}); "
+                                f"default {','.join(DEFAULT_TRIGGERS)}")
+    p.add_argument("--off", action="store_true", help="disarm the camera")
+    p.add_argument("--ack", action="store_true", help="acknowledge all current alerts")
+    p.add_argument("--notify", choices=("on", "off"), help="desktop notifications for alerts")
+    p.set_defaults(func=cmd_alert)
+    p = sub.add_parser("events", help="listen for alerts on armed cameras (started by the panel)")
+    p.add_argument("--follow-parent", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_events)
     p = sub.add_parser("favorite", help="set the camera the panel opens on (or --clear)")
     p.add_argument("camera", nargs="?")
     p.add_argument("--clear", action="store_true")
