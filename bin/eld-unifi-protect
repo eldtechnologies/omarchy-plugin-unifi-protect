@@ -904,10 +904,11 @@ def camera_key(camera):
 
 
 def apply_prefs(cameras, prefs):
-    hidden = set(prefs["hidden"])
+    hidden = set(prefs.get("hidden", []))
+    favorite = prefs.get("favorite", "")
     for camera in cameras:
         camera["hidden"] = camera_key(camera) in hidden
-        camera["favorite"] = bool(prefs["favorite"]) and camera_key(camera) == prefs["favorite"]
+        camera["favorite"] = bool(favorite) and camera_key(camera) == favorite
     # The favourite leads the grid and the keyboard order.
     cameras.sort(key=lambda c: not c["favorite"])
     return cameras
