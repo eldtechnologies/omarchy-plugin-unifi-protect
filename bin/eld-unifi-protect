@@ -726,6 +726,9 @@ ALERTS_PATH = os.path.join(RUNTIME_DIR, "alerts.json")
 ALERTS_ACK_PATH = os.path.join(RUNTIME_DIR, "alerts-ack.json")
 EVENTS_LOCK = os.path.join(RUNTIME_DIR, "events.lock")
 ALERTS_KEEP = 50
+ALERT_IMAGES_DIR = os.path.join(RUNTIME_DIR, "alerts")
+NOTIFY_EVERY = 60   # seconds; at most one notification per camera per minute
+PLUGIN_ID = "com.eldtechnologies.unifi-protect"
 ALERTS_MAX_AGE = 24 * 3600
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -878,6 +881,8 @@ class AlertListener:
         self.config = None
         self.prefs_stamp = None
         self.tasks = {}
+        self.notify_enabled = True
+        self.last_notified = {}      # camera uid -> time of its last notification
 
     def refresh(self):
         """Re-read config and arming when cameras.json has changed."""
@@ -889,7 +894,9 @@ class AlertListener:
             return
         self.prefs_stamp = stamp
         self.config = load_config() or {"consoles": []}
-        self.armed = armed_cameras(self.config, load_prefs())
+        prefs = load_prefs()
+        self.armed = armed_cameras(self.config, prefs)
+        self.notify_enabled = prefs["notify"]
 
     def save(self):
         cutoff = time.time() - ALERTS_MAX_AGE
@@ -923,11 +930,62 @@ class AlertListener:
             }
             self.alerts.append(existing)
             changed = True
+            self.notify(console_id, camera, existing)
         if existing is not None and item.get("end") and not existing.get("end"):
             existing["end"] = event_time(item["end"])
             changed = True
         if changed:
             self.save()
+
+    def notify(self, console_id, camera, alert):
+        """Desktop notification for a new alert, at most once a minute per camera."""
+        if not self.notify_enabled or not shutil.which("notify-send"):
+            return
+        now = time.time()
+        if now - self.last_notified.get(camera["uid"], 0) < NOTIFY_EVERY:
+            return
+        self.last_notified[camera["uid"]] = now
+        console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
+        try:
+            asyncio.get_running_loop().create_task(self.send_notification(console, camera, alert))
+        except RuntimeError:
+            pass  # no event loop (called outside the listener)
+
+    async def send_notification(self, console, camera, alert):
+        image = ""
+        if console is not None:
+            # A frame from the moment of the alert, as the notification's picture.
+            try:
+                data = await asyncio.to_thread(
+                    lambda: Protect(console, self.config).snapshot(camera["id"]))
+                os.makedirs(ALERT_IMAGES_DIR, mode=0o700, exist_ok=True)
+                image = os.path.join(ALERT_IMAGES_DIR, f"{alert['id']}.jpg")
+                write_atomic(image, data)
+                old = sorted(os.scandir(ALERT_IMAGES_DIR), key=lambda e: e.stat().st_mtime)
+                for entry in old[:-20]:
+                    os.remove(entry.path)
+            except (ProtectError, OSError):
+                image = ""
+        what = {"person": "Person", "vehicle": "Vehicle", "animal": "Animal",
+                "package": "Package", "ring": "Doorbell", "motion": "Motion"}.get(alert["kind"], alert["kind"])
+        summary = f"Doorbell at {camera['name']}" if alert["kind"] == "ring" else f"{what} at {camera['name']}"
+        body = f"{camera['consoleName']} · {time.strftime('%H:%M', time.localtime(alert['start']))}"
+        command = ["notify-send", "--app-name=UniFi Protect", "--urgency=normal",
+                   "--action=live=Watch live", "--wait"]
+        if image:
+            command.append(f"--hint=string:image-path:file://{image}")
+        command += [summary, body]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            chosen = (await process.communicate())[0].decode().strip()
+        except OSError:
+            return
+        if chosen == "live" and shutil.which("omarchy-shell"):
+            # Open the panel on this camera's live view.
+            await asyncio.create_subprocess_exec(
+                "omarchy-shell", PLUGIN_ID, "live", camera["uid"],
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
 
     async def watch_console(self, console_id):
         backoff = 2
@@ -997,6 +1055,7 @@ def cmd_alert(args):
     if args.notify:
         prefs["notify"] = args.notify == "on"
         save_prefs(prefs)
+        poll_cameras()   # the panel reads the setting from the state file
         print("alert notifications " + ("on" if prefs["notify"] else "off"))
         return
     if not args.camera:
@@ -1346,6 +1405,7 @@ def poll_cameras(config=None):
         "error": "; ".join(errors) if errors else None,
         "consoles": summaries,
         "hideOffline": load_prefs()["hideOffline"],
+        "alertNotify": load_prefs()["notify"],
         "cameras": apply_prefs(merge_cameras(cameras), load_prefs()),
     }
     write_json(STATE_PATH, state)
