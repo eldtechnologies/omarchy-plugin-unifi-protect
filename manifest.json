@@ -19,21 +19,41 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "snapshotIntervalSec": 3,
       "columns": 2,
       "liveQuality": "medium",
       "popoutQuality": "high",
-      "wallMode": "window"
+      "wallMode": "window",
+      "refresh": "balanced",
+      "framing": "fill",
+      "openFavoriteLive": false
     },
     "schema": [
       {
-        "key": "snapshotIntervalSec",
-        "type": "integer",
-        "label": "Snapshot refresh while the panel is open (seconds)",
-        "min": 1,
-        "max": 60,
-        "step": 1,
-        "defaultValue": 3
+        "key": "refresh",
+        "type": "enum",
+        "label": "Snapshot refresh while the panel is open",
+        "options": [
+          "fast",
+          "balanced",
+          "efficient"
+        ],
+        "defaultValue": "balanced"
+      },
+      {
+        "key": "framing",
+        "type": "enum",
+        "label": "Picture framing (fill crops to the tile, fit shows it all)",
+        "options": [
+          "fill",
+          "fit"
+        ],
+        "defaultValue": "fill"
+      },
+      {
+        "key": "openFavoriteLive",
+        "type": "boolean",
+        "label": "Open straight into the favourite camera's live view",
+        "defaultValue": false
       },
       {
         "key": "columns",

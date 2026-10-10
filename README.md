@@ -123,6 +123,18 @@ It opens in one of two modes, set with `wallMode`:
 The wall runs as its own Quickshell process, not inside the Omarchy shell, so
 a video decoder fault can never take down the bar or the lock screen.
 
+### Favourite camera
+
+Hover a tile and click the star to make it your favourite. It moves to the
+front of the grid and is selected whenever the panel opens; with
+`openFavoriteLive` the panel opens straight into its live view. Like hiding,
+it follows the camera by MAC address.
+
+```bash
+eld-unifi-protect favorite "Front Door"
+eld-unifi-protect favorite --clear
+```
+
 ### Hiding cameras
 
 Hover a tile and click the crossed-out eye to hide that camera. **Hide
@@ -169,7 +181,9 @@ Widget settings live in `~/.config/omarchy/shell.json` and reload on save:
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `snapshotIntervalSec` | `3` | Snapshot refresh while the panel is open |
+| `refresh` | `balanced` | Snapshot refresh while the panel is open: `fast` (1 s), `balanced` (3 s), `efficient` (10 s). An explicit `snapshotIntervalSec` overrides it |
+| `framing` | `fill` | `fill` crops pictures to the tile; `fit` shows the whole picture, letterboxed |
+| `openFavoriteLive` | `false` | Open the panel straight into the favourite camera's live view |
 | `columns` | `2` | Grid columns |
 | `liveQuality` | `medium` | Stream for the in-panel live view |
 | `popoutQuality` | `high` | Stream for the mpv window |

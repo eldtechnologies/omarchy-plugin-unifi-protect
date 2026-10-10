@@ -891,7 +891,8 @@ def load_prefs():
         prefs = {}
     return {"hideOffline": bool(prefs.get("hideOffline", False)),
             "hidden": list(prefs.get("hidden", [])),
-            "readOnly": bool(prefs.get("readOnly", False))}
+            "readOnly": bool(prefs.get("readOnly", False)),
+            "favorite": str(prefs.get("favorite") or "")}
 
 
 def save_prefs(prefs):
@@ -903,9 +904,13 @@ def camera_key(camera):
 
 
 def apply_prefs(cameras, prefs):
-    hidden = set(prefs["hidden"])
+    hidden = set(prefs.get("hidden", []))
+    favorite = prefs.get("favorite", "")
     for camera in cameras:
         camera["hidden"] = camera_key(camera) in hidden
+        camera["favorite"] = bool(favorite) and camera_key(camera) == favorite
+    # The favourite leads the grid and the keyboard order.
+    cameras.sort(key=lambda c: not c["favorite"])
     return cameras
 
 
@@ -1475,6 +1480,25 @@ def cmd_read_only(args):
         print("read-only: off; the plugin enables a camera's stream when one is needed")
 
 
+def cmd_favorite(args):
+    prefs = load_prefs()
+    if args.clear or not args.camera:
+        prefs["favorite"] = ""
+        save_prefs(prefs)
+        poll_cameras()
+        print("no favourite camera")
+        return
+    state = poll_cameras(require_config())
+    matches = find_cameras(state["cameras"], args.camera)
+    if len(matches) != 1:
+        raise ProtectError(f"{args.camera!r} matches {len(matches)} cameras; use its id "
+                           "from `eld-unifi-protect cameras`")
+    prefs["favorite"] = camera_key(matches[0])
+    save_prefs(prefs)
+    poll_cameras()
+    print(f"favourite: {matches[0]['name']}  ·  {matches[0]['consoleName']}")
+
+
 def cmd_hide_offline(args):
     prefs = load_prefs()
     if args.mode == "toggle":
@@ -1679,6 +1703,10 @@ def main():
     p = sub.add_parser("read-only", help="never change anything on the consoles (no enabling streams)")
     p.add_argument("mode", choices=("on", "off", "status"), nargs="?", default="status")
     p.set_defaults(func=cmd_read_only)
+    p = sub.add_parser("favorite", help="set the camera the panel opens on (or --clear)")
+    p.add_argument("camera", nargs="?")
+    p.add_argument("--clear", action="store_true")
+    p.set_defaults(func=cmd_favorite)
     p = sub.add_parser("hide-offline", help="hide cameras that are offline")
     p.add_argument("mode", choices=("on", "off", "toggle"))
     p.set_defaults(func=cmd_hide_offline)

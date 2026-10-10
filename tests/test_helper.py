@@ -55,6 +55,12 @@ class Cameras(unittest.TestCase):
         h.apply_prefs(cams, {"hideOffline": False, "hidden": ["aa"]})
         self.assertEqual([c["hidden"] for c in cams], [True, False])
 
+    def test_favourite_is_flagged_and_leads(self):
+        cams = [camera("nvr", "a", "Gate", "AA"), camera("nvr", "b", "Patio", "BB")]
+        h.apply_prefs(cams, {"hidden": [], "favorite": "bb"})
+        self.assertEqual([(c["name"], c["favorite"]) for c in cams],
+                         [("Patio", True), ("Gate", False)])
+
     def test_find_cameras_by_uid_id_mac_or_name(self):
         cams = [camera("nvr", "abc", "Front Door", "AA:BB")]
         for wanted in ("nvr_abc", "abc", "aa:bb", "front door"):
