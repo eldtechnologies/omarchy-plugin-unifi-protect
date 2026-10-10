@@ -22,7 +22,8 @@
       "snapshotIntervalSec": 3,
       "columns": 2,
       "liveQuality": "medium",
-      "popoutQuality": "high"
+      "popoutQuality": "high",
+      "wallMode": "window"
     },
     "schema": [
       {
@@ -54,6 +55,16 @@
         "type": "string",
         "label": "Pop-out player quality (high, medium, low)",
         "defaultValue": "high"
+      },
+      {
+        "key": "wallMode",
+        "type": "enum",
+        "label": "Camera wall",
+        "options": [
+          "window",
+          "overlay"
+        ],
+        "defaultValue": "window"
       }
     ]
   },

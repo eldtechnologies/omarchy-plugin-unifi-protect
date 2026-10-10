@@ -101,11 +101,22 @@ eld-unifi-protect remove nvr
 
 ### Camera wall
 
-**Wall** in the panel header, or `W`, shows every visible camera live, full
-screen, on the focused monitor. Click a camera or press `1`–`9` to enlarge it
-at high quality. ←/→ flips cameras, `M` toggles sound, Esc goes back to the
-grid, and Esc (or `Q`) again closes the wall. Streams that drop reconnect on
-their own.
+**Wall** in the panel header, or `W`, shows every visible camera live. Click
+a camera or press `1`–`9` to enlarge it at high quality. ←/→ flips cameras,
+`M` toggles sound, Esc goes back to the grid, and Esc (or `Q`) again closes
+the wall. Streams that drop reconnect on their own.
+
+It opens in one of two modes, set with `wallMode`:
+
+- **`window`** (default): a maximized window. It keeps the bar visible and
+  stays on its workspace, so Super+number switches away and back while the
+  cameras keep running. On Hyprland the plugin registers a runtime rule that
+  maximizes only this window (matched by its title, "UniFi Protect Wall"); it
+  writes nothing to your config.
+- **`overlay`**: covers the whole screen, above every workspace, and holds the
+  keyboard until you close it. Good for a dedicated monitoring screen.
+
+`eld-unifi-protect wall --mode overlay` picks a mode for one launch.
 
 The wall runs as its own Quickshell process, not inside the Omarchy shell, so
 a video decoder fault can never take down the bar or the lock screen.
@@ -138,6 +149,7 @@ For example, in `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("SUPER + SHIFT + C", "Camera wall", "eld-unifi-protect wall")
+o.bind("SUPER + SHIFT + ALT + C", "Camera wall (overlay)", "eld-unifi-protect wall --mode overlay")
 ```
 
 The mpv window uses the app id `eld-unifi-protect`, for window rules.
@@ -152,6 +164,7 @@ Widget settings live in `~/.config/omarchy/shell.json` and reload on save:
 | `columns` | `2` | Grid columns |
 | `liveQuality` | `medium` | Stream for the in-panel live view |
 | `popoutQuality` | `high` | Stream for the mpv window |
+| `wallMode` | `window` | Camera wall as a maximized `window` or a full-screen `overlay` |
 
 ```json
 { "id": "com.eldtechnologies.unifi-protect", "columns": 3, "liveQuality": "high" }

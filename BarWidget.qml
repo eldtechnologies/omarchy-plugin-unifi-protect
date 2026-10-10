@@ -72,7 +72,8 @@ BarWidget {
     // Fullscreen grid of every visible camera; calling again closes it.
     function wall(): void {
       Quickshell.execDetached([decodeURIComponent(String(Qt.resolvedUrl("bin/eld-unifi-protect"))
-                                 .replace("file://", "")), "wall"])
+                                 .replace("file://", "")), "wall", "--mode",
+                               root.setting("wallMode", "window") === "overlay" ? "overlay" : "window"])
     }
     // Jump straight into a camera's live view, e.g. from a keybinding:
     //   omarchy-shell com.eldtechnologies.unifi-protect live "Front Door"
