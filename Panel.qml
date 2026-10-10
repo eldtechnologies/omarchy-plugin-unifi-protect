@@ -27,7 +27,10 @@ Panel {
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateHome: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
   readonly property string statePath: stateHome + "/eld-unifi-protect/state.json"
-  readonly property string runtimeDir: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/eld-unifi-protect"
+  // No shared fallback such as /tmp: the helper refuses to run without the
+  // private runtime directory, so there would be nothing to read there.
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR")
+                                       ? Quickshell.env("XDG_RUNTIME_DIR") + "/eld-unifi-protect" : ""
   readonly property string snapDir: runtimeDir + "/snapshots"
   readonly property string pluginDir: decodeURIComponent(
     String(Qt.resolvedUrl(".")).replace("file://", ""))
