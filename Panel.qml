@@ -36,7 +36,17 @@ Panel {
     String(Qt.resolvedUrl(".")).replace("file://", ""))
   readonly property string cli: pluginDir + "bin/eld-unifi-protect"
 
-  readonly property int snapshotSeconds: Math.max(1, setting("snapshotIntervalSec", 3))
+  // Presets for the settings UI. An explicit snapshotIntervalSec in
+  // shell.json (the older setting) still wins.
+  readonly property int snapshotSeconds: {
+    var explicit = Number(setting("snapshotIntervalSec", 0))
+    if (explicit > 0) return Math.max(1, explicit)
+    var preset = setting("refresh", "balanced")
+    return preset === "fast" ? 1 : preset === "efficient" ? 10 : 3
+  }
+  // fill: crop the picture to the tile; fit: show all of it, letterboxed.
+  readonly property bool framingFill: setting("framing", "fill") !== "fit"
+  readonly property bool openFavoriteLive: setting("openFavoriteLive", false) === true
   readonly property int columns: Math.max(1, Math.min(4, setting("columns", 2)))
   readonly property string liveQuality: validQuality(setting("liveQuality", "medium"), "medium")
   readonly property string popoutQuality: validQuality(setting("popoutQuality", "high"), "high")
@@ -186,6 +196,11 @@ Panel {
     var args = [root.cli, "open"]
     if (camera && camera.console) args.push(camera.console)
     Quickshell.execDetached(args)
+  }
+
+  function setFavorite(camera, favorite) {
+    Quickshell.execDetached(favorite ? [root.cli, "favorite", camera.uid]
+                                     : [root.cli, "favorite", "--clear"])
   }
 
   function hideCamera(camera, hide) {
@@ -369,6 +384,11 @@ Panel {
       root.reloadState()
       indexFile.reload()
       if (root.selectedIndex >= cameras.length) root.selectedIndex = 0
+      // The favourite sorts first; select it, and optionally go live.
+      if (cameras.length && cameras[0].favorite) {
+        root.selectedIndex = 0
+        if (root.openFavoriteLive && cameras[0].online) root.openLive(cameras[0])
+      }
     } else {
       root.closeLive()
       root.showHidden = false
@@ -469,7 +489,7 @@ Panel {
     Image {
       id: imageA
       anchors.fill: parent
-      fillMode: Image.PreserveAspectCrop
+      fillMode: root.framingFill ? Image.PreserveAspectCrop : Image.PreserveAspectFit
       asynchronous: true
       cache: false
       sourceSize.width: 960
@@ -480,7 +500,7 @@ Panel {
     Image {
       id: imageB
       anchors.fill: parent
-      fillMode: Image.PreserveAspectCrop
+      fillMode: root.framingFill ? Image.PreserveAspectCrop : Image.PreserveAspectFit
       asynchronous: true
       cache: false
       sourceSize.width: 960
@@ -642,7 +662,7 @@ Panel {
             VideoOutput {
               id: videoOutput
               anchors.fill: parent
-              fillMode: VideoOutput.PreserveAspectFit
+              fillMode: root.framingFill ? VideoOutput.PreserveAspectCrop : VideoOutput.PreserveAspectFit
             }
 
             Text {
@@ -1043,11 +1063,12 @@ Panel {
 
                   Text {
                     anchors.left: parent.left
-                    anchors.right: hideButton.left
+                    anchors.right: starButton.left
                     anchors.bottom: parent.bottom
                     anchors.margins: Style.space(8)
                     textFormat: Text.PlainText
-                    text: (tile.index < 9 ? (tile.index + 1) + "  " : "") + tile.modelData.name
+                    text: (tile.index < 9 ? (tile.index + 1) + "  " : "")
+                        + (tile.modelData.favorite ? "★ " : "") + tile.modelData.name
                         + (root.multiConsole ? "  ·  " + tile.modelData.consoleName : "")
                     color: "white"
                     font.family: root.fontFamily
@@ -1063,6 +1084,23 @@ Panel {
                     cursorShape: Qt.PointingHandCursor
                     onEntered: root.selectedIndex = tile.index
                     onClicked: root.openLive(tile.modelData)
+                  }
+
+                  PanelActionButton {
+                    id: starButton
+                    anchors.right: hideButton.visible ? hideButton.left
+                                 : (popButton.visible ? popButton.left : parent.right)
+                    anchors.bottom: parent.bottom
+                    anchors.margins: Style.space(4)
+                    property bool pointerInside: false
+                    opacity: tileMouse.containsMouse || pointerInside ? 1 : 0
+                    onHovered: function(isHovered) { pointerInside = isHovered }
+                    iconText: tile.modelData.favorite ? "\uf005" : "\uf006"
+                    tooltipText: tile.modelData.favorite ? "Unset favourite"
+                                 : "Open the panel on " + tile.modelData.name
+                    foreground: "white"
+                    fontFamily: root.fontFamily
+                    onClicked: root.setFavorite(tile.modelData, !tile.modelData.favorite)
                   }
 
                   PanelActionButton {
