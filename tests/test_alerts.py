@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from helpers import helper as h
 
@@ -157,7 +158,9 @@ class Notifications(unittest.TestCase):
             for uid in uids:
                 listener.notify("nvr", dict(camera, uid=uid), {"id": uid, "kind": "person", "start": 0})
             await asyncio.sleep(0)
-        asyncio.run(run())
+        # Independent of whether this machine has notify-send installed.
+        with mock.patch.object(h.shutil, "which", return_value="/usr/bin/notify-send"):
+            asyncio.run(run())
 
     def test_at_most_one_notification_per_camera_per_minute(self):
         lst = self.listener()
