@@ -1,15 +1,16 @@
 # UniFi Protect for Omarchy
 
 Your UniFi Protect cameras in the Omarchy bar: a grid of auto-refreshing
-snapshots, live video right in the panel, a fullscreen camera wall, and a
-pop-out player. Works with several consoles at once, such as a gateway and a
-dedicated NVR.
+snapshots, live video right in the panel, a camera wall with every camera
+live at once, and a pop-out player. Works with several consoles at once, such
+as a gateway and a dedicated NVR, and is set up from the panel itself.
+Video travels encrypted, and API keys stay out of the shell.
 
 In the bar it is a single camera icon. It turns your theme's urgent colour
 when a camera is offline, and gets a small dot when a console could not be
 reached on the last poll.
 
-Version 0.1.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
+Version 0.2.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
 
 > **Unofficial.** This is an independent community plugin. It is not made,
 > endorsed, or supported by Ubiquiti Inc. or by the Omarchy project.
@@ -59,8 +60,8 @@ Create the key **on the console itself**; this is the route known to work:
    it is under Settings: scroll the row of tabs sideways.
 3. **Create API Key** and copy it. It is shown only once.
 
-Paste it into the setup prompt with **Super + V**. The prompt is hidden like
-a password, so nothing appears as you paste.
+Paste it with **Super + V**. The key field (or the terminal prompt) is hidden
+like a password, so nothing visible appears as you paste.
 
 UniFi Site Manager (unifi.ui.com) can also create API keys. Reports differ on
 whether a console's local API accepts those, so if setup says the key was
@@ -95,11 +96,13 @@ eld-unifi-protect remove nvr
 | Grid | Arrows / hjkl | Move the selection |
 | Grid | `1`–`9` | Live view of camera N |
 | Grid | `W` | Camera wall |
+| Grid | Hover a tile | ★ favourite, eye to hide, pop-out button |
 | Grid / live | `P` | Pop out to mpv |
 | Live | ← / → | Previous / next camera |
 | Live | `M` | Toggle sound |
 | Live | Double-click | Pop out |
 | Live | Esc | Back to the grid |
+| Panel footer | Click the version | Release notes for that version |
 
 ### Camera wall
 
@@ -199,7 +202,7 @@ The plugin's own files:
 |------|----------|
 | Desktop keyring (Secret Service) | API keys, when a keyring is available |
 | `~/.config/eld-unifi-protect/config.json` | Consoles and pinned certificates; API keys only if there is no keyring (mode 0600) |
-| `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras (no secrets) |
+| `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras, favourite, read-only setting (no secrets) |
 | `~/.local/state/eld-unifi-protect/state.json` | Last camera list |
 | `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots and stream URLs (tmpfs, gone on reboot) |
 
@@ -258,7 +261,7 @@ helper only moves encrypted bytes. Measured on an Intel N100:
 | Workload | CPU, share of one core |
 |---|---|
 | Wall, 6 cameras (720p tiles, GPU decode, no tile audio) | ~17% |
-| Relay, TLS for those 6 streams | ~4% |
+| Relay, TLS for those 6 streams | ~4–5% |
 | One 4K stream, GPU decode | ~4% |
 | One 4K stream, CPU decode (what mpv does without `--hwdec`) | ~35% |
 
@@ -319,9 +322,9 @@ use. See [LICENSE](LICENSE) for the full terms. In particular:
 - It is not a security or monitoring system. Do not rely on it to record,
   detect, or alert on anything; use UniFi Protect itself for that.
 - It stores console API keys on your machine (in your keyring, or in a file
-  readable only by you) and can
-  enable RTSPS streams on your cameras. You are responsible for deciding
-  whether that is acceptable for your network.
+  readable only by you) and can enable RTSPS streams on your cameras (unless
+  read-only mode is on). You are responsible for deciding whether that is
+  acceptable for your network.
 - It uses UniFi Protect's Integration API, which Ubiquiti may change at any
   time.
 

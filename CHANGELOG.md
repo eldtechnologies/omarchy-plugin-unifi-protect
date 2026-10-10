@@ -3,6 +3,53 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
+## 0.2.0 — 2026-10-11
+
+### Fixed
+
+- **Stream relay hangs and rare crashes.** Each relay session used one TLS
+  connection from two threads, which OpenSSL forbids; about one session in
+  seven could hang, and the relay occasionally crashed. The relay now runs
+  on a single asyncio event loop. (#11)
+- The runtime directory could be created readable by other users (0755).
+  (#3)
+
+### Security
+
+- The relay token no longer appears on mpv's command line, where any local
+  user could read it. (#2)
+- A private runtime directory is required; the `/tmp` fallback is gone.
+  (#3)
+- Names and camera IDs from consoles are treated as untrusted: control
+  characters are stripped, and an ID that could escape the snapshot folder
+  is refused. (#7)
+- API keys are stored in the desktop keyring when one is available;
+  `eld-unifi-protect migrate-keys` moves existing keys there. (#4)
+- Private vulnerability reporting and a `SECURITY.md`. (#10)
+
+### Added
+
+- **Camera wall as a maximized window** (the new default) that keeps
+  workspace switching and the bar; the full-screen overlay remains as
+  `wallMode: overlay`. (#1)
+- **Setup inside the panel**: address, certificate check and API key,
+  without a terminal. (#13)
+- **Favourite camera**, picture **framing** (fill or fit) and snapshot
+  **refresh** presets. (#12)
+- **Read-only mode**: `eld-unifi-protect read-only on` never changes
+  anything on the consoles. (#9)
+- Pop-out player: scroll to zoom, Ctrl+arrows to pan, automatic reconnect.
+  (#5)
+- The panel shows the plugin version, linking to its release notes. (#14)
+- Tests, including an end-to-end relay test, and CI on every pull request.
+  (#10)
+
+### Changed
+
+- Incomplete snapshots are rejected instead of shown half-drawn. (#6)
+- API-key guidance no longer claims that Site Manager keys are rejected.
+  (#8)
+
 ## 0.1.0 — 2026-10-10
 
 First release.
