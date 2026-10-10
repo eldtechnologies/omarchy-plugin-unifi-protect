@@ -5,7 +5,6 @@ console's RTSPS endpoint. The relay sits between it and a plain-socket
 client, exactly as it does between a player and a real console.
 """
 
-import faulthandler
 import hashlib
 import os
 import sys
@@ -15,6 +14,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+import traceback
 import unittest
 
 from helpers import helper as h
@@ -115,7 +115,10 @@ class RelayEndToEnd(unittest.TestCase):
             return h.read_rtsp(reader)
         except TimeoutError:
             # Show where the relay and the fake console are stuck.
-            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            names = {t.ident: t.name for t in threading.enumerate()}
+            for ident, frame in sys._current_frames().items():
+                print(f"--- thread {names.get(ident, ident)}", file=sys.stderr)
+                traceback.print_stack(frame, file=sys.stderr)
             raise
 
     def test_full_session_is_tunnelled_and_rewritten(self):
