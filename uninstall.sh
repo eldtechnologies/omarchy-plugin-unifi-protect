@@ -24,7 +24,9 @@ fi
 if [[ $purge == "--purge" ]]; then
   rm -rf "$config_dir" "$state_dir"
   # API keys stored in the desktop keyring.
-  command -v secret-tool >/dev/null && secret-tool clear service eld-unifi-protect 2>/dev/null || true
+  if command -v secret-tool >/dev/null; then
+    secret-tool clear service eld-unifi-protect 2>/dev/null || true
+  fi
   echo "Removed. Revoke the API key on the console too: deleting the local copy does not revoke it."
 else
   echo "Removed. Your config is still in $config_dir"
