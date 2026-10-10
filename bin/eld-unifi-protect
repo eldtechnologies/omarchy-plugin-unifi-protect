@@ -699,6 +699,15 @@ def cmd_relay(args):
     Relay(require_config()).serve()
 
 
+def is_complete_jpeg(data):
+    """True for a whole JPEG: start-of-image first, end-of-image last.
+
+    Some cameras pad the file after the end marker, so trailing zero bytes
+    are allowed.
+    """
+    return bool(data) and data[:2] == b"\xff\xd8" and data.rstrip(b"\x00")[-2:] == b"\xff\xd9"
+
+
 class Protect:
     def __init__(self, console, config=None):
         self.console = console
@@ -765,12 +774,17 @@ class Protect:
         return self.request("GET", "/cameras") or []
 
     def snapshot(self, camera_id, high_quality=False):
-        return self.request(
+        data = self.request(
             "GET",
             f"/cameras/{camera_id}/snapshot",
             params={"highQuality": "true" if high_quality else "false"},
             raw=True,
         )
+        if not is_complete_jpeg(data):
+            # A cut-off transfer or an error page: keep the previous frame
+            # on screen rather than a half-drawn one.
+            raise ProtectError("console sent an incomplete snapshot")
+        return data
 
     def stream_urls(self, camera_id, qualities):
         """Relay URLs for the given qualities, creating any that are missing.
