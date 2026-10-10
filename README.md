@@ -244,6 +244,17 @@ run.
 The version is set in `manifest.json` only; `eld-unifi-protect --version` reads
 it from there. Record changes in `CHANGELOG.md`.
 
+Run the tests (standard library only; they never touch your real config,
+keys or consoles):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+They include an end-to-end test of the stream relay against a fake TLS
+console. CI runs them, plus a manifest check and `shellcheck`, on every pull
+request. To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
 ## Disclaimer
 
 This software is provided **as is, without warranty of any kind**, and ELD
