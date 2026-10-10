@@ -20,6 +20,8 @@ Version 0.1.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologie
 - A UniFi console running **UniFi Protect 5.3 or newer** (for the official
   Integration API): Dream Machine, Cloud Gateway, UNVR, and so on
 - `python3` (ships with Omarchy; the helper uses the standard library only)
+- `secret-tool` from `libsecret` and a keyring such as `gnome-keyring` (both
+  ship with Omarchy) to keep API keys in the keyring; optional, see below
 - `qt6-multimedia-ffmpeg` for live video (ships with Omarchy)
 - `mpv`, optional, for the pop-out player: `omarchy pkg add mpv`
 
@@ -155,7 +157,8 @@ The plugin's own files:
 
 | Path | Contents |
 |------|----------|
-| `~/.config/eld-unifi-protect/config.json` | Consoles, API keys, pinned certificates (mode 0600) |
+| Desktop keyring (Secret Service) | API keys, when a keyring is available |
+| `~/.config/eld-unifi-protect/config.json` | Consoles and pinned certificates; API keys only if there is no keyring (mode 0600) |
 | `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras (no secrets) |
 | `~/.local/state/eld-unifi-protect/state.json` | Last camera list |
 | `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots and stream URLs (tmpfs, gone on reboot) |
@@ -168,6 +171,12 @@ The Omarchy shell never speaks HTTP and never sees an API key. The helper
 and resolves stream URLs. The panel watches those files and plays the
 streams.
 
+- **API keys** are stored in your desktop keyring (Secret Service, through
+  `secret-tool`), encrypted at rest, whenever one is available; otherwise in
+  `config.json`, readable only by you. They are passed to `secret-tool` on
+  stdin, never as arguments. `eld-unifi-protect migrate-keys` moves existing
+  keys into the keyring (`--to file` moves them back), and `doctor` shows
+  where each console's key lives.
 - **Traffic:** while the panel is closed, one camera-list poll per console per
   minute. Snapshots are fetched only while the panel is open on the grid.
 - **TLS:** consoles use self-signed certificates. Setup pins each console's
@@ -221,10 +230,12 @@ If you installed with `omarchy plugin add`:
 ```bash
 omarchy plugin remove com.eldtechnologies.unifi-protect
 rm -rf ~/.config/eld-unifi-protect ~/.local/state/eld-unifi-protect
+secret-tool clear service eld-unifi-protect
 ```
 
-`omarchy plugin remove` deletes only the plugin folder, so the second line is
-needed to delete your API keys.
+`omarchy plugin remove` deletes only the plugin folder, so the last two lines
+are needed to delete your settings and API keys (the last one clears keys
+held in the keyring).
 
 If you installed with `./install.sh`, run `./uninstall.sh` from the checkout.
 It also removes the `eld-unifi-protect` command and asks whether to delete your
@@ -263,7 +274,8 @@ use. See [LICENSE](LICENSE) for the full terms. In particular:
 
 - It is not a security or monitoring system. Do not rely on it to record,
   detect, or alert on anything; use UniFi Protect itself for that.
-- It stores console API keys on your machine (readable only by you) and can
+- It stores console API keys on your machine (in your keyring, or in a file
+  readable only by you) and can
   enable RTSPS streams on your cameras. You are responsible for deciding
   whether that is acceptable for your network.
 - It uses UniFi Protect's Integration API, which Ubiquiti may change at any
