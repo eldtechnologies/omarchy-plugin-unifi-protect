@@ -52,6 +52,7 @@ SNAP_DIR = os.path.join(RUNTIME_DIR, "snapshots")
 SNAP_INDEX = os.path.join(SNAP_DIR, "index.json")
 
 QUALITIES = ("high", "medium", "low")
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
 
@@ -1320,9 +1321,16 @@ def cmd_live(args):
     player = shutil.which("mpv")
     if not player:
         raise ProtectError("mpv is not installed: omarchy pkg add mpv")
+    input_conf = os.path.join(PLUGIN_DIR, "mpv", "input.conf")
     command = [
         player,
         "--no-terminal",
+        # Scroll to zoom, Ctrl+arrows to pan, Ctrl+0 to reset; mpv's own
+        # bindings (f for fullscreen, m for mute, q to quit) still apply.
+        f"--input-conf={input_conf}",
+        # A camera stream that drops (Wi-Fi, firmware update, console
+        # restart) ends the "file"; looping it reconnects instead of closing.
+        "--loop-file=inf",
         f"--title={title}",
         "--force-window=immediate",
         "--profile=low-latency",

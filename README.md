@@ -152,6 +152,13 @@ o.bind("SUPER + SHIFT + C", "Camera wall", "eld-unifi-protect wall")
 o.bind("SUPER + SHIFT + ALT + C", "Camera wall (overlay)", "eld-unifi-protect wall --mode overlay")
 ```
 
+### Pop-out player
+
+`P` (or double-click in live view) opens the camera in its own mpv window at
+high quality. Scroll to zoom in on a detail, horizontal scroll or
+Ctrl+arrows to pan, and Ctrl+0 to reset; `f` toggles fullscreen and `q`
+closes it. If the stream drops, the window reconnects on its own.
+
 The mpv window uses the app id `eld-unifi-protect`, for window rules.
 
 ## Configuration
