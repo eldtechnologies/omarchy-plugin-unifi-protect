@@ -96,6 +96,96 @@ def slugify(text):
     return slug or "console"
 
 
+# ---- API key storage ---------------------------------------------------------
+#
+# Keys go to the desktop keyring (Secret Service, via secret-tool) when one is
+# available: encrypted at rest and locked with the session. config.json then
+# only records "keyStore": "keyring" for that console. Without a keyring, the
+# key stays in config.json, which is readable only by the user.
+#
+# The key always travels to and from secret-tool on stdin/stdout, never as a
+# command-line argument, which any local user could read.
+
+KEYRING_SERVICE = "eld-unifi-protect"
+_key_cache = {}
+
+
+class KeyringUnavailable(Exception):
+    pass
+
+
+def _secret_tool(args, secret=None):
+    tool = shutil.which("secret-tool")
+    if not tool:
+        raise KeyringUnavailable("secret-tool is not installed (package libsecret)")
+    try:
+        result = subprocess.run([tool, *args], input=secret, capture_output=True,
+                                text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        raise KeyringUnavailable("the keyring did not answer; is it locked?")
+    # Exit 1 with nothing on stderr means "no such item"; anything on stderr
+    # means the Secret Service itself could not be reached.
+    if result.returncode != 0 and result.stderr.strip():
+        raise KeyringUnavailable(result.stderr.strip().splitlines()[-1])
+    return result
+
+
+def keyring_available():
+    try:
+        _secret_tool(["lookup", "service", KEYRING_SERVICE, "console", "__probe__"])
+        return True
+    except KeyringUnavailable:
+        return False
+
+
+def keyring_store(console_id, label, key):
+    result = _secret_tool(["store", f"--label={label}", "service", KEYRING_SERVICE,
+                           "console", console_id], secret=key)
+    if result.returncode != 0:
+        raise KeyringUnavailable("the keyring refused to store the key")
+    _key_cache[console_id] = key
+
+
+def keyring_lookup(console_id):
+    if console_id not in _key_cache:
+        result = _secret_tool(["lookup", "service", KEYRING_SERVICE, "console", console_id])
+        _key_cache[console_id] = result.stdout if result.returncode == 0 else ""
+    return _key_cache[console_id]
+
+
+def keyring_clear(console_id):
+    _key_cache.pop(console_id, None)
+    _secret_tool(["clear", "service", KEYRING_SERVICE, "console", console_id])
+
+
+def resolve_keys(config):
+    """Fill in apiKey for keyring consoles; record why when it cannot."""
+    for console in config["consoles"]:
+        if console.get("keyStore") != "keyring":
+            continue
+        try:
+            console["apiKey"] = keyring_lookup(console["id"])
+            if not console["apiKey"]:
+                console["keyError"] = ("API key missing from the keyring; "
+                                       "run `eld-unifi-protect setup` for this console")
+        except KeyringUnavailable as error:
+            console["apiKey"] = ""
+            console["keyError"] = f"cannot read the API key from the keyring: {error}"
+
+
+def store_key(config, console, key):
+    """Put a console's key in the keyring if possible, else in the file."""
+    try:
+        keyring_store(console["id"], f"UniFi Protect API key ({console['name']}, {console['host']})", key)
+        console["keyStore"] = "keyring"
+        console["apiKey"] = key
+        return "keyring"
+    except KeyringUnavailable:
+        console.pop("keyStore", None)
+        console["apiKey"] = key
+        return "file"
+
+
 def load_config():
     """Return {"consoles": [...], "timeoutSec": n}, or None when unconfigured.
 
@@ -121,14 +211,23 @@ def load_config():
             }],
             "timeoutSec": config.get("timeoutSec", 8),
         }
-    config["consoles"] = [c for c in config.get("consoles", []) if c.get("host") and c.get("apiKey")]
+    config["consoles"] = [c for c in config.get("consoles", [])
+                          if c.get("host") and (c.get("apiKey") or c.get("keyStore") == "keyring")]
     if not config["consoles"]:
         return None
+    resolve_keys(config)
     return config
 
 
 def save_config(config):
-    write_json(CONFIG_PATH, config)
+    """Write the config; keys held by the keyring are never written out."""
+    stored = dict(config, consoles=[])
+    for console in config["consoles"]:
+        entry = {k: v for k, v in console.items() if k != "keyError"}
+        if entry.get("keyStore") == "keyring":
+            entry.pop("apiKey", None)
+        stored["consoles"].append(entry)
+    write_json(CONFIG_PATH, stored)
     os.chmod(CONFIG_DIR, 0o700)
 
 
@@ -604,6 +703,9 @@ class Protect:
         self.console = console
         self.host = console["host"]
         self.name, self.port = split_host(self.host)
+        if not console.get("apiKey"):
+            # Callers already prefix errors with the console's name.
+            raise ProtectError(console.get("keyError", "no API key configured"))
         self.key = console["apiKey"]
         self.pin = console.get("certSha256")
         self.timeout = float((config or {}).get("timeoutSec", 8))
@@ -992,13 +1094,19 @@ def cmd_setup(args):
     while console_id in taken:
         console_id, n = f"{base}-{n}", n + 1
 
-    entry = {"id": console_id, "name": name, "host": host, "apiKey": key, "certSha256": pin}
+    entry = {"id": console_id, "name": name, "host": host, "certSha256": pin}
+    if existing and existing.get("keyStore") == "keyring" and existing.get("id") != console_id:
+        keyring_clear(existing["id"])
+    where = store_key(config, entry, key)
     if existing:
         consoles[consoles.index(existing)] = entry
     else:
         consoles.append(entry)
     save_config(config)
-    print(f"Saved {CONFIG_PATH} (readable only by you)")
+    if where == "keyring":
+        print(f"API key saved in your keyring; console settings in {CONFIG_PATH}")
+    else:
+        print(f"No keyring available: API key saved in {CONFIG_PATH} (readable only by you)")
     poll_cameras(config)
     if len(consoles) == 1:
         print("Got another console, such as an NVR? Run `eld-unifi-protect setup` again to add it.")
@@ -1020,6 +1128,11 @@ def cmd_remove(args):
     if not args.yes and input(f"Remove {console['name']} ({console['host']})? [y/N] ").strip().lower() not in ("y", "yes"):
         raise ProtectError("not changed")
     config["consoles"].remove(console)
+    if console.get("keyStore") == "keyring":
+        try:
+            keyring_clear(console["id"])
+        except KeyringUnavailable as error:
+            print(f"Could not remove the key from the keyring: {error}", file=sys.stderr)
     if config["consoles"]:
         save_config(config)
     else:
@@ -1030,6 +1143,29 @@ def cmd_remove(args):
     write_json(STATE_PATH, state)
     poll_cameras()
     print(f"Removed {console['name']}. Revoke its API key on the console as well.")
+
+
+def cmd_migrate_keys(args):
+    """Move API keys between the keyring and config.json."""
+    config = require_config()
+    for console in config["consoles"]:
+        if console.get("keyError"):
+            raise ProtectError(f"{console['name']}: {console['keyError']}")
+    if args.to == "keyring" and not keyring_available():
+        raise ProtectError("no keyring available (Secret Service via secret-tool)")
+    moved = 0
+    for console in config["consoles"]:
+        in_keyring = console.get("keyStore") == "keyring"
+        if args.to == "keyring" and not in_keyring:
+            store_key(config, console, console["apiKey"])
+            moved += 1
+        elif args.to == "file" and in_keyring:
+            keyring_clear(console["id"])
+            console.pop("keyStore", None)
+            moved += 1
+    save_config(config)
+    where = "your keyring" if args.to == "keyring" else CONFIG_PATH
+    print(f"{moved} key(s) moved; all keys are now in {where}")
 
 
 def cmd_trust_cert(args):
@@ -1168,6 +1304,8 @@ def cmd_doctor(args):
     report(shutil.which("mpv") is not None, "mpv installed (pop-out player)")
     for console in (config or {}).get("consoles", []):
         print(f"\n{console['name']} ({console['host']})")
+        store = "keyring" if console.get("keyStore") == "keyring" else f"file ({CONFIG_PATH})"
+        report(not console.get("keyError"), "API key stored in " + store, console.get("keyError", ""))
         try:
             pin = fetch_cert_fingerprint(console["host"])
             report(pin == console.get("certSha256"), "certificate matches pin")
@@ -1341,6 +1479,9 @@ def main():
     p.add_argument("console", help="console id, name or address")
     p.add_argument("--yes", action="store_true")
     p.set_defaults(func=cmd_remove)
+    p = sub.add_parser("migrate-keys", help="move API keys to the keyring, or back to the config file")
+    p.add_argument("--to", choices=("keyring", "file"), default="keyring")
+    p.set_defaults(func=cmd_migrate_keys)
     p = sub.add_parser("trust-cert", help="re-pin console certificates")
     p.add_argument("console", nargs="?")
     p.add_argument("--yes", action="store_true")
