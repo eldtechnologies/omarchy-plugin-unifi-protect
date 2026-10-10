@@ -1161,12 +1161,13 @@ def cmd_setup(args):
         raise ProtectError("setup cancelled")
 
     print(
-        "\nCreate an API key on this console itself, not on unifi.ui.com:\n"
+        "\nCreate an API key on this console itself (the route known to work):\n"
         f"  1. Open https://{host} in a browser and sign in.\n"
         "  2. Click Integrations in the left sidebar (at the bottom of the icon bar).\n"
         "     On older UniFi OS: Settings → scroll the tabs sideways → Integrations.\n"
         "  3. Create API Key. It is shown once; copy it before closing the dialog.\n"
         "Each console needs its own key: a gateway's key does not work on an NVR.\n"
+        "If a key made in Site Manager (unifi.ui.com) is rejected, use one made here.\n"
     )
     key = getpass.getpass("API key (input hidden, paste with Super+V): ").strip()
     if not key and existing.get("apiKey"):

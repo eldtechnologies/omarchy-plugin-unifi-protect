@@ -52,7 +52,7 @@ you to confirm, then asks for an API key. In the panel, the key goes from a
 password field to the helper on stdin and the field is cleared at once; it is
 never written to a file, a log or a command line.
 
-Create the key **on the console itself**, not on unifi.ui.com:
+Create the key **on the console itself**; this is the route known to work:
 
 1. Open `https://<console-ip>` and sign in.
 2. Click **Integrations** at the bottom of the left sidebar. On older UniFi OS
@@ -60,9 +60,11 @@ Create the key **on the console itself**, not on unifi.ui.com:
 3. **Create API Key** and copy it. It is shown only once.
 
 Paste it into the setup prompt with **Super + V**. The prompt is hidden like
-a password, so nothing appears as you paste. Keys created in the cloud Site
-Manager at unifi.ui.com are a different kind, and consoles reject them with
-HTTP 401.
+a password, so nothing appears as you paste.
+
+UniFi Site Manager (unifi.ui.com) can also create API keys. Reports differ on
+whether a console's local API accepts those, so if setup says the key was
+rejected (HTTP 401), create one on the console as above instead.
 
 ### Several consoles
 
