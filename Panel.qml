@@ -36,6 +36,25 @@ Panel {
     String(Qt.resolvedUrl(".")).replace("file://", ""))
   readonly property string cli: pluginDir + "bin/eld-unifi-protect"
 
+  // Version and release notes come from manifest.json, the one place the
+  // version is set, so the panel can never disagree with the plugin.
+  property string pluginVersion: ""
+  property string homepage: ""
+  readonly property string releaseUrl: homepage !== "" && pluginVersion !== ""
+                                       ? homepage + "/releases/tag/v" + pluginVersion : ""
+
+  FileView {
+    path: root.pluginDir + "manifest.json"
+    printErrors: false
+    onLoaded: {
+      try {
+        var manifest = JSON.parse(text())
+        root.pluginVersion = manifest.version || ""
+        root.homepage = String(manifest.homepage || "").replace(/\/+$/, "")
+      } catch (error) { }
+    }
+  }
+
   // Presets for the settings UI. An explicit snapshotIntervalSec in
   // shell.json (the older setting) still wins.
   readonly property int snapshotSeconds: {
@@ -1170,6 +1189,30 @@ Panel {
               font.pixelSize: Style.font.caption
               horizontalAlignment: Text.AlignHCenter
               elide: Text.ElideRight
+            }
+
+            // Version, linking to its release notes.
+            Text {
+              visible: root.pluginVersion !== ""
+              anchors.horizontalCenter: parent.horizontalCenter
+              textFormat: Text.PlainText
+              text: "UniFi Protect for Omarchy v" + root.pluginVersion
+              color: versionMouse.containsMouse && root.releaseUrl !== "" ? root.foreground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.underline: versionMouse.containsMouse && root.releaseUrl !== ""
+
+              MouseArea {
+                id: versionMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                enabled: root.releaseUrl !== ""
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  Quickshell.execDetached(["xdg-open", root.releaseUrl])
+                  root.close()
+                }
+              }
             }
           }
         }
