@@ -1031,6 +1031,92 @@ def refresh_snapshots(config, cameras, index):
 # ---- commands ------------------------------------------------------------
 
 
+def verify_console(config, host, pin, key):
+    """Prove the key works against the pinned console; (info, cameras)."""
+    probe = {"id": "probe", "name": host, "host": host, "apiKey": key, "certSha256": pin}
+    client = Protect(probe, config)
+    return client.info() or {}, client.cameras()
+
+
+def default_console_name(config, existing):
+    if existing.get("name") and existing.get("name") != existing.get("host"):
+        return existing["name"]
+    return "NVR" if config["consoles"] and not existing else "Console"
+
+
+def save_console(config, existing, host, pin, key, name):
+    """Add or replace a console and store its key; (entry, "keyring"|"file")."""
+    consoles = config["consoles"]
+    name = clean_text(name, default_console_name(config, existing), 40)
+    taken = {c["id"] for c in consoles if c is not existing}
+    console_id = existing.get("id") if existing and existing.get("id") not in taken else slugify(name)
+    base, n = console_id, 2
+    while console_id in taken:
+        console_id, n = f"{base}-{n}", n + 1
+    entry = {"id": console_id, "name": name, "host": host, "certSha256": pin}
+    if existing and existing.get("keyStore") == "keyring" and existing.get("id") != console_id:
+        keyring_clear(existing["id"])
+    where = store_key(config, entry, key)
+    if existing:
+        consoles[consoles.index(existing)] = entry
+    else:
+        consoles.append(entry)
+    save_config(config)
+    return entry, where
+
+
+def normalize_host(host):
+    return host.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+
+
+def cmd_setup_probe(args):
+    """Panel setup, step 1: reach the console and report its certificate."""
+    host = normalize_host(args.host)
+    if not host:
+        raise ProtectError("enter the console's address")
+    try:
+        pin = fetch_cert_fingerprint(host)
+    except OSError as error:
+        raise ProtectError(f"cannot reach {host}: {error.strerror or error}")
+    config = load_config() or {"consoles": []}
+    existing = next((c for c in config["consoles"] if c["host"] == host), {})
+    print(json.dumps({
+        "host": host,
+        "fingerprint": pin,
+        "existing": bool(existing),
+        "changed": bool(existing.get("certSha256")) and existing["certSha256"] != pin,
+        "suggestedName": default_console_name(config, existing),
+    }))
+
+
+def cmd_setup_save(args):
+    """Panel setup, step 2: verify the key and save the console.
+
+    The key arrives on stdin, never as an argument: command lines are
+    readable by every local user. An empty key keeps an existing console's
+    key (to rename it or re-pin its certificate).
+    """
+    key = sys.stdin.readline().strip()
+    host = normalize_host(args.host)
+    config = load_config() or {"consoles": [], "timeoutSec": 8}
+    existing = next((c for c in config["consoles"] if c["host"] == host), {})
+    if not key:
+        key = existing.get("apiKey", "")
+    if not key:
+        raise ProtectError("paste the API key")
+    # The pin was shown to the user in step 1; refuse if the console now
+    # presents anything else.
+    _, cameras = verify_console(config, host, args.pin, key)
+    entry, where = save_console(config, existing, host, args.pin, key, args.name or "")
+    poll_cameras(config)
+    print(json.dumps({
+        "name": entry["name"],
+        "cameras": len(cameras),
+        "online": sum(1 for c in cameras if c.get("state") == "CONNECTED"),
+        "keyStore": where,
+    }))
+
+
 def cmd_setup(args):
     config = load_config() or {"consoles": [], "timeoutSec": 8}
     consoles = config["consoles"]
@@ -1074,10 +1160,7 @@ def cmd_setup(args):
     if not key:
         raise ProtectError("no API key given")
 
-    probe = {"id": "probe", "name": host, "host": host, "apiKey": key, "certSha256": pin}
-    client = Protect(probe, config)
-    info = client.info() or {}
-    cameras = client.cameras()
+    info, cameras = verify_console(config, host, pin, key)
     online = sum(1 for c in cameras if c.get("state") == "CONNECTED")
     print(
         f"\nConnected to UniFi Protect {info.get('applicationVersion', '')}".rstrip()
@@ -1087,22 +1170,8 @@ def cmd_setup(args):
     default_name = existing.get("name") or ("NVR" if consoles else "Console")
     if existing.get("name") == host:
         default_name = "Console"
-    name = clean_text(input(f"Name for this console [{default_name}]: "), default_name, 40)
-    taken = {c["id"] for c in consoles if c is not existing}
-    console_id = existing.get("id") if existing and existing.get("id") not in taken else slugify(name)
-    base, n = console_id, 2
-    while console_id in taken:
-        console_id, n = f"{base}-{n}", n + 1
-
-    entry = {"id": console_id, "name": name, "host": host, "certSha256": pin}
-    if existing and existing.get("keyStore") == "keyring" and existing.get("id") != console_id:
-        keyring_clear(existing["id"])
-    where = store_key(config, entry, key)
-    if existing:
-        consoles[consoles.index(existing)] = entry
-    else:
-        consoles.append(entry)
-    save_config(config)
+    name = input(f"Name for this console [{default_name}]: ").strip() or default_name
+    _, where = save_console(config, existing, host, pin, key, name)
     if where == "keyring":
         print(f"API key saved in your keyring; console settings in {CONFIG_PATH}")
     else:
@@ -1475,6 +1544,14 @@ def main():
 
     sub.add_parser("setup", help="add a console, or replace a console's key").set_defaults(func=cmd_setup)
     sub.add_parser("consoles", help="list configured consoles").set_defaults(func=cmd_consoles)
+    p = sub.add_parser("setup-probe", help=argparse.SUPPRESS)
+    p.add_argument("host")
+    p.set_defaults(func=cmd_setup_probe)
+    p = sub.add_parser("setup-save", help=argparse.SUPPRESS)
+    p.add_argument("--host", required=True)
+    p.add_argument("--pin", required=True)
+    p.add_argument("--name")
+    p.set_defaults(func=cmd_setup_save)
     p = sub.add_parser("remove", help="remove a console")
     p.add_argument("console", help="console id, name or address")
     p.add_argument("--yes", action="store_true")

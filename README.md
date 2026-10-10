@@ -45,8 +45,12 @@ eld-unifi-protect setup
 
 ### Connecting a console
 
-Setup asks for the console's address, shows the fingerprint of its TLS
-certificate for you to confirm, then asks for an API key.
+Setup runs inside the panel (**Run setup**, or **Add console** later); the
+same steps are available in a terminal with `eld-unifi-protect setup`. It asks
+for the console's address, shows the fingerprint of its TLS certificate for
+you to confirm, then asks for an API key. In the panel, the key goes from a
+password field to the helper on stdin and the field is cleared at once; it is
+never written to a file, a log or a command line.
 
 Create the key **on the console itself**, not on unifi.ui.com:
 
