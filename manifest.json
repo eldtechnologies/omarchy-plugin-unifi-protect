@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "id": "com.eldtechnologies.unifi-protect",
+  "name": "UniFi Protect",
+  "version": "0.1.0",
+  "author": "ELD Technologies",
+  "license": "MIT",
+  "description": "See your UniFi Protect cameras from the Omarchy bar: a snapshot grid, live video in the panel, a fullscreen camera wall, and support for several consoles.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "UniFi Protect",
+    "description": "Camera grid and live view for a UniFi Protect console.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "snapshotIntervalSec": 3,
+      "columns": 2,
+      "liveQuality": "medium",
+      "popoutQuality": "high"
+    },
+    "schema": [
+      {
+        "key": "snapshotIntervalSec",
+        "type": "integer",
+        "label": "Snapshot refresh while the panel is open (seconds)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 3
+      },
+      {
+        "key": "columns",
+        "type": "integer",
+        "label": "Columns in the camera grid",
+        "min": 1,
+        "max": 4,
+        "step": 1,
+        "defaultValue": 2
+      },
+      {
+        "key": "liveQuality",
+        "type": "string",
+        "label": "In-panel live quality (high, medium, low)",
+        "defaultValue": "medium"
+      },
+      {
+        "key": "popoutQuality",
+        "type": "string",
+        "label": "Pop-out player quality (high, medium, low)",
+        "defaultValue": "high"
+      }
+    ]
+  },
+  "homepage": "https://github.com/eldtechnologies/omarchy-plugin-unifi-protect"
+}

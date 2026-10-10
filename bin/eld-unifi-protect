@@ -1,0 +1,1292 @@
+#!/usr/bin/env python3
+"""UniFi Protect helper for the Omarchy shell.
+
+The shell never speaks HTTP or holds the API key. This CLI does both, writes
+camera state and snapshots to disk for the panel to watch, and resolves
+RTSPS stream URLs on demand.
+
+Uses the official Protect Integration API (/proxy/protect/integration/v1)
+authenticated with a console API key (X-API-KEY).
+"""
+
+import argparse
+import fcntl
+import getpass
+import hashlib
+import hmac
+import http.client
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+
+API_BASE = "/proxy/protect/integration/v1"
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "eld-unifi-protect")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"), "eld-unifi-protect")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+# Snapshots are disposable and rewritten every few seconds: keep them in
+# tmpfs so they never wear the disk or survive a reboot.
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "eld-unifi-protect")
+SNAP_DIR = os.path.join(RUNTIME_DIR, "snapshots")
+SNAP_INDEX = os.path.join(SNAP_DIR, "index.json")
+
+QUALITIES = ("high", "medium", "low")
+
+
+
+def plugin_version():
+    """The version lives in manifest.json alone, so the two never drift."""
+    manifest = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "manifest.json")
+    try:
+        with open(manifest) as handle:
+            return json.load(handle).get("version", "unknown")
+    except (OSError, ValueError):
+        return "unknown"
+
+
+class ProtectError(Exception):
+    pass
+
+
+# ---- files ---------------------------------------------------------------
+
+
+def write_atomic(path, data, mode=0o600):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    # Unique per call, not per process: the wall resolves streams from
+    # several threads, and a shared temp name let one thread rename the
+    # other's file away.
+    tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    with open(tmp, "wb") as handle:
+        handle.write(data if isinstance(data, bytes) else data.encode())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def write_json(path, value):
+    write_atomic(path, json.dumps(value, indent=2) + "\n")
+
+
+def slugify(text):
+    slug = "".join(ch if ch.isalnum() else "-" for ch in text.lower()).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug or "console"
+
+
+def load_config():
+    """Return {"consoles": [...], "timeoutSec": n}, or None when unconfigured.
+
+    Each UniFi console runs its own Protect with its own API key, so the
+    config is a list. The original single-console shape is still read and
+    converted on the next save.
+    """
+    try:
+        with open(CONFIG_PATH) as handle:
+            config = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        raise ProtectError(f"cannot read {CONFIG_PATH}: {error}")
+    if "consoles" not in config and config.get("host"):
+        config = {
+            "consoles": [{
+                "id": slugify(config["host"]),
+                "name": config["host"],
+                "host": config["host"],
+                "apiKey": config.get("apiKey", ""),
+                "certSha256": config.get("certSha256"),
+            }],
+            "timeoutSec": config.get("timeoutSec", 8),
+        }
+    config["consoles"] = [c for c in config.get("consoles", []) if c.get("host") and c.get("apiKey")]
+    if not config["consoles"]:
+        return None
+    return config
+
+
+def save_config(config):
+    write_json(CONFIG_PATH, config)
+    os.chmod(CONFIG_DIR, 0o700)
+
+
+def require_config():
+    config = load_config()
+    if config is None:
+        raise ProtectError("not set up yet: run `eld-unifi-protect setup`")
+    return config
+
+
+def find_console(config, name):
+    """Match a console by id, name or host; None picks the only one."""
+    consoles = config["consoles"]
+    if name is None:
+        if len(consoles) == 1:
+            return consoles[0]
+        raise ProtectError("several consoles configured; name one: "
+                           + ", ".join(c["name"] for c in consoles))
+    wanted = name.lower()
+    for console in consoles:
+        if wanted in (console["id"], console["name"].lower(), console["host"].lower()):
+            return console
+    raise ProtectError(f"no console named {name!r}")
+
+
+def resolve_camera(config, uid):
+    """Split a "<console>_<camera>" uid into (Protect client, camera id)."""
+    console_id, sep, camera_id = uid.partition("_")
+    if sep:
+        for console in config["consoles"]:
+            if console["id"] == console_id:
+                return Protect(console, config), camera_id
+    # A bare camera id (older panels, scripts written by hand): find the
+    # console that last listed it, preferring one where it is connected.
+    listed = [c for c in previous_state().get("cameras", []) if c.get("id") == uid]
+    listed.sort(key=lambda c: not c.get("online"))
+    for camera in listed:
+        for console in config["consoles"]:
+            if console["id"] == camera.get("console"):
+                return Protect(console, config), uid
+    if len(config["consoles"]) == 1:
+        return Protect(config["consoles"][0], config), uid
+    raise ProtectError(f"no camera {uid!r} on any console; see `eld-unifi-protect cameras`")
+
+
+# ---- TLS -----------------------------------------------------------------
+#
+# Consoles ship self-signed certificates. Rather than turning verification
+# off, setup pins the SHA-256 of the certificate the console presents, and
+# every connection checks the pin during the handshake, before the API key
+# is written to the socket.
+
+
+def split_host(host):
+    host = host.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+    if host.startswith("["):
+        name, _, port = host[1:].partition("]")
+        return name, int(port.lstrip(":") or 443)
+    if host.count(":") == 1:
+        name, port = host.split(":")
+        return name, int(port)
+    return host, 443
+
+
+def fetch_cert_fingerprint(host, timeout=8):
+    name, port = split_host(host)
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((name, port), timeout=timeout) as sock:
+        with context.wrap_socket(sock, server_hostname=name) as tls:
+            der = tls.getpeercert(binary_form=True)
+    return hashlib.sha256(der).hexdigest()
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, pin, timeout):
+        context = ssl.create_default_context()
+        if pin:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        super().__init__(host, port, timeout=timeout, context=context)
+        self._pin = pin
+
+    def connect(self):
+        super().connect()
+        if self._pin:
+            der = self.sock.getpeercert(binary_form=True)
+            if hashlib.sha256(der).hexdigest() != self._pin:
+                self.sock.close()
+                raise ProtectError(
+                    "console certificate changed; if expected, run `eld-unifi-protect trust-cert`"
+                )
+
+
+# ---- API -----------------------------------------------------------------
+
+
+STREAM_CACHE = os.path.join(RUNTIME_DIR, "streams.json")
+STREAM_CACHE_LOCK = threading.Lock()
+
+
+def load_stream_cache():
+    try:
+        with open(STREAM_CACHE) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+# ---- stream relay ----------------------------------------------------------
+#
+# Protect serves camera video as RTSPS on port 7441 behind its self-signed
+# certificate. FFmpeg 9 (inside both QtMultimedia and mpv) refuses unverified
+# TLS, and neither player can be handed the certificate we pinned. So players
+# connect to this relay over loopback, and the relay carries the stream to the
+# console over TLS, checking the same pinned certificate as the API does:
+#
+#   player --plain RTSP, 127.0.0.1 only--> relay --TLS, pinned--> console:7441
+#
+# Nothing unencrypted leaves the machine. The relay forces RTSP-over-TCP
+# (interleaved), so media never travels as separate UDP outside the tunnel,
+# and every URL carries a random token so other local users cannot use it.
+
+RELAY_INFO = os.path.join(RUNTIME_DIR, "relay.json")
+RELAY_LOCK = os.path.join(RUNTIME_DIR, "relay.lock")
+RELAY_IDLE_EXIT = 60
+STREAM_PORT = 7441
+
+
+def read_relay_info():
+    try:
+        with open(RELAY_INFO) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def relay_alive(info):
+    if not info.get("port"):
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", info["port"]), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+RELAY_START_LOCK = threading.Lock()
+
+
+def ensure_relay():
+    """Return the running relay's info, starting the relay if needed."""
+    with RELAY_START_LOCK:
+        return _ensure_relay()
+
+
+def _ensure_relay():
+    info = read_relay_info()
+    if info.get("pid") and relay_alive(info):
+        return info
+    subprocess.Popen(
+        [sys.executable, "-I", os.path.realpath(__file__), "relay"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        fresh = read_relay_info()
+        if fresh.get("pid") != info.get("pid") and relay_alive(fresh):
+            return fresh
+    raise ProtectError("the stream relay did not start; run `eld-unifi-protect relay` to see why")
+
+
+def relay_url(console_id, rtsps_url):
+    """The loopback URL a player opens for one of Protect's RTSPS URLs."""
+    info = ensure_relay()
+    path = urllib.parse.urlsplit(rtsps_url).path
+    return f"rtsp://127.0.0.1:{info['port']}/{info['token']}/{console_id}{path}"
+
+
+def read_exact(reader, count):
+    data = reader.read(count)
+    return data if len(data) == count else None
+
+
+def read_rtsp(reader):
+    """One RTSP message or interleaved frame, or None at end of stream.
+
+    Returns ("frame", raw_bytes) for $-framed media, which is passed through
+    untouched, or ("text", start_line, headers, body) for requests and
+    responses, which may need their URLs rewritten.
+    """
+    first = reader.read(1)
+    if not first:
+        return None
+    if first == b"$":
+        header = read_exact(reader, 3)
+        if header is None:
+            return None
+        payload = read_exact(reader, int.from_bytes(header[1:3], "big"))
+        if payload is None:
+            return None
+        return ("frame", first + header + payload)
+    line = first + reader.readline(8192)
+    start = line.decode("latin-1").rstrip("\r\n")
+    headers = []
+    while True:
+        line = reader.readline(8192)
+        if not line:
+            return None
+        line = line.decode("latin-1").rstrip("\r\n")
+        if not line:
+            break
+        name, _, value = line.partition(":")
+        headers.append((name.strip(), value.strip()))
+    length = 0
+    for name, value in headers:
+        if name.lower() == "content-length":
+            length = int(value or 0)
+    body = read_exact(reader, length) if length else b""
+    if body is None:
+        return None
+    return ("text", start, headers, body)
+
+
+def header_value(headers, wanted):
+    for name, value in headers:
+        if name.lower() == wanted:
+            return value
+    return ""
+
+
+def encode_rtsp(start, headers, body):
+    lines = [start]
+    for name, value in headers:
+        if name.lower() != "content-length":
+            lines.append(f"{name}: {value}")
+    if body:
+        lines.append(f"Content-Length: {len(body)}")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
+
+
+class RelaySession:
+    """One player connection, tunnelled to one console over pinned TLS."""
+
+    def __init__(self, client, relay):
+        self.client = client
+        self.relay = relay
+        self.client_reader = client.makefile("rb", buffering=65536)
+        self.upstream = None
+        self.console = None
+        self.local_base = ""
+        self.remote_base = ""
+
+    def reply(self, code, reason, cseq):
+        self.client.sendall(f"RTSP/1.0 {code} {reason}\r\nCSeq: {cseq}\r\n\r\n".encode())
+
+    def route(self, url):
+        """Check the token and find the console a request URL names."""
+        parts = urllib.parse.urlsplit(url).path.split("/")
+        if len(parts) < 3 or not hmac.compare_digest(parts[1], self.relay.token):
+            return None
+        return self.relay.consoles.get(parts[2])
+
+    def connect(self, console):
+        name, _ = split_host(console["host"])
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        raw = socket.create_connection((name, STREAM_PORT), timeout=8)
+        tls = context.wrap_socket(raw, server_hostname=name)
+        der = tls.getpeercert(binary_form=True)
+        if hashlib.sha256(der).hexdigest() != console.get("certSha256"):
+            tls.close()
+            raise ProtectError(f"{console['name']}: stream certificate does not match the pinned one")
+        tls.settimeout(None)
+        host = f"[{name}]" if ":" in name else name
+        self.console = console
+        self.upstream = tls
+        self.local_base = f"rtsp://127.0.0.1:{self.relay.port}/{self.relay.token}/{console['id']}"
+        self.remote_base = f"rtsps://{host}:{STREAM_PORT}"
+        # Absolute URLs in responses (Content-Base, RTP-Info) name the
+        # console; they must point back at the relay or the player would
+        # bypass it on the next request.
+        self.remote_pattern = re.compile(
+            r"rtsps?://(?:" + re.escape(host) + r"|[^/\s;,\"]+)(?::\d+)?(?=/)", re.I)
+        threading.Thread(target=self.pump_upstream, daemon=True).start()
+
+    def to_upstream(self, text):
+        return text.replace(self.local_base, self.remote_base)
+
+    def to_client(self, text):
+        return self.remote_pattern.sub(self.local_base, text)
+
+    def run(self):
+        try:
+            while True:
+                message = read_rtsp(self.client_reader)
+                if message is None:
+                    return
+                if message[0] == "frame":
+                    # RTCP receiver reports from the player.
+                    if self.upstream:
+                        self.upstream.sendall(message[1])
+                    continue
+                _, start, headers, body = message
+                method, _, rest = start.partition(" ")
+                url, _, version = rest.partition(" ")
+                cseq = header_value(headers, "cseq")
+                console = self.route(url) if url != "*" else self.console
+                if console is None:
+                    self.reply(404, "Not Found", cseq)
+                    return
+                if self.console is not None and console is not self.console:
+                    self.reply(400, "Bad Request", cseq)
+                    return
+                transport = header_value(headers, "transport")
+                if method == "SETUP" and "/TCP" not in transport.upper():
+                    # Refuse UDP: FFmpeg then retries over TCP, which keeps
+                    # every media packet inside the TLS tunnel.
+                    self.reply(461, "Unsupported Transport", cseq)
+                    continue
+                if self.upstream is None:
+                    try:
+                        self.connect(console)
+                    except (OSError, ProtectError):
+                        self.reply(502, "Bad Gateway", cseq)
+                        return
+                start = f"{method} {self.to_upstream(url)} {version}"
+                headers = [(n, self.to_upstream(v)) for n, v in headers]
+                self.upstream.sendall(encode_rtsp(start, headers, body))
+        except OSError:
+            pass
+        finally:
+            self.close()
+
+    def pump_upstream(self):
+        reader = self.upstream.makefile("rb", buffering=65536)
+        try:
+            while True:
+                message = read_rtsp(reader)
+                if message is None:
+                    return
+                if message[0] == "frame":
+                    self.client.sendall(message[1])
+                    continue
+                _, start, headers, body = message
+                headers = [(n, self.to_client(v)) for n, v in headers]
+                if body:
+                    body = self.to_client(body.decode("latin-1")).encode("latin-1")
+                self.client.sendall(encode_rtsp(start, headers, body))
+        except OSError:
+            pass
+        finally:
+            self.close()
+
+    def close(self):
+        for sock in (self.client, self.upstream):
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                sock.close()
+
+
+class Relay:
+    def __init__(self, config):
+        self.consoles = {c["id"]: c for c in config["consoles"]}
+        previous = read_relay_info()
+        # Reuse the last port and token, so URLs handed out before an idle
+        # exit keep working when a player reconnects.
+        self.token = previous.get("token") or secrets.token_urlsafe(18)
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server.bind(("127.0.0.1", int(previous.get("port") or 0)))
+        except OSError:
+            self.server.bind(("127.0.0.1", 0))
+        self.port = self.server.getsockname()[1]
+        self.server.listen(32)
+        self.active = 0
+        self.last_activity = time.monotonic()
+        self.lock = threading.Lock()
+
+    def serve(self):
+        write_json(RELAY_INFO, {"pid": os.getpid(), "port": self.port, "token": self.token})
+        threading.Thread(target=self.reap_when_idle, daemon=True).start()
+        while True:
+            client, _ = self.server.accept()
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            threading.Thread(target=self.handle, args=(client,), daemon=True).start()
+
+    def handle(self, client):
+        with self.lock:
+            self.active += 1
+        try:
+            RelaySession(client, self).run()
+        finally:
+            with self.lock:
+                self.active -= 1
+                self.last_activity = time.monotonic()
+
+    def reap_when_idle(self):
+        while True:
+            time.sleep(5)
+            with self.lock:
+                idle = self.active == 0 and time.monotonic() - self.last_activity > RELAY_IDLE_EXIT
+            if idle:
+                os._exit(0)
+
+
+def cmd_relay(args):
+    """Run the stream relay. Started on demand; exits after a minute idle."""
+    # main() restores the default SIGPIPE so the CLI behaves in pipelines;
+    # here it would kill the relay the moment any player hangs up. Ignored,
+    # a write to a closed socket raises, and only that session ends.
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    lock = open(RELAY_LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return  # another relay is already running
+    Relay(require_config()).serve()
+
+
+class Protect:
+    def __init__(self, console, config=None):
+        self.console = console
+        self.host = console["host"]
+        self.name, self.port = split_host(self.host)
+        self.key = console["apiKey"]
+        self.pin = console.get("certSha256")
+        self.timeout = float((config or {}).get("timeoutSec", 8))
+
+    def request(self, method, path, body=None, params=None, raw=False):
+        # The Integration API rate-limits per key. A burst (opening the wall,
+        # several cameras at once) gets 429s that clear within a second or
+        # two, so wait as asked and try again rather than fail the camera.
+        for attempt in range(4):
+            status, headers, data = self._send(method, path, body, params)
+            if status != 429 or attempt == 3:
+                break
+            try:
+                delay = float(headers.get("Retry-After") or 0)
+            except ValueError:
+                delay = 0
+            time.sleep(min(10.0, delay or 0.5 * 2 ** attempt))
+        if status in (401, 403):
+            raise ProtectError("console rejected the API key (HTTP %d)" % status)
+        if status == 404:
+            raise ProtectError("not found: is UniFi Protect installed and up to date on this console?")
+        if status == 429:
+            raise ProtectError("console is rate limiting requests; try again in a moment")
+        if status >= 400:
+            detail = data[:200].decode(errors="replace").strip()
+            raise ProtectError(f"HTTP {status} from console: {detail}")
+        if raw:
+            return data
+        return json.loads(data) if data else None
+
+    def _send(self, method, path, body, params):
+        url = API_BASE + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params, doseq=True)
+        headers = {"X-API-KEY": self.key, "Accept": "application/json"}
+        payload = None
+        if body is not None:
+            payload = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        conn = PinnedHTTPSConnection(self.name, self.port, self.pin, self.timeout)
+        try:
+            conn.request(method, url, body=payload, headers=headers)
+            response = conn.getresponse()
+            return response.status, response.headers, response.read()
+        except ProtectError:
+            raise
+        except (OSError, http.client.HTTPException) as error:
+            raise ProtectError(f"cannot reach {self.host}: {error}")
+        finally:
+            conn.close()
+
+    def info(self):
+        return self.request("GET", "/meta/info")
+
+    def cameras(self):
+        return self.request("GET", "/cameras") or []
+
+    def snapshot(self, camera_id, high_quality=False):
+        return self.request(
+            "GET",
+            f"/cameras/{camera_id}/snapshot",
+            params={"highQuality": "true" if high_quality else "false"},
+            raw=True,
+        )
+
+    def stream_urls(self, camera_id, qualities):
+        """Relay URLs for the given qualities, creating any that are missing.
+
+        Creating a stream turns on RTSPS for that channel on the camera; it
+        stays enabled, so this happens once per quality. Protect's URLs are
+        stable, so they are cached for the session rather than fetched per
+        view; the relay URL wrapping them is built fresh each time.
+        """
+        cache = load_stream_cache()
+        cache_key = f"{self.host}/{camera_id}"
+        known = cache.get(cache_key, {})
+        if all(known.get(q) for q in qualities):
+            return {q: relay_url(self.console["id"], known[q]) for q in qualities}
+
+        streams = self.request("GET", f"/cameras/{camera_id}/rtsps-stream") or {}
+        missing = [q for q in qualities if not streams.get(q)]
+        if missing:
+            created = self.request(
+                "POST", f"/cameras/{camera_id}/rtsps-stream", body={"qualities": missing}
+            ) or {}
+            streams.update({k: v for k, v in created.items() if v})
+        urls = {}
+        for quality in qualities:
+            url = streams.get(quality)
+            if not url:
+                raise ProtectError(f"console did not return a {quality} stream for this camera")
+            urls[quality] = url
+        with STREAM_CACHE_LOCK:
+            # Re-read under the lock so concurrent lookups add to the cache
+            # instead of overwriting each other's entries.
+            cache = load_stream_cache()
+            cache.setdefault(cache_key, {}).update(urls)
+            write_json(STREAM_CACHE, cache)
+        return {q: relay_url(self.console["id"], u) for q, u in urls.items()}
+
+    def stream_url(self, camera_id, quality):
+        return self.stream_urls(camera_id, [quality])[quality]
+
+
+def summarize_camera(camera, console):
+    flags = camera.get("featureFlags") or {}
+    state = camera.get("state") or "UNKNOWN"
+    return {
+        "uid": console["id"] + "_" + str(camera.get("id")),
+        "id": camera.get("id"),
+        "console": console["id"],
+        "consoleName": console["name"],
+        "mac": (camera.get("mac") or "").lower().replace(":", ""),
+        "name": camera.get("name") or camera.get("type") or "Camera",
+        "model": camera.get("type") or camera.get("modelKey") or "",
+        "state": state,
+        "online": state == "CONNECTED",
+        "hasMic": bool(flags.get("hasMic")),
+        "hasPackageCamera": bool(camera.get("hasPackageCamera")),
+    }
+
+
+# ---- camera preferences ----------------------------------------------------
+#
+# Which cameras to hide. Kept apart from config.json so it holds no secret
+# and can be edited, synced or shared freely. Cameras are keyed by MAC, so a
+# hidden camera stays hidden when it moves to another console.
+
+PREFS_PATH = os.path.join(CONFIG_DIR, "cameras.json")
+
+
+def load_prefs():
+    try:
+        with open(PREFS_PATH) as handle:
+            prefs = json.load(handle)
+    except (OSError, ValueError):
+        prefs = {}
+    return {"hideOffline": bool(prefs.get("hideOffline", False)),
+            "hidden": list(prefs.get("hidden", []))}
+
+
+def save_prefs(prefs):
+    write_atomic(PREFS_PATH, json.dumps(prefs, indent=2) + "\n", mode=0o644)
+
+
+def camera_key(camera):
+    return camera.get("mac") or camera.get("uid")
+
+
+def apply_prefs(cameras, prefs):
+    hidden = set(prefs["hidden"])
+    for camera in cameras:
+        camera["hidden"] = camera_key(camera) in hidden
+    return cameras
+
+
+def find_cameras(cameras, wanted):
+    """Match by uid, camera id, MAC, or name (case-insensitive)."""
+    wanted_l = wanted.lower()
+    exact = [c for c in cameras if wanted in (c.get("uid"), c.get("id"))
+             or wanted_l.replace(":", "") == c.get("mac")]
+    if exact:
+        return exact
+    return [c for c in cameras if c.get("name", "").lower() == wanted_l]
+
+
+def merge_cameras(cameras):
+    """Drop stale copies of a camera that moved between consoles.
+
+    A camera moved from a gateway to an NVR stays listed on the gateway as
+    DISCONNECTED. Keep one entry per MAC, preferring a connected one, so the
+    ghost never hides the live copy.
+    """
+    best = {}
+    order = []
+    for camera in cameras:
+        key = camera["mac"] or camera["uid"]
+        if key not in best:
+            best[key] = camera
+            order.append(key)
+        elif camera["online"] and not best[key]["online"]:
+            best[key] = camera
+    return sorted((best[k] for k in order), key=lambda c: (c["consoleName"].lower(), c["name"].lower()))
+
+
+# ---- state ---------------------------------------------------------------
+
+
+def previous_state():
+    try:
+        with open(STATE_PATH) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def fetch_console(console, config):
+    try:
+        cameras = [summarize_camera(c, console) for c in Protect(console, config).cameras()]
+        return {"cameras": cameras, "error": None}
+    except ProtectError as error:
+        return {"cameras": None, "error": str(error)}
+
+
+def poll_cameras(config=None):
+    """Refresh state.json from every console. Never raises.
+
+    Consoles are polled in parallel, so a slow or dead one cannot hold up the
+    others; its cameras keep their last known entries, marked stale.
+    """
+    now = int(time.time())
+    try:
+        config = config or load_config()
+    except ProtectError as error:
+        config = None
+        load_error = str(error)
+    else:
+        load_error = None
+    if config is None:
+        state = {"configured": False, "updatedAt": now, "cameras": [], "consoles": []}
+        if load_error:
+            state["error"] = load_error
+        write_json(STATE_PATH, state)
+        return state
+
+    previous = previous_state()
+    previous_cameras = previous.get("cameras", [])
+    consoles = config["consoles"]
+    with ThreadPoolExecutor(max_workers=len(consoles)) as pool:
+        results = list(pool.map(lambda c: fetch_console(c, config), consoles))
+
+    cameras = []
+    summaries = []
+    errors = []
+    for console, result in zip(consoles, results):
+        stale = result["error"] is not None
+        if stale:
+            errors.append(f"{console['name']}: {result['error']}")
+            listed = [dict(c, online=False, stale=True) for c in previous_cameras
+                      if c.get("console") == console["id"]]
+        else:
+            listed = result["cameras"]
+        cameras.extend(listed)
+        summaries.append({
+            "id": console["id"],
+            "name": console["name"],
+            "host": console["host"],
+            "stale": stale,
+            "error": result["error"],
+            "cameraCount": len(listed),
+        })
+
+    state = {
+        "configured": True,
+        "host": "  ·  ".join(c["host"] for c in consoles),
+        "updatedAt": now,
+        "stale": bool(errors),
+        "error": "; ".join(errors) if errors else None,
+        "consoles": summaries,
+        "hideOffline": load_prefs()["hideOffline"],
+        "cameras": apply_prefs(merge_cameras(cameras), load_prefs()),
+    }
+    write_json(STATE_PATH, state)
+    return state
+
+
+def snapshot_path(uid):
+    return os.path.join(SNAP_DIR, f"{uid}.jpg")
+
+
+def load_index():
+    try:
+        with open(SNAP_INDEX) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def refresh_snapshots(config, cameras, index):
+    clients = {c["id"]: Protect(c, config) for c in config["consoles"]}
+
+    def grab(camera):
+        client = clients.get(camera.get("console"))
+        if client is None or not camera.get("online"):
+            return None
+        try:
+            data = client.snapshot(camera["id"])
+        except ProtectError:
+            return None
+        if data:
+            write_atomic(snapshot_path(camera["uid"]), data)
+            return camera["uid"]
+        return None
+
+    # A handful of workers: enough that one slow camera does not stretch
+    # the refresh for the rest, few enough not to trip the API rate limit.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for uid in pool.map(grab, cameras):
+            if uid:
+                index[uid] = time.time()
+    write_json(SNAP_INDEX, index)
+
+
+# ---- commands ------------------------------------------------------------
+
+
+def cmd_setup(args):
+    config = load_config() or {"consoles": [], "timeoutSec": 8}
+    consoles = config["consoles"]
+    print("UniFi Protect setup\n")
+    if consoles:
+        print("Configured consoles:")
+        for console in consoles:
+            print(f"  {console['name']}  ({console['host']})")
+        print("\nEnter a new address to add a console, or an existing one to replace its key.\n")
+
+    default_host = "" if consoles else "192.168.1.1"
+    prompt = f"Console address [{default_host}]: " if default_host else "Console address: "
+    host = input(prompt).strip() or default_host
+    host = host.removeprefix("https://").removeprefix("http://").rstrip("/")
+    if not host:
+        raise ProtectError("no address given")
+    existing = next((c for c in consoles if c["host"] == host), {})
+
+    try:
+        pin = fetch_cert_fingerprint(host)
+    except OSError as error:
+        raise ProtectError(f"cannot reach {host}: {error}")
+    print(f"\nConsole certificate SHA-256:\n  {pin}")
+    if existing.get("certSha256") and existing["certSha256"] != pin:
+        print("  (this differs from the certificate pinned previously)")
+    if input("Trust this certificate? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+        raise ProtectError("setup cancelled")
+
+    print(
+        "\nCreate an API key on this console itself, not on unifi.ui.com:\n"
+        f"  1. Open https://{host} in a browser and sign in.\n"
+        "  2. Click Integrations in the left sidebar (at the bottom of the icon bar).\n"
+        "     On older UniFi OS: Settings → scroll the tabs sideways → Integrations.\n"
+        "  3. Create API Key. It is shown once; copy it before closing the dialog.\n"
+        "Each console needs its own key: a gateway's key does not work on an NVR.\n"
+    )
+    key = getpass.getpass("API key (input hidden, paste with Super+V): ").strip()
+    if not key and existing.get("apiKey"):
+        key = existing["apiKey"]
+        print("  keeping the existing key")
+    if not key:
+        raise ProtectError("no API key given")
+
+    probe = {"id": "probe", "name": host, "host": host, "apiKey": key, "certSha256": pin}
+    client = Protect(probe, config)
+    info = client.info() or {}
+    cameras = client.cameras()
+    online = sum(1 for c in cameras if c.get("state") == "CONNECTED")
+    print(
+        f"\nConnected to UniFi Protect {info.get('applicationVersion', '')}".rstrip()
+        + f" · {online}/{len(cameras)} camera(s) online"
+    )
+
+    default_name = existing.get("name") or ("NVR" if consoles else "Console")
+    if existing.get("name") == host:
+        default_name = "Console"
+    name = input(f"Name for this console [{default_name}]: ").strip() or default_name
+    taken = {c["id"] for c in consoles if c is not existing}
+    console_id = existing.get("id") if existing and existing.get("id") not in taken else slugify(name)
+    base, n = console_id, 2
+    while console_id in taken:
+        console_id, n = f"{base}-{n}", n + 1
+
+    entry = {"id": console_id, "name": name, "host": host, "apiKey": key, "certSha256": pin}
+    if existing:
+        consoles[consoles.index(existing)] = entry
+    else:
+        consoles.append(entry)
+    save_config(config)
+    print(f"Saved {CONFIG_PATH} (readable only by you)")
+    poll_cameras(config)
+    if len(consoles) == 1:
+        print("Got another console, such as an NVR? Run `eld-unifi-protect setup` again to add it.")
+    print("Click the camera icon in the bar to see your cameras.")
+
+
+def cmd_consoles(args):
+    config = require_config()
+    state = {c["id"]: c for c in previous_state().get("consoles", [])}
+    for console in config["consoles"]:
+        seen = state.get(console["id"], {})
+        status = "unreachable" if seen.get("stale") else f"{seen.get('cameraCount', '?')} cameras"
+        print(f"{console['id']:<16} {console['name']:<20} {console['host']:<20} {status}")
+
+
+def cmd_remove(args):
+    config = require_config()
+    console = find_console(config, args.console)
+    if not args.yes and input(f"Remove {console['name']} ({console['host']})? [y/N] ").strip().lower() not in ("y", "yes"):
+        raise ProtectError("not changed")
+    config["consoles"].remove(console)
+    if config["consoles"]:
+        save_config(config)
+    else:
+        os.remove(CONFIG_PATH)
+    # Drop its cameras from the panel now rather than on the next poll.
+    state = previous_state()
+    state["cameras"] = [c for c in state.get("cameras", []) if c.get("console") != console["id"]]
+    write_json(STATE_PATH, state)
+    poll_cameras()
+    print(f"Removed {console['name']}. Revoke its API key on the console as well.")
+
+
+def cmd_trust_cert(args):
+    config = require_config()
+    targets = [find_console(config, args.console)] if args.console else config["consoles"]
+    changed = False
+    for console in targets:
+        pin = fetch_cert_fingerprint(console["host"])
+        print(f"{console['name']} ({console['host']})\n  pinned:  {console.get('certSha256')}\n  current: {pin}")
+        if pin == console.get("certSha256"):
+            print("  already trusted")
+            continue
+        if args.yes or input("  Trust the current certificate? [y/N] ").strip().lower() in ("y", "yes"):
+            console["certSha256"] = pin
+            changed = True
+    if changed:
+        save_config(config)
+        print("Updated.")
+
+
+def cmd_poll(args):
+    state = poll_cameras()
+    if args.print:
+        print(json.dumps(state, indent=2))
+
+
+def cmd_cameras(args):
+    state = poll_cameras(require_config())
+    for console in state.get("consoles", []):
+        if console.get("error"):
+            print(f"! {console['name']}: {console['error']}", file=sys.stderr)
+    for camera in state["cameras"]:
+        status = "online " if camera["online"] else "OFFLINE"
+        status += " hidden" if camera.get("hidden") else "       "
+        print(f"{status}  {camera['uid']:<40} {camera['consoleName']:<12} {camera['name']}  ({camera['model']})")
+
+
+def cmd_snapshot(args):
+    client, camera_id = resolve_camera(require_config(), args.camera)
+    data = client.snapshot(camera_id, high_quality=args.high)
+    out = args.output or snapshot_path(args.camera)
+    write_atomic(out, data, mode=0o600)
+    print(out)
+
+
+def cmd_watch(args):
+    """Snapshot loop the panel runs while it is open.
+
+    Exits on its own when its parent (the shell) goes away, so a crashed or
+    restarted shell can never leave it hammering the consoles.
+    """
+    parent = os.getppid()
+    interval = max(1.0, args.interval)
+    index = load_index()
+    last_poll = 0.0
+    cameras = previous_state().get("cameras", [])
+    while os.getppid() == parent:
+        started = time.monotonic()
+        try:
+            config = load_config()
+            if config is None:
+                poll_cameras()
+                time.sleep(10)
+                continue
+            if started - last_poll > 60 or not cameras:
+                cameras = poll_cameras(config).get("cameras", [])
+                last_poll = started
+            refresh_snapshots(config, cameras, index)
+        except ProtectError:
+            pass
+        time.sleep(max(0.2, interval - (time.monotonic() - started)))
+
+
+def cmd_stream(args):
+    client, camera_id = resolve_camera(require_config(), args.camera)
+    print(client.stream_url(camera_id, args.quality))
+
+
+def cmd_live(args):
+    client, camera_id = resolve_camera(require_config(), args.camera)
+    url = client.stream_url(camera_id, args.quality)
+    title = args.title or "UniFi Protect"
+    player = shutil.which("mpv")
+    if not player:
+        raise ProtectError("mpv is not installed: omarchy pkg add mpv")
+    command = [
+        player,
+        "--no-terminal",
+        f"--title={title}",
+        "--force-window=immediate",
+        "--profile=low-latency",
+        "--untimed",
+        "--cache=no",
+        "--rtsp-transport=tcp",
+        # mpv decodes on the CPU unless told otherwise; a 4K stream costs
+        # roughly a third of a core that way, against a few percent on the GPU.
+        "--hwdec=auto-safe",
+        "--mute=yes",
+        "--keep-open=no",
+        "--x11-name=eld-unifi-protect",
+        "--wayland-app-id=eld-unifi-protect",
+        url,
+    ]
+    os.execv(player, command)
+
+
+def cmd_open(args):
+    config = require_config()
+    console = find_console(config, args.console) if args.console else config["consoles"][0]
+    subprocess.Popen(
+        ["xdg-open", f"https://{console['host']}/protect/dashboard"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def cmd_doctor(args):
+    ok = True
+
+    def report(good, label, detail=""):
+        nonlocal ok
+        ok = ok and good
+        print(("  ok   " if good else "  FAIL ") + label + (f" — {detail}" if detail else ""))
+
+    config = load_config()
+    report(config is not None, "config", CONFIG_PATH if config else "run `eld-unifi-protect setup`")
+    report(shutil.which("mpv") is not None, "mpv installed (pop-out player)")
+    for console in (config or {}).get("consoles", []):
+        print(f"\n{console['name']} ({console['host']})")
+        try:
+            pin = fetch_cert_fingerprint(console["host"])
+            report(pin == console.get("certSha256"), "certificate matches pin")
+        except OSError as error:
+            report(False, "console reachable", str(error))
+            continue
+        try:
+            client = Protect(console, config)
+            info = client.info() or {}
+            report(True, "API key accepted", "Protect " + str(info.get("applicationVersion", "?")))
+            cameras = client.cameras()
+            online = sum(1 for c in cameras if c.get("state") == "CONNECTED")
+            report(True, "cameras", f"{online}/{len(cameras)} online")
+        except ProtectError as error:
+            report(False, "API", str(error))
+    sys.exit(0 if ok else 1)
+
+
+def cmd_hide(args, hide=True):
+    state = poll_cameras(require_config())
+    prefs = load_prefs()
+    hidden = set(prefs["hidden"])
+    for wanted in args.cameras:
+        matches = find_cameras(state["cameras"], wanted)
+        if not matches:
+            raise ProtectError(f"no camera {wanted!r}; see `eld-unifi-protect cameras`")
+        for camera in matches:
+            (hidden.add if hide else hidden.discard)(camera_key(camera))
+            print(("hidden   " if hide else "visible  ") + camera["name"] + "  ·  " + camera["consoleName"])
+    prefs["hidden"] = sorted(hidden)
+    save_prefs(prefs)
+    poll_cameras()
+
+
+def cmd_unhide(args):
+    if args.all:
+        prefs = load_prefs()
+        prefs["hidden"] = []
+        save_prefs(prefs)
+        poll_cameras()
+        print("all cameras visible")
+        return
+    if not args.cameras:
+        raise ProtectError("name a camera, or pass --all")
+    cmd_hide(args, hide=False)
+
+
+def cmd_hide_offline(args):
+    prefs = load_prefs()
+    if args.mode == "toggle":
+        prefs["hideOffline"] = not prefs["hideOffline"]
+    else:
+        prefs["hideOffline"] = args.mode == "on"
+    save_prefs(prefs)
+    poll_cameras()
+    print("offline cameras " + ("hidden" if prefs["hideOffline"] else "shown"))
+
+
+WALL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "wall")
+WALL_CONFIG = os.path.join(RUNTIME_DIR, "wall.json")
+WALL_PID = os.path.join(RUNTIME_DIR, "wall.pid")
+
+
+def running_wall():
+    try:
+        with open(WALL_PID) as handle:
+            pid = int(handle.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            if b"quickshell" in handle.read():
+                return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def cmd_wall(args):
+    """Fullscreen live grid of every online camera, in its own process.
+
+    Running it again while it is up closes it, so one keybinding toggles it.
+    """
+    pid = running_wall()
+    if pid:
+        if args.no_toggle:
+            return
+        os.kill(pid, signal.SIGTERM)
+        return
+
+    config = require_config()
+    state = poll_cameras(config)
+    cameras = [c for c in state.get("cameras", []) if c.get("online") and not c.get("hidden")]
+    if not cameras:
+        raise ProtectError("no cameras online")
+    clients = {c["id"]: Protect(c, config) for c in config["consoles"]}
+    qualities = list(dict.fromkeys([args.quality, args.focus_quality]))
+
+    def resolve(camera):
+        try:
+            urls = clients[camera["console"]].stream_urls(camera["id"], qualities)
+            return dict(camera, grid=urls[args.quality], focus=urls[args.focus_quality])
+        except (ProtectError, KeyError) as error:
+            return dict(camera, error=str(error))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tiles = list(pool.map(resolve, cameras))
+
+    # The URLs embed per-camera access tokens: keep the file private.
+    write_json(WALL_CONFIG, {
+        "cameras": tiles,
+        "snapshotDir": SNAP_DIR,
+        "multiConsole": len(config["consoles"]) > 1,
+    })
+    quickshell = shutil.which("quickshell") or shutil.which("qs")
+    if not quickshell:
+        raise ProtectError("quickshell is not installed")
+    env = dict(os.environ, ELD_UNIFI_PROTECT_WALL=WALL_CONFIG)
+    process = subprocess.Popen(
+        [quickshell, "--no-duplicate", "--path", WALL_DIR],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    write_atomic(WALL_PID, str(process.pid))
+
+
+def main():
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    parser = argparse.ArgumentParser(prog="eld-unifi-protect", description=__doc__.splitlines()[0])
+    parser.add_argument("--version", action="version", version=f"%(prog)s {plugin_version()}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("setup", help="add a console, or replace a console's key").set_defaults(func=cmd_setup)
+    sub.add_parser("consoles", help="list configured consoles").set_defaults(func=cmd_consoles)
+    p = sub.add_parser("remove", help="remove a console")
+    p.add_argument("console", help="console id, name or address")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_remove)
+    p = sub.add_parser("trust-cert", help="re-pin console certificates")
+    p.add_argument("console", nargs="?")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_trust_cert)
+    p = sub.add_parser("poll", help="refresh the state file")
+    p.add_argument("--print", action="store_true")
+    p.set_defaults(func=cmd_poll)
+    sub.add_parser("cameras", help="list cameras").set_defaults(func=cmd_cameras)
+    p = sub.add_parser("snapshot", help="save a camera snapshot")
+    p.add_argument("camera")
+    p.add_argument("-o", "--output")
+    p.add_argument("--high", action="store_true", help="request a full-resolution snapshot")
+    p.set_defaults(func=cmd_snapshot)
+    p = sub.add_parser("watch", help="refresh snapshots in a loop (used by the panel)")
+    p.add_argument("--interval", type=float, default=3)
+    p.set_defaults(func=cmd_watch)
+    p = sub.add_parser("stream", help="print a camera's RTSPS URL")
+    p.add_argument("camera")
+    p.add_argument("--quality", choices=QUALITIES, default="medium")
+    p.set_defaults(func=cmd_stream)
+    p = sub.add_parser("live", help="play a camera in mpv")
+    p.add_argument("camera")
+    p.add_argument("--quality", choices=QUALITIES, default="high")
+    p.add_argument("--title")
+    p.set_defaults(func=cmd_live)
+    p = sub.add_parser("hide", help="hide cameras from the panel and wall")
+    p.add_argument("cameras", nargs="+", help="camera name, id or MAC")
+    p.set_defaults(func=cmd_hide)
+    p = sub.add_parser("unhide", help="show hidden cameras again")
+    p.add_argument("cameras", nargs="*")
+    p.add_argument("--all", action="store_true")
+    p.set_defaults(func=cmd_unhide)
+    p = sub.add_parser("hide-offline", help="hide cameras that are offline")
+    p.add_argument("mode", choices=("on", "off", "toggle"))
+    p.set_defaults(func=cmd_hide_offline)
+    sub.add_parser("relay", help="run the encrypted stream relay (started on demand)").set_defaults(func=cmd_relay)
+    p = sub.add_parser("wall", help="toggle a fullscreen live grid of all cameras")
+    p.add_argument("--quality", choices=QUALITIES, default="medium", help="stream for grid tiles")
+    p.add_argument("--focus-quality", choices=QUALITIES, default="high", help="stream for an enlarged camera")
+    p.add_argument("--no-toggle", action="store_true", help="do nothing if already open")
+    p.set_defaults(func=cmd_wall)
+    p = sub.add_parser("open", help="open Protect in the browser")
+    p.add_argument("console", nargs="?")
+    p.set_defaults(func=cmd_open)
+    sub.add_parser("doctor", help="check the setup").set_defaults(func=cmd_doctor)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except ProtectError as error:
+        print(f"eld-unifi-protect: {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
