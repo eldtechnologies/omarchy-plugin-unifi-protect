@@ -97,10 +97,68 @@ Panel {
   }
   readonly property bool healthy: configured && onlineCount === shownCameras.length
 
+  // ---- alerts ----
+  //
+  // The helper's `events` listener writes alerts.json; acknowledging writes
+  // alerts-ack.json. Unacknowledged alerts light the bar until the panel
+  // is opened; a camera's tile stays marked for ten minutes either way.
+  property var alertsData: ({})
+  property real ackedAt: 0
+  property real nowSec: Date.now() / 1000
+  readonly property var alerts: alertsData && alertsData.alerts ? alertsData.alerts : []
+  readonly property var unackedAlerts: alerts.filter(function(a) { return a.start > root.ackedAt })
+  readonly property bool alerting: configured && unackedAlerts.length > 0
+  readonly property var latestAlert: unackedAlerts.length ? unackedAlerts[unackedAlerts.length - 1] : null
+  readonly property int armedCount: allCameras.filter(function(c) {
+    return c.alerts && c.alerts.length > 0 }).length
+  readonly property var alertProblems: {
+    var out = []
+    var statuses = alertsData && alertsData.consoles ? alertsData.consoles : {}
+    for (var id in statuses) {
+      if (statuses[id] && statuses[id].connected === false && statuses[id].error) {
+        var name = id
+        for (var i = 0; i < consoles.length; i++) if (consoles[i].id === id) name = consoles[i].name
+        out.push(name + ": " + statuses[id].error)
+      }
+    }
+    return out
+  }
+
+  function alertLabel(kind) {
+    return { person: "Person", vehicle: "Vehicle", animal: "Animal", package: "Package",
+             ring: "Doorbell", motion: "Motion" }[kind] || kind
+  }
+
+  function ago(seconds) {
+    var age = root.nowSec - seconds
+    if (age < 60) return "just now"
+    if (age < 3600) return Math.floor(age / 60) + " min ago"
+    return Qt.formatTime(new Date(seconds * 1000), "HH:mm")
+  }
+
+  // The newest alert for a camera within the last ten minutes, or null.
+  function recentAlert(uid) {
+    for (var i = alerts.length - 1; i >= 0; i--) {
+      if (alerts[i].uid === uid) return root.nowSec - alerts[i].start < 600 ? alerts[i] : null
+    }
+    return null
+  }
+
+  function setArmed(camera, armed) {
+    Quickshell.execDetached(armed ? [root.cli, "alert", camera.uid]
+                                  : [root.cli, "alert", camera.uid, "--off"])
+  }
+
   readonly property string barTooltip: {
     if (!configured) return "UniFi Protect — not set up yet"
-    var lines = [onlineCount + "/" + shownCameras.length + " cameras online"
-                 + (hiddenCount ? " · " + hiddenCount + " hidden" : "")]
+    var lines = []
+    if (latestAlert) {
+      lines.push("● " + alertLabel(latestAlert.kind) + " · " + latestAlert.camera + " · "
+                 + Qt.formatTime(new Date(latestAlert.start * 1000), "HH:mm")
+                 + (unackedAlerts.length > 1 ? "  (+" + (unackedAlerts.length - 1) + " more)" : ""))
+    }
+    lines.push(onlineCount + "/" + shownCameras.length + " cameras online"
+                 + (hiddenCount ? " · " + hiddenCount + " hidden" : ""))
     for (var c = 0; c < consoles.length; c++)
       if (consoles[c].stale) lines.push("! " + consoles[c].name + " unreachable")
     for (var i = 0; i < shownCameras.length; i++)
@@ -396,15 +454,63 @@ Panel {
     onLoaded: root.applyIndex(text())
   }
 
+  FileView {
+    path: root.runtimeDir + "/alerts.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: { try { root.alertsData = JSON.parse(text()) } catch (error) { } }
+  }
+
+  FileView {
+    path: root.runtimeDir + "/alerts-ack.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: { try { root.ackedAt = JSON.parse(text()).ackedAt || 0 } catch (error) { } }
+  }
+
+  // Keeps "2 min ago" and the ten-minute tile marks current.
+  Timer {
+    interval: 30000
+    repeat: true
+    running: root.alerts.length > 0
+    onTriggered: root.nowSec = Date.now() / 1000
+  }
+
+  // The listener runs while any camera is armed, panel open or not. It exits
+  // by itself once nothing is armed, or if the shell goes away; this
+  // restarts it if it stops while cameras are still armed.
+  Process {
+    id: eventsProcess
+    running: false
+    command: [root.cli, "events", "--follow-parent"]
+  }
+
+  Timer {
+    interval: 5000
+    repeat: true
+    triggeredOnStart: true
+    running: root.configured && root.armedCount > 0
+    onTriggered: if (!eventsProcess.running) eventsProcess.running = true
+  }
+
   Component.onCompleted: reloadState()
 
   onOpenedChanged: {
     if (opened) {
       root.reloadState()
       indexFile.reload()
+      root.nowSec = Date.now() / 1000
+      // Opening the panel is seeing the alert: select the camera, and
+      // acknowledge so the bar stops flashing.
+      var newest = root.latestAlert
+      if (newest) Quickshell.execDetached([root.cli, "alert", "--ack"])
       if (root.selectedIndex >= cameras.length) root.selectedIndex = 0
       // The favourite sorts first; select it, and optionally go live.
-      if (cameras.length && cameras[0].favorite) {
+      if (newest) {
+        for (var a = 0; a < cameras.length; a++) if (cameras[a].uid === newest.uid) root.selectedIndex = a
+      } else if (cameras.length && cameras[0].favorite) {
         root.selectedIndex = 0
         if (root.openFavoriteLive && cameras[0].online) root.openLive(cameras[0])
       }
@@ -984,6 +1090,17 @@ Panel {
 
             Text {
               textFormat: Text.PlainText
+              visible: root.armedCount > 0 && root.alertProblems.length > 0
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "Alerts paused · " + root.alertProblems.join("; ")
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              textFormat: Text.PlainText
               visible: root.stale
               width: parent.width
               wrapMode: Text.WordWrap
@@ -1029,8 +1146,10 @@ Panel {
                   radius: Style.cornerRadius
                   color: root.surface
                   clip: true
-                  border.width: selected || tileMouse.containsMouse ? Math.max(1, Style.space(2)) : 0
-                  border.color: Color.accent
+                  readonly property var alert: root.recentAlert(modelData.uid)
+                  readonly property bool armed: modelData.alerts && modelData.alerts.length > 0
+                  border.width: alert || selected || tileMouse.containsMouse ? Math.max(1, Style.space(2)) : 0
+                  border.color: alert ? root.urgent : Color.accent
 
                   readonly property bool hiddenTile: root.isHidden(modelData)
 
@@ -1082,12 +1201,13 @@ Panel {
 
                   Text {
                     anchors.left: parent.left
-                    anchors.right: starButton.left
+                    anchors.right: bellButton.left
                     anchors.bottom: parent.bottom
                     anchors.margins: Style.space(8)
                     textFormat: Text.PlainText
                     text: (tile.index < 9 ? (tile.index + 1) + "  " : "")
-                        + (tile.modelData.favorite ? "★ " : "") + tile.modelData.name
+                        + (tile.modelData.favorite ? "★ " : "") + (tile.armed ? "\uf0f3 " : "")
+                        + tile.modelData.name
                         + (root.multiConsole ? "  ·  " + tile.modelData.consoleName : "")
                     color: "white"
                     font.family: root.fontFamily
@@ -1103,6 +1223,46 @@ Panel {
                     cursorShape: Qt.PointingHandCursor
                     onEntered: root.selectedIndex = tile.index
                     onClicked: root.openLive(tile.modelData)
+                  }
+
+                  // What was seen, and when, while the camera's alert is recent.
+                  Rectangle {
+                    visible: tile.alert !== null
+                    anchors.top: parent.top
+                    anchors.right: parent.right
+                    anchors.margins: Style.space(8)
+                    width: alertBadge.implicitWidth + Style.space(12)
+                    height: alertBadge.implicitHeight + Style.space(4)
+                    radius: height / 2
+                    color: root.urgent
+
+                    Text {
+                      id: alertBadge
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: tile.alert ? root.alertLabel(tile.alert.kind) + " · " + root.ago(tile.alert.start) : ""
+                      color: "white"
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                  }
+
+                  PanelActionButton {
+                    id: bellButton
+                    anchors.right: starButton.left
+                    anchors.bottom: parent.bottom
+                    anchors.margins: Style.space(4)
+                    visible: tile.modelData.online || tile.armed
+                    property bool pointerInside: false
+                    opacity: tileMouse.containsMouse || pointerInside ? 1 : 0
+                    onHovered: function(isHovered) { pointerInside = isHovered }
+                    iconText: tile.armed ? "\uf0f3" : "\uf1f6"
+                    tooltipText: tile.armed ? "Stop alerts for " + tile.modelData.name
+                                 : "Alert on a person, vehicle or doorbell at " + tile.modelData.name
+                    foreground: "white"
+                    fontFamily: root.fontFamily
+                    onClicked: root.setArmed(tile.modelData, !tile.armed)
                   }
 
                   PanelActionButton {
