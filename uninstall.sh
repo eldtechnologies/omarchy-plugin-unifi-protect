@@ -7,12 +7,13 @@ plugin_id="com.eldtechnologies.unifi-protect"
 plugin_dir="$HOME/.config/omarchy/plugins/$plugin_id"
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/eld-unifi-protect"
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/eld-unifi-protect"
-runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/eld-unifi-protect"
+# Only the private runtime directory; never guess a shared path like /tmp.
+runtime_dir="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/eld-unifi-protect}"
 
 omarchy plugin disable "$plugin_id" 2>/dev/null || true
 if [[ -L $plugin_dir ]]; then rm "$plugin_dir"; else rm -rf "$plugin_dir"; fi
 rm -f "$HOME/.local/bin/eld-unifi-protect"
-rm -rf "$runtime_dir"
+[[ -n $runtime_dir ]] && rm -rf "$runtime_dir"
 omarchy-shell shell rescanPlugins 2>/dev/null || true
 
 purge=${1:-}

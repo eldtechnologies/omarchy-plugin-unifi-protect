@@ -23,6 +23,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import ssl
 import subprocess
 import sys
@@ -40,7 +41,12 @@ STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, 
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 # Snapshots are disposable and rewritten every few seconds: keep them in
 # tmpfs so they never wear the disk or survive a reboot.
-RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "eld-unifi-protect")
+# Snapshots, stream URLs and the relay's token live here. It must be the
+# per-user, owner-only runtime directory: never a shared fallback such as
+# /tmp, where another user could plant files or symlinks ahead of us.
+# check_runtime_dir() enforces that before any command runs.
+RUNTIME_BASE = os.environ.get("XDG_RUNTIME_DIR") or ""
+RUNTIME_DIR = os.path.join(RUNTIME_BASE, "eld-unifi-protect") if RUNTIME_BASE else ""
 SNAP_DIR = os.path.join(RUNTIME_DIR, "snapshots")
 SNAP_INDEX = os.path.join(SNAP_DIR, "index.json")
 
@@ -1268,6 +1274,41 @@ def cmd_wall(args):
     write_atomic(WALL_PID, str(process.pid))
 
 
+def private_dir_problem(path):
+    """Why path is not a private directory of ours, or None if it is."""
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        return f"cannot use {path}: {error.strerror}"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return f"{path} is not a directory"
+    if info.st_uid != os.getuid():
+        return f"{path} is not owned by you"
+    if info.st_mode & 0o077:
+        return f"{path} is accessible to other users"
+    return None
+
+
+def check_runtime_dir():
+    if not RUNTIME_BASE:
+        raise ProtectError("XDG_RUNTIME_DIR is not set; it is needed for a private runtime directory")
+    problem = private_dir_problem(RUNTIME_BASE)
+    if problem:
+        raise ProtectError(problem)
+    try:
+        os.mkdir(RUNTIME_DIR, 0o700)
+    except FileExistsError:
+        # Earlier versions let os.makedirs create this as a side effect of a
+        # deeper path, with default 0755 permissions. If it is our own real
+        # directory, tighten it rather than refuse to run.
+        info = os.lstat(RUNTIME_DIR)
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+            os.chmod(RUNTIME_DIR, 0o700)
+    problem = private_dir_problem(RUNTIME_DIR)
+    if problem:
+        raise ProtectError(problem)
+
+
 def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     parser = argparse.ArgumentParser(prog="eld-unifi-protect", description=__doc__.splitlines()[0])
@@ -1328,6 +1369,7 @@ def main():
 
     args = parser.parse_args()
     try:
+        check_runtime_dir()
         args.func(args)
     except ProtectError as error:
         print(f"eld-unifi-protect: {error}", file=sys.stderr)
