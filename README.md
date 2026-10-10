@@ -226,7 +226,11 @@ streams.
   your machine.
 - **Streams get switched on:** if a camera has no stream yet for the quality
   you open, the plugin enables one, the same as turning on RTSP in the
-  camera's Protect settings. It stays enabled.
+  camera's Protect settings. It stays enabled. To forbid that, turn on
+  read-only mode: `eld-unifi-protect read-only on`. The plugin then never
+  changes anything on your consoles. It uses only streams already enabled in
+  Protect, falling back to the nearest enabled quality, and tells you how to
+  enable one when a camera has none.
 - **Rate limits:** requests that get HTTP 429 wait and retry, and stream URLs
   are cached for the session.
 
