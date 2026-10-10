@@ -1105,8 +1105,16 @@ def cmd_live(args):
         "--keep-open=no",
         "--x11-name=eld-unifi-protect",
         "--wayland-app-id=eld-unifi-protect",
-        url,
+        # The URL carries the relay token. Command lines are readable by
+        # every local user through /proc/<pid>/cmdline, so it goes to mpv as
+        # a one-line playlist on stdin instead.
+        "--playlist=-",
     ]
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, (url + "\n").encode())
+    os.close(write_fd)
+    os.dup2(read_fd, 0)
+    os.close(read_fd)
     os.execv(player, command)
 
 
