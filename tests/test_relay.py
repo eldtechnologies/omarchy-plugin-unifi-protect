@@ -5,8 +5,10 @@ console's RTSPS endpoint. The relay sits between it and a plain-socket
 client, exactly as it does between a player and a real console.
 """
 
+import faulthandler
 import hashlib
 import os
+import sys
 import shutil
 import socket
 import ssl
@@ -81,7 +83,8 @@ class RelayEndToEnd(unittest.TestCase):
                         "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", key,
                         "-out", cert, "-days", "1", "-subj", "/CN=fake-console"],
                        check=True, capture_output=True)
-        der = ssl.PEM_cert_to_DER_cert(open(cert).read())
+        with open(cert) as handle:
+            der = ssl.PEM_cert_to_DER_cert(handle.read())
         cls.pin = hashlib.sha256(der).hexdigest()
         cls.console = FakeConsole(cert, key)
         h.STREAM_PORT = cls.console.port      # the relay dials this "console"
@@ -108,7 +111,12 @@ class RelayEndToEnd(unittest.TestCase):
     def request(self, sock, reader, method, url, cseq, extra=()):
         headers = [("CSeq", str(cseq)), *extra]
         sock.sendall(h.encode_rtsp(f"{method} {url} RTSP/1.0", headers, b""))
-        return h.read_rtsp(reader)
+        try:
+            return h.read_rtsp(reader)
+        except TimeoutError:
+            # Show where the relay and the fake console are stuck.
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            raise
 
     def test_full_session_is_tunnelled_and_rewritten(self):
         sock, reader = self.connect()

@@ -85,13 +85,15 @@ class Files(unittest.TestCase):
     def test_write_atomic_is_private_and_complete(self):
         path = os.path.join(os.environ["XDG_STATE_HOME"], "t", "f.json")
         h.write_atomic(path, '{"a": 1}')
-        self.assertEqual(json.load(open(path)), {"a": 1})
+        with open(path) as handle:
+            self.assertEqual(json.load(handle), {"a": 1})
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         leftovers = [n for n in os.listdir(os.path.dirname(path)) if ".tmp." in n]
         self.assertEqual(leftovers, [])
 
     def test_version_comes_from_the_manifest(self):
-        manifest = json.load(open(ROOT / "manifest.json"))
+        with open(ROOT / "manifest.json") as handle:
+            manifest = json.load(handle)
         self.assertEqual(h.plugin_version(), manifest["version"])
 
 
