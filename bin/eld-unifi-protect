@@ -10,6 +10,7 @@ authenticated with a console API key (X-API-KEY).
 """
 
 import argparse
+import asyncio
 import fcntl
 import getpass
 import hashlib
@@ -367,20 +368,53 @@ def encode_rtsp(start, headers, body):
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
 
 
-class RelaySession:
-    """One player connection, tunnelled to one console over pinned TLS."""
+async def read_rtsp_async(reader):
+    """read_rtsp() for an asyncio StreamReader; None at end of stream."""
+    try:
+        first = await reader.readexactly(1)
+        if first == b"$":
+            header = await reader.readexactly(3)
+            payload = await reader.readexactly(int.from_bytes(header[1:3], "big"))
+            return ("frame", first + header + payload)
+        start = (first + await reader.readuntil(b"\n")).decode("latin-1").rstrip("\r\n")
+        headers = []
+        while True:
+            line = (await reader.readuntil(b"\n")).decode("latin-1").rstrip("\r\n")
+            if not line:
+                break
+            name, _, value = line.partition(":")
+            headers.append((name.strip(), value.strip()))
+        length = int(header_value(headers, "content-length") or 0)
+        body = await reader.readexactly(length) if length else b""
+        return ("text", start, headers, body)
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, ValueError):
+        return None
 
-    def __init__(self, client, relay):
-        self.client = client
+
+class RelaySession:
+    """One player connection, tunnelled to one console over pinned TLS.
+
+    Both directions run as coroutines on the relay's single event loop.
+    That is a correctness requirement, not a style choice: OpenSSL forbids
+    using one TLS connection from two threads at once, and the earlier
+    thread-per-direction design read and wrote it concurrently, which could
+    hang or crash the relay.
+    """
+
+    def __init__(self, relay, reader, writer):
         self.relay = relay
-        self.client_reader = client.makefile("rb", buffering=65536)
-        self.upstream = None
+        self.client_reader = reader
+        self.client_writer = writer
+        self.upstream_reader = None
+        self.upstream_writer = None
+        self.pump = None
         self.console = None
         self.local_base = ""
         self.remote_base = ""
 
-    def reply(self, code, reason, cseq):
-        self.client.sendall(f"RTSP/1.0 {code} {reason}\r\nCSeq: {cseq}\r\n\r\n".encode())
+    async def reply(self, code, reason, cseq):
+        self.client_writer.write(f"RTSP/1.0 {code} {reason}\r\nCSeq: {cseq}\r\n\r\n".encode())
+        await self.client_writer.drain()
 
     def route(self, url):
         """Check the token and find the console a request URL names."""
@@ -389,21 +423,25 @@ class RelaySession:
             return None
         return self.relay.consoles.get(parts[2])
 
-    def connect(self, console):
+    async def connect(self, console):
         name, _ = split_host(console["host"])
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        raw = socket.create_connection((name, STREAM_PORT), timeout=8)
-        tls = context.wrap_socket(raw, server_hostname=name)
-        der = tls.getpeercert(binary_form=True)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(name, STREAM_PORT, ssl=context, server_hostname=name), 8)
+        der = writer.get_extra_info("ssl_object").getpeercert(binary_form=True)
         if hashlib.sha256(der).hexdigest() != console.get("certSha256"):
-            tls.close()
+            writer.close()
             raise ProtectError(f"{console['name']}: stream certificate does not match the pinned one")
-        tls.settimeout(None)
-        host = f"[{name}]" if ":" in name else name
         self.console = console
-        self.upstream = tls
+        self.upstream_reader, self.upstream_writer = reader, writer
+        self.set_bases(console, name)
+        self.pump = asyncio.create_task(self.pump_upstream())
+
+    def set_bases(self, console, name):
+        """Set up URL rewriting between the relay and one console."""
+        host = f"[{name}]" if ":" in name else name
         self.local_base = f"rtsp://127.0.0.1:{self.relay.port}/{self.relay.token}/{console['id']}"
         self.remote_base = f"rtsps://{host}:{STREAM_PORT}"
         # Absolute URLs in responses (Content-Base, RTP-Info) name the
@@ -411,7 +449,6 @@ class RelaySession:
         # bypass it on the next request.
         self.remote_pattern = re.compile(
             r"rtsps?://(?:" + re.escape(host) + r"|[^/\s;,\"]+)(?::\d+)?(?=/)", re.I)
-        threading.Thread(target=self.pump_upstream, daemon=True).start()
 
     def to_upstream(self, text):
         return text.replace(self.local_base, self.remote_base)
@@ -419,16 +456,17 @@ class RelaySession:
     def to_client(self, text):
         return self.remote_pattern.sub(self.local_base, text)
 
-    def run(self):
+    async def run(self):
         try:
             while True:
-                message = read_rtsp(self.client_reader)
+                message = await read_rtsp_async(self.client_reader)
                 if message is None:
                     return
                 if message[0] == "frame":
                     # RTCP receiver reports from the player.
-                    if self.upstream:
-                        self.upstream.sendall(message[1])
+                    if self.upstream_writer:
+                        self.upstream_writer.write(message[1])
+                        await self.upstream_writer.drain()
                     continue
                 _, start, headers, body = message
                 method, _, rest = start.partition(" ")
@@ -436,59 +474,59 @@ class RelaySession:
                 cseq = header_value(headers, "cseq")
                 console = self.route(url) if url != "*" else self.console
                 if console is None:
-                    self.reply(404, "Not Found", cseq)
+                    await self.reply(404, "Not Found", cseq)
                     return
                 if self.console is not None and console is not self.console:
-                    self.reply(400, "Bad Request", cseq)
+                    await self.reply(400, "Bad Request", cseq)
                     return
                 transport = header_value(headers, "transport")
                 if method == "SETUP" and "/TCP" not in transport.upper():
                     # Refuse UDP: FFmpeg then retries over TCP, which keeps
                     # every media packet inside the TLS tunnel.
-                    self.reply(461, "Unsupported Transport", cseq)
+                    await self.reply(461, "Unsupported Transport", cseq)
                     continue
-                if self.upstream is None:
+                if self.upstream_writer is None:
                     try:
-                        self.connect(console)
-                    except (OSError, ProtectError):
-                        self.reply(502, "Bad Gateway", cseq)
+                        await self.connect(console)
+                    except (OSError, ProtectError, asyncio.TimeoutError):
+                        await self.reply(502, "Bad Gateway", cseq)
                         return
                 start = f"{method} {self.to_upstream(url)} {version}"
                 headers = [(n, self.to_upstream(v)) for n, v in headers]
-                self.upstream.sendall(encode_rtsp(start, headers, body))
+                self.upstream_writer.write(encode_rtsp(start, headers, body))
+                await self.upstream_writer.drain()
         except OSError:
             pass
         finally:
             self.close()
 
-    def pump_upstream(self):
-        reader = self.upstream.makefile("rb", buffering=65536)
+    async def pump_upstream(self):
         try:
             while True:
-                message = read_rtsp(reader)
+                message = await read_rtsp_async(self.upstream_reader)
                 if message is None:
                     return
                 if message[0] == "frame":
-                    self.client.sendall(message[1])
-                    continue
-                _, start, headers, body = message
-                headers = [(n, self.to_client(v)) for n, v in headers]
-                if body:
-                    body = self.to_client(body.decode("latin-1")).encode("latin-1")
-                self.client.sendall(encode_rtsp(start, headers, body))
+                    self.client_writer.write(message[1])
+                else:
+                    _, start, headers, body = message
+                    headers = [(n, self.to_client(v)) for n, v in headers]
+                    if body:
+                        body = self.to_client(body.decode("latin-1")).encode("latin-1")
+                    self.client_writer.write(encode_rtsp(start, headers, body))
+                await self.client_writer.drain()
         except OSError:
             pass
         finally:
             self.close()
 
     def close(self):
-        for sock in (self.client, self.upstream):
-            if sock is not None:
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                sock.close()
+        """Idempotent: either direction ending closes the whole session."""
+        if self.pump is not None and self.pump is not asyncio.current_task():
+            self.pump.cancel()
+        for writer in (self.client_writer, self.upstream_writer):
+            if writer is not None and not writer.is_closing():
+                writer.close()
 
 
 class Relay:
@@ -508,32 +546,34 @@ class Relay:
         self.server.listen(32)
         self.active = 0
         self.last_activity = time.monotonic()
-        self.lock = threading.Lock()
 
     def serve(self):
+        """Run the relay's event loop; blocks until the relay exits."""
+        asyncio.run(self._serve())
+
+    async def _serve(self):
         write_json(RELAY_INFO, {"pid": os.getpid(), "port": self.port, "token": self.token})
-        threading.Thread(target=self.reap_when_idle, daemon=True).start()
-        while True:
-            client, _ = self.server.accept()
-            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            threading.Thread(target=self.handle, args=(client,), daemon=True).start()
+        server = await asyncio.start_server(self.handle, sock=self.server)
+        reaper = asyncio.create_task(self.reap_when_idle())
+        async with server:
+            await server.serve_forever()
+        reaper.cancel()
 
-    def handle(self, client):
-        with self.lock:
-            self.active += 1
+    async def handle(self, reader, writer):
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.active += 1
         try:
-            RelaySession(client, self).run()
+            await RelaySession(self, reader, writer).run()
         finally:
-            with self.lock:
-                self.active -= 1
-                self.last_activity = time.monotonic()
+            self.active -= 1
+            self.last_activity = time.monotonic()
 
-    def reap_when_idle(self):
+    async def reap_when_idle(self):
         while True:
-            time.sleep(5)
-            with self.lock:
-                idle = self.active == 0 and time.monotonic() - self.last_activity > RELAY_IDLE_EXIT
-            if idle:
+            await asyncio.sleep(5)
+            if self.active == 0 and time.monotonic() - self.last_activity > RELAY_IDLE_EXIT:
                 os._exit(0)
 
 
