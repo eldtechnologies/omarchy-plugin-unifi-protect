@@ -1450,6 +1450,35 @@ def running_wall():
     return None
 
 
+# The wall window's title, matched by the Hyprland rule below. wall/shell.qml
+# sets the same title; keep the two in step.
+WALL_WINDOW_TITLE = "UniFi Protect Wall"
+
+
+def register_wall_window_rule():
+    """Ask Hyprland to maximize the wall window when it opens.
+
+    A rule that matches only the wall's title, registered at runtime: it
+    never touches another window and writes nothing to the user's config.
+    It is registered once per Hyprland session and remembered in a Lua
+    global, because registering it again on every launch disabled it.
+    Reloading the config clears both, so the next launch registers it anew.
+    Best effort: without Hyprland, or with an older one, the wall still
+    opens, just not maximized.
+    """
+    rule = (
+        "if not _G.eld_unifi_protect_wall_rule then "
+        "_G.eld_unifi_protect_wall_rule = hl.window_rule({ "
+        f"match = {{ title = '^{WALL_WINDOW_TITLE}$' }}, maximize = true }}) "
+        "end"
+    )
+    hyprctl = shutil.which("hyprctl")
+    if not hyprctl:
+        return
+    subprocess.run([hyprctl, "eval", rule], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=5, check=False)
+
+
 def cmd_wall(args):
     """Fullscreen live grid of every online camera, in its own process.
 
@@ -1489,7 +1518,10 @@ def cmd_wall(args):
     quickshell = shutil.which("quickshell") or shutil.which("qs")
     if not quickshell:
         raise ProtectError("quickshell is not installed")
-    env = dict(os.environ, ELD_UNIFI_PROTECT_WALL=WALL_CONFIG)
+    if args.mode == "window":
+        register_wall_window_rule()
+    env = dict(os.environ, ELD_UNIFI_PROTECT_WALL=WALL_CONFIG,
+               ELD_UNIFI_PROTECT_WALL_MODE=args.mode)
     process = subprocess.Popen(
         [quickshell, "--no-duplicate", "--path", WALL_DIR],
         env=env,
@@ -1595,10 +1627,13 @@ def main():
     p.add_argument("mode", choices=("on", "off", "toggle"))
     p.set_defaults(func=cmd_hide_offline)
     sub.add_parser("relay", help="run the encrypted stream relay (started on demand)").set_defaults(func=cmd_relay)
-    p = sub.add_parser("wall", help="toggle a fullscreen live grid of all cameras")
+    p = sub.add_parser("wall", help="toggle a live grid of all cameras")
     p.add_argument("--quality", choices=QUALITIES, default="medium", help="stream for grid tiles")
     p.add_argument("--focus-quality", choices=QUALITIES, default="high", help="stream for an enlarged camera")
     p.add_argument("--no-toggle", action="store_true", help="do nothing if already open")
+    p.add_argument("--mode", choices=("window", "overlay"), default="window",
+                   help="window: maximized, keeps workspaces and the bar (default); "
+                        "overlay: covers everything")
     p.set_defaults(func=cmd_wall)
     p = sub.add_parser("open", help="open Protect in the browser")
     p.add_argument("console", nargs="?")

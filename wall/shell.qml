@@ -5,7 +5,7 @@ import Quickshell.Io
 import Quickshell.Wayland
 import Quickshell.Hyprland
 
-// Fullscreen live wall of every online camera.
+// Live wall of every online camera, maximized or full-screen.
 //
 // Runs as its own Quickshell process, started by `eld-unifi-protect wall`,
 // never inside omarchy-shell: eight concurrent RTSPS decoders are the
@@ -148,181 +148,213 @@ ShellRoot {
     }
   }
 
-  PanelWindow {
-    id: window
-    // Mapped only once the camera list is in, so startup never flashes an
-    // empty black screen.
-    visible: shell.count > 0
-    screen: {
-      var name = Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
-      for (var i = 0; i < Quickshell.screens.length; i++)
-        if (Quickshell.screens[i].name === name) return Quickshell.screens[i]
-      return Quickshell.screens[0]
+  // ---- contents, shared by both window modes ----
+  component WallView: Item {
+    id: keys
+    anchors.fill: parent
+    focus: true
+
+    Keys.onPressed: function(event) {
+      hintTimer.restart()
+      var text = event.text.toLowerCase()
+      if (event.key === Qt.Key_Escape || text === "q") {
+        if (shell.focusedIndex >= 0 && text !== "q") shell.focusedIndex = -1
+        else Qt.quit()
+      } else if (event.key === Qt.Key_Left || text === "h") shell.move(-1, 0)
+      else if (event.key === Qt.Key_Right || text === "l") shell.move(1, 0)
+      else if (event.key === Qt.Key_Up || text === "k") shell.move(0, -1)
+      else if (event.key === Qt.Key_Down || text === "j") shell.move(0, 1)
+      else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+        if (shell.focusedIndex >= 0) shell.focusedIndex = -1
+        else shell.focusCamera(shell.selectedIndex)
+      }
+      else if (text === "m") shell.muted = !shell.muted
+      else if (text >= "1" && text <= "9") shell.focusCamera(Number(text) - 1)
+      else if (text === "0") shell.focusedIndex = -1
+      else return
+      event.accepted = true
     }
-    anchors { top: true; bottom: true; left: true; right: true }
-    exclusionMode: ExclusionMode.Ignore
-    WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
-    WlrLayershell.namespace: "eld-unifi-protect-wall"
-    color: "black"
 
-    Item {
-      id: keys
+    // ---- grid ----
+    // Stays mounted while a camera is enlarged, so going back is instant
+    // rather than a reconnect of every stream.
+    Grid {
+      id: grid
       anchors.fill: parent
-      focus: true
+      visible: shell.focusedIndex < 0
+      columns: shell.columns
+      spacing: 2
 
-      Keys.onPressed: function(event) {
-        hintTimer.restart()
-        var text = event.text.toLowerCase()
-        if (event.key === Qt.Key_Escape || text === "q") {
-          if (shell.focusedIndex >= 0 && text !== "q") shell.focusedIndex = -1
-          else Qt.quit()
-        } else if (event.key === Qt.Key_Left || text === "h") shell.move(-1, 0)
-        else if (event.key === Qt.Key_Right || text === "l") shell.move(1, 0)
-        else if (event.key === Qt.Key_Up || text === "k") shell.move(0, -1)
-        else if (event.key === Qt.Key_Down || text === "j") shell.move(0, 1)
-        else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
-          if (shell.focusedIndex >= 0) shell.focusedIndex = -1
-          else shell.focusCamera(shell.selectedIndex)
-        }
-        else if (text === "m") shell.muted = !shell.muted
-        else if (text >= "1" && text <= "9") shell.focusCamera(Number(text) - 1)
-        else if (text === "0") shell.focusedIndex = -1
-        else return
-        event.accepted = true
-      }
+      Repeater {
+        model: shell.cameras
 
-      // ---- grid ----
-      // Stays mounted while a camera is enlarged, so going back is instant
-      // rather than a reconnect of every stream.
-      Grid {
-        id: grid
-        anchors.fill: parent
-        visible: shell.focusedIndex < 0
-        columns: shell.columns
-        spacing: 2
+        Rectangle {
+          id: tile
+          required property var modelData
+          required property int index
+          width: (grid.width - grid.spacing * (shell.columns - 1)) / shell.columns
+          height: (grid.height - grid.spacing * (shell.rows - 1)) / shell.rows
+          color: "#0b0b0b"
+          border.width: index === shell.selectedIndex && hintTimer.running ? 2 : 0
+          border.color: "#ffffff"
 
-        Repeater {
-          model: shell.cameras
-
-          Rectangle {
-            id: tile
-            required property var modelData
-            required property int index
-            width: (grid.width - grid.spacing * (shell.columns - 1)) / shell.columns
-            height: (grid.height - grid.spacing * (shell.rows - 1)) / shell.rows
-            color: "#0b0b0b"
-            border.width: index === shell.selectedIndex && hintTimer.running ? 2 : 0
-            border.color: "#ffffff"
-
-            Stream {
-              anchors.fill: parent
-              anchors.margins: tile.border.width
-              url: tile.modelData.grid || ""
-              snapshot: shell.snapshotDir ? "file://" + shell.snapshotDir + "/" + tile.modelData.uid + ".jpg" : ""
-            }
-
-            Text {
-              anchors.centerIn: parent
-              visible: !!tile.modelData.error
-              text: tile.modelData.error || ""
-              color: "#ff7777"
-              font.pixelSize: 16
-            }
-
-            Rectangle {
-              anchors.left: parent.left
-              anchors.bottom: parent.bottom
-              anchors.margins: 10
-              width: label.implicitWidth + 16
-              height: label.implicitHeight + 8
-              radius: 4
-              color: Qt.rgba(0, 0, 0, 0.55)
-
-              Text {
-                id: label
-                anchors.centerIn: parent
-                text: (tile.index < 9 ? (tile.index + 1) + "  " : "") + tile.modelData.name
-                      + (shell.multiConsole ? "  ·  " + tile.modelData.consoleName : "")
-                color: "white"
-                font.pixelSize: 14
-                font.bold: true
-              }
-            }
-
-            MouseArea {
-              anchors.fill: parent
-              hoverEnabled: true
-              onPositionChanged: { shell.selectedIndex = tile.index; hintTimer.restart() }
-              onClicked: shell.focusCamera(tile.index)
-            }
-          }
-        }
-      }
-
-      // ---- one camera, full screen, at the higher quality ----
-      Loader {
-        anchors.fill: parent
-        active: shell.focusedIndex >= 0
-        sourceComponent: Item {
           Stream {
             anchors.fill: parent
-            url: shell.focusedCamera ? shell.focusedCamera.focus || shell.focusedCamera.grid : ""
-            snapshot: shell.focusedCamera && shell.snapshotDir
-                      ? "file://" + shell.snapshotDir + "/" + shell.focusedCamera.uid + ".jpg" : ""
-            playAudio: true
+            anchors.margins: tile.border.width
+            url: tile.modelData.grid || ""
+            snapshot: shell.snapshotDir ? "file://" + shell.snapshotDir + "/" + tile.modelData.uid + ".jpg" : ""
+          }
+
+          Text {
+            anchors.centerIn: parent
+            visible: !!tile.modelData.error
+            text: tile.modelData.error || ""
+            color: "#ff7777"
+            font.pixelSize: 16
           }
 
           Rectangle {
             anchors.left: parent.left
-            anchors.top: parent.top
-            anchors.margins: 20
-            width: focusLabel.implicitWidth + 24
-            height: focusLabel.implicitHeight + 12
-            radius: 6
+            anchors.bottom: parent.bottom
+            anchors.margins: 10
+            width: label.implicitWidth + 16
+            height: label.implicitHeight + 8
+            radius: 4
             color: Qt.rgba(0, 0, 0, 0.55)
 
             Text {
-              id: focusLabel
+              id: label
               anchors.centerIn: parent
-              text: "● " + (shell.focusedCamera ? shell.focusedCamera.name : "")
-                    + (shell.multiConsole && shell.focusedCamera ? "  ·  " + shell.focusedCamera.consoleName : "")
-                    + (shell.muted ? "" : "  ·  sound on")
+              text: (tile.index < 9 ? (tile.index + 1) + "  " : "") + tile.modelData.name
+                    + (shell.multiConsole ? "  ·  " + tile.modelData.consoleName : "")
               color: "white"
-              font.pixelSize: 18
+              font.pixelSize: 14
               font.bold: true
             }
           }
 
           MouseArea {
             anchors.fill: parent
-            onClicked: shell.focusedIndex = -1
+            hoverEnabled: true
+            onPositionChanged: { shell.selectedIndex = tile.index; hintTimer.restart() }
+            onClicked: shell.focusCamera(tile.index)
           }
         }
       }
+    }
 
-      // ---- key hints ----
-      Rectangle {
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.bottom: parent.bottom
-        anchors.bottomMargin: 24
-        width: hints.implicitWidth + 32
-        height: hints.implicitHeight + 14
-        radius: height / 2
-        color: Qt.rgba(0, 0, 0, 0.7)
-        opacity: hintTimer.running ? 1 : 0
-        Behavior on opacity { NumberAnimation { duration: 300 } }
+    // ---- one camera, full screen, at the higher quality ----
+    Loader {
+      anchors.fill: parent
+      active: shell.focusedIndex >= 0
+      sourceComponent: Item {
+        Stream {
+          anchors.fill: parent
+          url: shell.focusedCamera ? shell.focusedCamera.focus || shell.focusedCamera.grid : ""
+          snapshot: shell.focusedCamera && shell.snapshotDir
+                    ? "file://" + shell.snapshotDir + "/" + shell.focusedCamera.uid + ".jpg" : ""
+          playAudio: true
+        }
 
-        Text {
-          id: hints
-          anchors.centerIn: parent
-          text: shell.focusedIndex >= 0
-                ? "←/→ next camera  ·  M sound  ·  Esc or click back to grid  ·  Q close"
-                : "Click or 1–9 enlarge  ·  arrows select  ·  Enter enlarge  ·  Esc close"
-          color: "white"
-          font.pixelSize: 14
+        Rectangle {
+          anchors.left: parent.left
+          anchors.top: parent.top
+          anchors.margins: 20
+          width: focusLabel.implicitWidth + 24
+          height: focusLabel.implicitHeight + 12
+          radius: 6
+          color: Qt.rgba(0, 0, 0, 0.55)
+
+          Text {
+            id: focusLabel
+            anchors.centerIn: parent
+            text: "● " + (shell.focusedCamera ? shell.focusedCamera.name : "")
+                  + (shell.multiConsole && shell.focusedCamera ? "  ·  " + shell.focusedCamera.consoleName : "")
+                  + (shell.muted ? "" : "  ·  sound on")
+            color: "white"
+            font.pixelSize: 18
+            font.bold: true
+          }
+        }
+
+        MouseArea {
+          anchors.fill: parent
+          onClicked: shell.focusedIndex = -1
         }
       }
+    }
+
+    // ---- key hints ----
+    Rectangle {
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.bottom: parent.bottom
+      anchors.bottomMargin: 24
+      width: hints.implicitWidth + 32
+      height: hints.implicitHeight + 14
+      radius: height / 2
+      color: Qt.rgba(0, 0, 0, 0.7)
+      opacity: hintTimer.running ? 1 : 0
+      Behavior on opacity { NumberAnimation { duration: 300 } }
+
+      Text {
+        id: hints
+        anchors.centerIn: parent
+        text: shell.focusedIndex >= 0
+              ? "←/→ next camera  ·  M sound  ·  Esc or click back to grid  ·  Q close"
+              : "Click or 1–9 enlarge  ·  arrows select  ·  Enter enlarge  ·  Esc close"
+        color: "white"
+        font.pixelSize: 14
+      }
+    }
+  }
+
+  // ---- window modes ----
+  //
+  // "window" (default): an ordinary toplevel that Hyprland manages. The CLI
+  // registers a named rule that maximizes it, so it fills the screen but
+  // stays on its workspace: Super+number switches away and back, and the
+  // bar stays visible.
+  //
+  // "overlay": a layer-shell surface over everything, every workspace
+  // included, with exclusive keyboard focus. A true kiosk, at the cost of
+  // workspace switching.
+  readonly property string mode: Quickshell.env("ELD_UNIFI_PROTECT_WALL_MODE") === "overlay"
+                                  ? "overlay" : "window"
+
+  LazyLoader {
+    // Mapped only once the camera list is in, so startup never flashes an
+    // empty black screen.
+    active: shell.mode === "window" && shell.count > 0
+
+    FloatingWindow {
+      // The Hyprland rule matches this title; keep the two in step.
+      title: "UniFi Protect Wall"
+      color: "black"
+      implicitWidth: 1600
+      implicitHeight: 900
+
+      WallView { anchors.fill: parent }
+    }
+  }
+
+  LazyLoader {
+    active: shell.mode === "overlay" && shell.count > 0
+
+    PanelWindow {
+      screen: {
+        var name = Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
+        for (var i = 0; i < Quickshell.screens.length; i++)
+          if (Quickshell.screens[i].name === name) return Quickshell.screens[i]
+        return Quickshell.screens[0]
+      }
+      anchors { top: true; bottom: true; left: true; right: true }
+      exclusionMode: ExclusionMode.Ignore
+      WlrLayershell.layer: WlrLayer.Overlay
+      WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+      WlrLayershell.namespace: "eld-unifi-protect-wall"
+      color: "black"
+
+      WallView { anchors.fill: parent }
     }
   }
 }

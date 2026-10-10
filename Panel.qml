@@ -196,8 +196,12 @@ Panel {
     Quickshell.execDetached([root.cli, "hide-offline", "toggle"])
   }
 
+  // "window": a maximized window that keeps workspace switching and the
+  // bar; "overlay": covers everything, every workspace included.
+  readonly property string wallMode: setting("wallMode", "window") === "overlay" ? "overlay" : "window"
+
   function openWall() {
-    Quickshell.execDetached([root.cli, "wall"])
+    Quickshell.execDetached([root.cli, "wall", "--mode", root.wallMode])
     root.close()
   }
 
