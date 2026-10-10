@@ -201,15 +201,142 @@ Panel {
     root.close()
   }
 
-  function addConsole() {
+  // ---- setup, inside the panel ----
+  //
+  // Two steps, each a call to the helper: setup-probe fetches the console's
+  // certificate fingerprint for the user to trust, then setup-save checks
+  // the API key against that pinned certificate and stores it. The key is
+  // handed to the helper on stdin, never as an argument, and the field is
+  // cleared as soon as it is sent, the same way Omarchy's own network panel
+  // handles Wi-Fi passwords.
+  property string setupStep: ""          // "", "address", "key"
+  property string setupHost: ""
+  property string setupPin: ""
+  property bool setupPinChanged: false
+  property bool setupExisting: false
+  property string setupSuggestedName: ""
+  property string setupError: ""
+  property string setupBusy: ""
+  property string setupDone: ""
+  readonly property bool settingUp: setupStep !== ""
+
+  function openSetup() {
+    root.closeLive()
+    root.setupError = ""
+    root.setupBusy = ""
+    root.setupStep = "address"
+    Qt.callLater(function() { if (addressField) addressField.forceActiveFocus() })
+  }
+
+  function addConsole() { root.openSetup() }
+
+  function cancelSetup() {
+    setupProbe.running = false
+    keyField.text = ""
+    root.setupStep = ""
+    root.setupError = ""
+    root.setupBusy = ""
+    keyCatcher.forceActiveFocus()
+  }
+
+  function setupInTerminal() {
     Quickshell.execDetached(["xdg-terminal-exec", root.cli, "setup"])
+    root.cancelSetup()
     root.close()
   }
 
-  function openSetup() {
-    // Setup prompts for an API key, so it needs a real terminal.
-    Quickshell.execDetached(["xdg-terminal-exec", root.cli, "setup"])
-    root.close()
+  function probeConsole() {
+    var host = addressField.text.trim()
+    if (host === "" || setupProbe.running) return
+    root.setupError = ""
+    root.setupBusy = "Reaching " + host + "…"
+    setupProbe.command = [root.cli, "setup-probe", host]
+    setupProbe.running = true
+  }
+
+  function connectConsole() {
+    if (setupSave.running) return
+    if (keyField.text.trim() === "" && !root.setupExisting) {
+      root.setupError = "Paste the API key"
+      return
+    }
+    root.setupError = ""
+    root.setupBusy = "Checking the key with " + root.setupHost + "…"
+    setupSave.secret = keyField.text.trim()
+    keyField.text = ""
+    setupSave.command = [root.cli, "setup-save", "--host", root.setupHost,
+                         "--pin", root.setupPin, "--name", nameField.text.trim()]
+    setupSave.running = true
+  }
+
+  function helperError(text, fallback) {
+    var message = text.trim().replace(/^eld-unifi-protect: /, "")
+    return message !== "" ? message : fallback
+  }
+
+  Process {
+    id: setupProbe
+    running: false
+    stdout: StdioCollector { id: probeOut }
+    stderr: StdioCollector { id: probeErr }
+    onExited: function(exitCode) {
+      root.setupBusy = ""
+      if (exitCode !== 0) {
+        root.setupError = root.helperError(probeErr.text, "Could not reach the console")
+        return
+      }
+      try {
+        var result = JSON.parse(probeOut.text)
+        root.setupHost = result.host
+        root.setupPin = result.fingerprint
+        root.setupPinChanged = result.changed === true
+        root.setupExisting = result.existing === true
+        root.setupSuggestedName = result.suggestedName || "Console"
+        nameField.text = root.setupSuggestedName
+        root.setupStep = "key"
+        Qt.callLater(function() { keyField.forceActiveFocus() })
+      } catch (error) {
+        root.setupError = "Unexpected answer from the helper"
+      }
+    }
+  }
+
+  Process {
+    id: setupSave
+    property string secret: ""
+    running: false
+    stdinEnabled: true
+    stdout: StdioCollector { id: saveOut }
+    stderr: StdioCollector { id: saveErr }
+    onStarted: {
+      write(secret + "\n")
+      secret = ""
+    }
+    onExited: function(exitCode) {
+      root.setupBusy = ""
+      if (exitCode !== 0) {
+        root.setupError = root.helperError(saveErr.text, "Could not save the console")
+        Qt.callLater(function() { keyField.forceActiveFocus() })
+        return
+      }
+      try {
+        var result = JSON.parse(saveOut.text)
+        root.setupDone = "Connected to " + result.name + " · " + result.online + "/"
+          + result.cameras + " cameras online · key stored in "
+          + (result.keyStore === "keyring" ? "your keyring" : "your config file")
+      } catch (error) {
+        root.setupDone = "Console connected"
+      }
+      setupDoneTimer.restart()
+      root.cancelSetup()
+      root.reloadState()
+    }
+  }
+
+  Timer {
+    id: setupDoneTimer
+    interval: 8000
+    onTriggered: root.setupDone = ""
   }
 
   FileView {
@@ -241,6 +368,7 @@ Panel {
     } else {
       root.closeLive()
       root.showHidden = false
+      if (root.settingUp) root.cancelSetup()
     }
   }
 
@@ -378,12 +506,16 @@ Panel {
                                                          : root.cardWidth)
     contentHeight: panel.fittedContentHeight(
       headerRow.implicitHeight + Style.space(10)
-        + (root.liveMode ? liveView.implicitHeight : content.implicitHeight),
+        + (root.liveMode ? liveView.implicitHeight
+           : root.settingUp ? setupCard.implicitHeight : content.implicitHeight),
       Style.space(1000))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // Typing an address or a key must not trigger the panel's letter
+      // shortcuts; Esc in a setup field cancels setup instead.
+      blocked: root.settingUp
 
       onCloseRequested: root.liveMode ? root.closeLive() : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
@@ -459,21 +591,21 @@ Panel {
             }
 
             ActionButton {
-              visible: !root.liveMode && root.configured && root.shownCameras.length > 0
+              visible: !root.liveMode && !root.settingUp && root.configured && root.shownCameras.length > 0
               label: "Wall"
               outlined: true
               onTriggered: root.openWall()
             }
 
             ActionButton {
-              visible: !root.liveMode && root.configured
+              visible: !root.liveMode && !root.settingUp && root.configured
               label: "Add console"
               outlined: true
               onTriggered: root.addConsole()
             }
 
             ActionButton {
-              visible: !root.liveMode && root.configured
+              visible: !root.liveMode && !root.settingUp && root.configured
               label: "Protect"
               outlined: true
               onTriggered: root.openConsole()
@@ -563,10 +695,181 @@ Panel {
           }
         }
 
+        // ---- setup ----
+        Column {
+          id: setupCard
+          visible: root.settingUp
+          width: parent.width
+          spacing: Style.space(8)
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            text: root.configured ? "Add a UniFi Protect console" : "Connect your UniFi Protect console"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+
+          // Step 1: address.
+          Text {
+            visible: root.setupStep === "address"
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "The console's local address: a Dream Machine, Cloud Gateway, NVR or "
+                + "Cloud Key running Protect. Each console needs its own setup."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          TextField {
+            id: addressField
+            visible: root.setupStep === "address"
+            width: parent.width
+            placeholderText: "192.168.1.1"
+            text: root.configured ? "" : "192.168.1.1"
+            foreground: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            onAccepted: root.probeConsole()
+            Keys.onEscapePressed: root.cancelSetup()
+          }
+
+          // Step 2: trust the certificate, paste the key.
+          Text {
+            visible: root.setupStep === "key"
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.WrapAnywhere
+            text: root.setupHost + " presents this certificate (SHA-256):\n" + root.setupPin
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            visible: root.setupStep === "key" && root.setupPinChanged
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "This differs from the certificate trusted before. Continue only if you "
+                + "expected it (firmware update, factory reset)."
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            visible: root.setupStep === "key"
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Connecting trusts it: from then on the plugin refuses any other certificate "
+                + "from this address, so the key is only ever sent to this console.\n\n"
+                + "Create an API key on the console: open https://" + root.setupHost
+                + ", click Integrations at the bottom of the left sidebar (older UniFi OS: "
+                + "Settings, scroll the tabs sideways), then Create API Key. It is shown once."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          TextField {
+            id: keyField
+            visible: root.setupStep === "key"
+            width: parent.width
+            password: true
+            placeholderText: root.setupExisting ? "API key (leave empty to keep the current one)"
+                                                : "API key (paste with Super+V)"
+            foreground: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            onAccepted: root.connectConsole()
+            Keys.onEscapePressed: root.cancelSetup()
+          }
+
+          TextField {
+            id: nameField
+            visible: root.setupStep === "key"
+            width: parent.width
+            placeholderText: "Name, e.g. NVR"
+            foreground: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            onAccepted: root.connectConsole()
+            Keys.onEscapePressed: root.cancelSetup()
+          }
+
+          Text {
+            visible: root.setupError !== "" || root.setupBusy !== ""
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: root.setupError !== "" ? root.setupError : root.setupBusy
+            color: root.setupError !== "" ? root.urgent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Row {
+            spacing: Style.space(6)
+
+            ActionButton {
+              visible: root.setupStep === "address"
+              label: "Next"
+              enabled: !setupProbe.running && addressField.text.trim() !== ""
+              onTriggered: root.probeConsole()
+            }
+
+            ActionButton {
+              visible: root.setupStep === "key"
+              label: "Connect"
+              enabled: !setupSave.running
+              onTriggered: root.connectConsole()
+            }
+
+            ActionButton {
+              label: root.setupStep === "key" ? "Back" : "Cancel"
+              outlined: true
+              enabled: !setupSave.running
+              onTriggered: {
+                if (root.setupStep === "key") {
+                  keyField.text = ""
+                  root.setupError = ""
+                  root.setupStep = "address"
+                  addressField.text = root.setupHost
+                } else {
+                  root.cancelSetup()
+                }
+              }
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Prefer the terminal? Run setup there instead"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.underline: setupTerminalMouse.containsMouse
+
+            MouseArea {
+              id: setupTerminalMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.setupInTerminal()
+            }
+          }
+        }
+
         // ---- grid ----
         Flickable {
           id: bodyScroll
-          visible: !root.liveMode
+          visible: !root.liveMode && !root.settingUp
           width: parent.width
           height: parent.height - headerRow.height - panelBody.spacing
           contentHeight: content.implicitHeight
@@ -580,6 +883,17 @@ Panel {
             id: content
             width: bodyScroll.width
             spacing: Style.space(10)
+
+            Text {
+              visible: root.setupDone !== ""
+              textFormat: Text.PlainText
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: root.setupDone
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
 
             // ---- first-run ----
             Rectangle {
@@ -611,10 +925,8 @@ Panel {
                   textFormat: Text.PlainText
                   width: parent.width
                   wrapMode: Text.WordWrap
-                  text: "Open your console by its local address, click Integrations "
-                      + "at the bottom of the left sidebar and create an API key, "
-                      + "then run setup. Keys from unifi.ui.com will not work. The key "
-                      + "is stored in your config directory, readable only by you."
+                  text: "Setup asks for your console's address and an API key, and keeps "
+                      + "the key in your keyring (or a file only you can read)."
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
