@@ -24,6 +24,7 @@ import shutil
 import signal
 import socket
 import stat
+import unicodedata
 import ssl
 import subprocess
 import sys
@@ -707,17 +708,35 @@ class Protect:
         return self.stream_urls(camera_id, [quality])[quality]
 
 
+# Text and IDs from a console are untrusted input. Names are printed to
+# terminals and shown in the panel; IDs become file names and URL paths.
+CAMERA_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def clean_text(value, fallback="", limit=80):
+    """Printable text only: drops control and format characters (including
+    terminal escape sequences), collapses whitespace, caps the length."""
+    text = "".join(ch if unicodedata.category(ch)[0] not in "CZ" else " "
+                   for ch in str(value or ""))
+    text = " ".join(text.split())[:limit]
+    return text or fallback
+
+
 def summarize_camera(camera, console):
+    camera_id = str(camera.get("id") or "")
+    if not CAMERA_ID.fullmatch(camera_id):
+        return None  # not a Protect ID; never let it near a path or URL
     flags = camera.get("featureFlags") or {}
-    state = camera.get("state") or "UNKNOWN"
+    state = clean_text(camera.get("state"), "UNKNOWN", 32)
+    model = clean_text(camera.get("type") or camera.get("modelKey"))
     return {
-        "uid": console["id"] + "_" + str(camera.get("id")),
-        "id": camera.get("id"),
+        "uid": console["id"] + "_" + camera_id,
+        "id": camera_id,
         "console": console["id"],
         "consoleName": console["name"],
-        "mac": (camera.get("mac") or "").lower().replace(":", ""),
-        "name": camera.get("name") or camera.get("type") or "Camera",
-        "model": camera.get("type") or camera.get("modelKey") or "",
+        "mac": re.sub(r"[^0-9a-f]", "", str(camera.get("mac") or "").lower()),
+        "name": clean_text(camera.get("name"), model or "Camera"),
+        "model": model,
         "state": state,
         "online": state == "CONNECTED",
         "hasMic": bool(flags.get("hasMic")),
@@ -801,7 +820,8 @@ def previous_state():
 
 def fetch_console(console, config):
     try:
-        cameras = [summarize_camera(c, console) for c in Protect(console, config).cameras()]
+        listed = (summarize_camera(c, console) for c in Protect(console, config).cameras())
+        cameras = [c for c in listed if c is not None]
         return {"cameras": cameras, "error": None}
     except ProtectError as error:
         return {"cameras": None, "error": str(error)}
@@ -965,7 +985,7 @@ def cmd_setup(args):
     default_name = existing.get("name") or ("NVR" if consoles else "Console")
     if existing.get("name") == host:
         default_name = "Console"
-    name = input(f"Name for this console [{default_name}]: ").strip() or default_name
+    name = clean_text(input(f"Name for this console [{default_name}]: "), default_name, 40)
     taken = {c["id"] for c in consoles if c is not existing}
     console_id = existing.get("id") if existing and existing.get("id") not in taken else slugify(name)
     base, n = console_id, 2
