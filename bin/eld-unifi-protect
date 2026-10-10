@@ -802,6 +802,19 @@ class Protect:
 
         streams = self.request("GET", f"/cameras/{camera_id}/rtsps-stream") or {}
         missing = [q for q in qualities if not streams.get(q)]
+        if missing and load_prefs()["readOnly"]:
+            # Read-only: never switch streams on. Fall back to whichever
+            # quality is already enabled, nearest to the one asked for.
+            enabled = [q for q in QUALITIES if streams.get(q)]
+            if not enabled:
+                raise ProtectError(
+                    "no stream is enabled for this camera. Turn on RTSPS in Protect "
+                    "(camera → Settings → Advanced), or let the plugin do it: "
+                    "eld-unifi-protect read-only off")
+            for quality in missing:
+                order = QUALITIES[QUALITIES.index(quality):] + QUALITIES[:QUALITIES.index(quality)][::-1]
+                streams[quality] = streams[next(q for q in order if q in enabled)]
+            missing = []
         if missing:
             created = self.request(
                 "POST", f"/cameras/{camera_id}/rtsps-stream", body={"qualities": missing}
@@ -877,7 +890,8 @@ def load_prefs():
     except (OSError, ValueError):
         prefs = {}
     return {"hideOffline": bool(prefs.get("hideOffline", False)),
-            "hidden": list(prefs.get("hidden", []))}
+            "hidden": list(prefs.get("hidden", [])),
+            "readOnly": bool(prefs.get("readOnly", False))}
 
 
 def save_prefs(prefs):
@@ -1445,6 +1459,22 @@ def cmd_unhide(args):
     cmd_hide(args, hide=False)
 
 
+def cmd_read_only(args):
+    prefs = load_prefs()
+    if args.mode != "status":
+        prefs["readOnly"] = args.mode == "on"
+        save_prefs(prefs)
+        # Cached URLs may include fallbacks chosen under the other setting.
+        try:
+            os.remove(STREAM_CACHE)
+        except FileNotFoundError:
+            pass
+    if prefs["readOnly"]:
+        print("read-only: on; only streams already enabled in Protect are used")
+    else:
+        print("read-only: off; the plugin enables a camera's stream when one is needed")
+
+
 def cmd_hide_offline(args):
     prefs = load_prefs()
     if args.mode == "toggle":
@@ -1646,6 +1676,9 @@ def main():
     p.add_argument("cameras", nargs="*")
     p.add_argument("--all", action="store_true")
     p.set_defaults(func=cmd_unhide)
+    p = sub.add_parser("read-only", help="never change anything on the consoles (no enabling streams)")
+    p.add_argument("mode", choices=("on", "off", "status"), nargs="?", default="status")
+    p.set_defaults(func=cmd_read_only)
     p = sub.add_parser("hide-offline", help="hide cameras that are offline")
     p.add_argument("mode", choices=("on", "off", "toggle"))
     p.set_defaults(func=cmd_hide_offline)
