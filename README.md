@@ -3,12 +3,14 @@
 Your UniFi Protect cameras in the Omarchy bar: a grid of auto-refreshing
 snapshots, live video right in the panel, a camera wall with every camera
 live at once, and a pop-out player. Works with several consoles at once, such
-as a gateway and a dedicated NVR, and is set up from the panel itself.
+as a gateway and a dedicated NVR, and is set up from the panel itself. Arm a
+camera to be alerted when it sees a person, a vehicle or a doorbell ring.
 Video travels encrypted, and API keys stay out of the shell.
 
-In the bar it is a single camera icon. It turns your theme's urgent colour
-when a camera is offline, and gets a small dot when a console could not be
-reached on the last poll.
+In the bar it is a single camera icon. It pulses in your theme's urgent
+colour when an armed camera has seen something, turns that colour when a
+camera is offline, and gets a small dot when a console could not be reached
+on the last poll.
 
 Version 0.2.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
 
@@ -25,6 +27,7 @@ Version 0.2.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologie
   ship with Omarchy) to keep API keys in the keyring; optional, see below
 - `qt6-multimedia-ffmpeg` for live video (ships with Omarchy)
 - `mpv`, optional, for the pop-out player: `omarchy pkg add mpv`
+- `notify-send` from `libnotify` for alert notifications (ships with Omarchy)
 
 ## Install
 
@@ -102,6 +105,7 @@ eld-unifi-protect remove nvr
 | Live | `M` | Toggle sound |
 | Live | Double-click | Pop out |
 | Live | Esc | Back to the grid |
+| Grid | `A` | Alert log |
 | Panel footer | Click the version | Release notes for that version |
 
 ### Camera wall
@@ -164,6 +168,13 @@ camera's tile is selected, with a red border and a badge such as "Person · 2
 min ago" for ten minutes. Armed cameras carry a bell in their label. If a
 console's event stream can't be reached, the panel says so.
 
+**Alerts** in the panel header (or `A`) opens the alert log: what was seen,
+on which camera, when and for how long, with a snapshot from that moment,
+newest first. Alerts you hadn't seen yet are marked. Click one to watch that
+camera live; **Clear** empties the log, which otherwise keeps the last 24
+hours. When you open the panel because the bar is pulsing, it goes straight
+to the log.
+
 Each alert also sends a **desktop notification**, "Person at Front Door",
 with a snapshot from that moment and a **Watch live** button that opens the
 panel on that camera. To avoid floods there is at most one notification per
@@ -176,6 +187,7 @@ eld-unifi-protect alert "Front Door"                  # person, vehicle, ring
 eld-unifi-protect alert "Driveway" --on vehicle
 eld-unifi-protect alert "Front Door" --off
 eld-unifi-protect alert                               # armed cameras and recent alerts
+eld-unifi-protect alert --clear                       # empty the alert log
 ```
 
 Detection is done by Protect, so a camera needs smart detections enabled in
@@ -253,6 +265,9 @@ streams.
   where each console's key lives.
 - **Traffic:** while the panel is closed, one camera-list poll per console per
   minute. Snapshots are fetched only while the panel is open on the grid.
+  While a camera is armed, the helper also keeps one connection open to that
+  console's event stream (`/subscribe/events`, same pinned TLS), plus one
+  snapshot per alert.
 - **TLS:** consoles use self-signed certificates. Setup pins each console's
   certificate fingerprint, and every API request checks it before the key is
   sent. If a console's certificate legitimately changes (firmware update,
@@ -351,7 +366,8 @@ Technologies accepts no liability for any damage or loss arising from its
 use. See [LICENSE](LICENSE) for the full terms. In particular:
 
 - It is not a security or monitoring system. Do not rely on it to record,
-  detect, or alert on anything; use UniFi Protect itself for that.
+  detect, or alert on anything; use UniFi Protect itself for that. Alerts
+  are missed while your computer is asleep, off, or offline.
 - It stores console API keys on your machine (in your keyring, or in a file
   readable only by you) and can enable RTSPS streams on your cameras (unless
   read-only mode is on). You are responsible for deciding whether that is

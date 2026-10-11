@@ -71,13 +71,14 @@ BarWidget {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.togglePanel() }
-    // For scripts: {"alerting": bool, "latest": {...} | null, "armed": n}
+    // For scripts: {"alerting": bool, "latest": {...} | null, "armed": n, "log": n}
     function alertStatus(): string {
       var panel = panelLoader.item
       return JSON.stringify({
         alerting: root.alerting,
         latest: panel ? panel.latestAlert : null,
-        armed: panel ? panel.armedCount : 0
+        armed: panel ? panel.armedCount : 0,
+        log: panel ? panel.logAlerts.length : 0
       })
     }
     // Fullscreen grid of every visible camera; calling again closes it.

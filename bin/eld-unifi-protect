@@ -728,6 +728,7 @@ EVENTS_LOCK = os.path.join(RUNTIME_DIR, "events.lock")
 ALERTS_KEEP = 50
 ALERT_IMAGES_DIR = os.path.join(RUNTIME_DIR, "alerts")
 NOTIFY_EVERY = 60   # seconds; at most one notification per camera per minute
+CAPTURE_EVERY = 5   # seconds; at most one alert snapshot per camera
 PLUGIN_ID = "com.eldtechnologies.unifi-protect"
 ALERTS_MAX_AGE = 24 * 3600
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -863,6 +864,28 @@ def armed_cameras(config, prefs):
     return {k: v for k, v in armed.items() if k in known}
 
 
+def read_ack():
+    try:
+        with open(ALERTS_ACK_PATH) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def prune_alert_images(keep):
+    """Delete alert snapshots no longer referenced by the log."""
+    try:
+        entries = list(os.scandir(ALERT_IMAGES_DIR))
+    except OSError:
+        return
+    for entry in entries:
+        if entry.name not in keep:
+            try:
+                os.remove(entry.path)
+            except OSError:
+                pass
+
+
 def load_alerts():
     try:
         with open(ALERTS_PATH) as handle:
@@ -883,6 +906,7 @@ class AlertListener:
         self.tasks = {}
         self.notify_enabled = True
         self.last_notified = {}      # camera uid -> time of its last notification
+        self.last_captured = {}      # camera uid -> time of its last alert snapshot
 
     def refresh(self):
         """Re-read config and arming when cameras.json has changed."""
@@ -899,10 +923,12 @@ class AlertListener:
         self.notify_enabled = prefs["notify"]
 
     def save(self):
-        cutoff = time.time() - ALERTS_MAX_AGE
+        # Older than a day, or before the user last cleared the log: drop.
+        cutoff = max(time.time() - ALERTS_MAX_AGE, read_ack().get("clearedAt", 0))
         self.alerts = [a for a in self.alerts if (a.get("start") or 0) > cutoff][-ALERTS_KEEP:]
         write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": self.alerts,
                                  "consoles": self.status})
+        prune_alert_images({a.get("image") for a in self.alerts})
 
     def handle(self, console_id, message):
         item = message.get("item") or {}
@@ -930,12 +956,36 @@ class AlertListener:
             }
             self.alerts.append(existing)
             changed = True
-            self.notify(console_id, camera, existing)
+            self.on_new_alert(console_id, camera, existing)
         if existing is not None and item.get("end") and not existing.get("end"):
             existing["end"] = event_time(item["end"])
             changed = True
         if changed:
             self.save()
+
+    def on_new_alert(self, console_id, camera, alert):
+        """Snapshot the moment for the alert log, then notify."""
+        try:
+            asyncio.get_running_loop().create_task(self.capture(console_id, camera, alert))
+        except RuntimeError:
+            pass  # no event loop (called outside the listener)
+
+    async def capture(self, console_id, camera, alert):
+        now = time.time()
+        console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
+        if console is not None and now - self.last_captured.get(camera["uid"], 0) >= CAPTURE_EVERY:
+            self.last_captured[camera["uid"]] = now
+            try:
+                data = await asyncio.to_thread(
+                    lambda: Protect(console, self.config).snapshot(camera["id"]))
+                os.makedirs(ALERT_IMAGES_DIR, mode=0o700, exist_ok=True)
+                name = f"{alert['id']}.jpg"
+                write_atomic(os.path.join(ALERT_IMAGES_DIR, name), data)
+                alert["image"] = name
+                self.save()
+            except (ProtectError, OSError):
+                pass
+        self.notify(console_id, camera, alert)
 
     def notify(self, console_id, camera, alert):
         """Desktop notification for a new alert, at most once a minute per camera."""
@@ -952,20 +1002,8 @@ class AlertListener:
             pass  # no event loop (called outside the listener)
 
     async def send_notification(self, console, camera, alert):
-        image = ""
-        if console is not None:
-            # A frame from the moment of the alert, as the notification's picture.
-            try:
-                data = await asyncio.to_thread(
-                    lambda: Protect(console, self.config).snapshot(camera["id"]))
-                os.makedirs(ALERT_IMAGES_DIR, mode=0o700, exist_ok=True)
-                image = os.path.join(ALERT_IMAGES_DIR, f"{alert['id']}.jpg")
-                write_atomic(image, data)
-                old = sorted(os.scandir(ALERT_IMAGES_DIR), key=lambda e: e.stat().st_mtime)
-                for entry in old[:-20]:
-                    os.remove(entry.path)
-            except (ProtectError, OSError):
-                image = ""
+        # The snapshot taken for the alert log is the notification's picture.
+        image = os.path.join(ALERT_IMAGES_DIR, alert["image"]) if alert.get("image") else ""
         what = {"person": "Person", "vehicle": "Vehicle", "animal": "Animal",
                 "package": "Package", "ring": "Doorbell", "motion": "Motion"}.get(alert["kind"], alert["kind"])
         summary = f"Doorbell at {camera['name']}" if alert["kind"] == "ring" else f"{what} at {camera['name']}"
@@ -1049,8 +1087,22 @@ def cmd_events(args):
 
 def cmd_alert(args):
     prefs = load_prefs()
-    if args.ack:
-        write_json(ALERTS_ACK_PATH, {"ackedAt": time.time()})
+    if args.ack or args.clear:
+        ack = read_ack()
+        ack["ackedAt"] = time.time()
+        if args.clear:
+            ack["clearedAt"] = ack["ackedAt"]
+        write_json(ALERTS_ACK_PATH, ack)
+        if args.clear:
+            # The listener drops cleared alerts on its next save. If it isn't
+            # running, nothing else writes the log, so empty it here.
+            lock = open(EVENTS_LOCK, "w")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return
+            write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": [], "consoles": {}})
+            prune_alert_images(set())
         return
     if args.notify:
         prefs["notify"] = args.notify == "on"
@@ -2096,6 +2148,7 @@ def main():
                                 f"default {','.join(DEFAULT_TRIGGERS)}")
     p.add_argument("--off", action="store_true", help="disarm the camera")
     p.add_argument("--ack", action="store_true", help="acknowledge all current alerts")
+    p.add_argument("--clear", action="store_true", help="clear the alert log")
     p.add_argument("--notify", choices=("on", "off"), help="desktop notifications for alerts")
     p.set_defaults(func=cmd_alert)
     p = sub.add_parser("events", help="listen for alerts on armed cameras (started by the panel)")

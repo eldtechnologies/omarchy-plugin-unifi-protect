@@ -139,6 +139,28 @@ class ListenerLifecycle(unittest.TestCase):
         self.assertEqual(lst.alerts[0]["kind"], "ring")
 
 
+class AlertLog(unittest.TestCase):
+    def test_clear_drops_older_alerts_and_their_snapshots(self):
+        os.makedirs(h.ALERT_IMAGES_DIR, exist_ok=True)
+        for name in ("old.jpg", "new.jpg", "stray.jpg"):
+            open(os.path.join(h.ALERT_IMAGES_DIR, name), "wb").close()
+        now = time.time()
+        h.write_json(h.ALERTS_ACK_PATH, {"ackedAt": now - 50, "clearedAt": now - 50})
+        listener = h.AlertListener()
+        listener.alerts = [{"id": "a", "start": now - 100, "image": "old.jpg"},
+                           {"id": "b", "start": now - 10, "image": "new.jpg"}]
+        listener.save()
+        self.assertEqual([a["id"] for a in listener.alerts], ["b"])
+        self.assertEqual(sorted(os.listdir(h.ALERT_IMAGES_DIR)), ["new.jpg"])
+        os.remove(h.ALERTS_ACK_PATH)
+
+    def test_day_old_alerts_expire(self):
+        listener = h.AlertListener()
+        listener.alerts = [{"id": "a", "start": time.time() - h.ALERTS_MAX_AGE - 5}]
+        listener.save()
+        self.assertEqual(listener.alerts, [])
+
+
 class Notifications(unittest.TestCase):
     def listener(self, enabled=True):
         listener = h.AlertListener()
