@@ -5,8 +5,10 @@ can be screenshotted, developed and tried without real footage. Each camera
 uses the image here with the matching name (`.jpg`, `.jpeg`, `.png` or
 `.webp`, 16:9); a missing one gets a plain placeholder.
 
-The images are AI-generated (Google Gemini image generation) and show no
-real place or person. To regenerate one, use its prompt:
+The images are AI-generated and show no real place or person. Demo mode
+blurs their top-left corner, where generated "camera" images tend to put a
+vendor logo, so screenshots never suggest an official product. To
+regenerate one, use its prompt with an image generator:
 
 | File | Prompt |
 |---|---|

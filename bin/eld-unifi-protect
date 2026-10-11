@@ -1237,15 +1237,21 @@ def build_demo_camera(slug, name):
     camera_id = demo_camera_id(slug)
     snapshot = os.path.join(DEMO_DIR, f"{camera_id}.jpg")
     source = demo_source_image(slug)
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S") + "  " + name
-    base = ([source, "-resize", "1920x1080^", "-gravity", "center", "-extent", "1920x1080"] if source
-            else ["-size", "1920x1080", "gradient:#33434c-#11181c", "-gravity", "center",
-                  "-fill", "#ffffff30", "-pointsize", "96", "-annotate", "0", name])
-    subprocess.run([magick, *base, "-gravity", "NorthWest", "-pointsize", "30",
-                    # Inset enough to survive the clip's slow zoom.
-                    "-fill", "#00000090", "-annotate", "+92+62", stamp,
-                    "-fill", "white", "-annotate", "+90+60", stamp, "-quality", "88", snapshot],
-                   check=True, capture_output=True)
+    if source:
+        # Demo images already carry a camera-style timestamp. Blur the top
+        # left corner, where generated images tend to put a vendor logo:
+        # the screenshots must not suggest an official product.
+        render = [source, "-resize", "1920x1080^", "-gravity", "center", "-extent", "1920x1080",
+                  "-gravity", "NorthWest", "-region", "300x130+0+0", "-blur", "0x22", "+region"]
+    else:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S") + "  " + name
+        render = ["-size", "1920x1080", "gradient:#33434c-#11181c", "-gravity", "center",
+                  "-fill", "#ffffff30", "-pointsize", "96", "-annotate", "0", name,
+                  # Inset enough to survive the clip's slow zoom.
+                  "-gravity", "NorthWest", "-pointsize", "30",
+                  "-fill", "#00000090", "-annotate", "+92+62", stamp,
+                  "-fill", "white", "-annotate", "+90+60", stamp]
+    subprocess.run([magick, *render, "-quality", "88", snapshot], check=True, capture_output=True)
     # A slow drift, so the 'live' view visibly moves; 60 s, looped by players.
     subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-loop", "1", "-framerate", "15",
                     "-i", snapshot, "-t", "60", "-vf",

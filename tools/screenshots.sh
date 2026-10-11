@@ -18,7 +18,7 @@ ipc=(omarchy-shell com.eldtechnologies.unifi-protect)
 runtime="${XDG_RUNTIME_DIR:?}/eld-unifi-protect"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$out"
+mkdir -p "$out"   # written only after every capture passes its checks
 
 monitor=$(hyprctl monitors -j | python3 -c 'import json,sys; m=[m for m in json.load(sys.stdin) if m["focused"]][0]; print(m["name"], m["scale"], m["reserved"][1])')
 read -r output scale bar_top <<<"$monitor"
@@ -27,7 +27,17 @@ home_ws=$(hyprctl activeworkspace -j | python3 -c 'import json,sys; print(json.l
 empty_ws=$(hyprctl workspaces -j | python3 -c 'import json,sys; used={w["name"] for w in json.load(sys.stdin) if w["windows"]}; print(next(str(n) for n in range(10, 30) if str(n) not in used))')
 
 goto() { hyprctl dispatch "hl.dsp.focus({ workspace = \"$1\" })" >/dev/null; sleep 1; }
-shot() { grim -o "$output" "$1"; }
+active_ws() { hyprctl activeworkspace -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])'; }
+
+# Never capture anything but the empty workspace: if something switched
+# away (a window asking for attention, a click), stop before saving.
+guard() {
+  if [[ $(active_ws) != "$empty_ws" ]]; then
+    echo "aborted: the screen left workspace $empty_ws during capture; nothing was saved" >&2
+    exit 1
+  fi
+}
+shot() { guard; grim -o "$output" "$1"; guard; }
 seen_alerts() { printf '{"ackedAt": %s}\n' "$(python3 -c "import time; print(time.time() - $1)")" >"$runtime/alerts-ack.json"; }
 
 cleanup() {
@@ -50,8 +60,14 @@ w, h, x, y = map(int, re.match(r"(\d+)x(\d+)\+(\d+)\+(\d+)", sys.argv[1]).groups
 pad = 24
 print(f"{w + 2 * pad}x{h + 2 * pad}+{max(0, x - pad)}+{max(0, y + int(sys.argv[2]) - pad)}")
 PY
-  magick "$work/$name.png" -crop "$(cat "$work/geometry")" +repage -resize '1400x>' "$out/$name.png"
-  echo "  $out/$name.png"
+  # A crop near full screen means more than the plugin changed: refuse it.
+  python3 - "$(cat "$work/geometry")" "$(magick identify -format '%w' "$work/base.png")" <<'PY' || exit 1
+import re, sys
+width = int(re.match(r"(\d+)x", sys.argv[1]).group(1))
+if width > 0.7 * int(sys.argv[2]):
+    sys.exit(f"aborted: the {sys.argv[1]} crop is not just the plugin; nothing was saved")
+PY
+  magick "$work/$name.png" -crop "$(cat "$work/geometry")" +repage -resize '1400x>' "$work/out-$name.png"
 }
 
 echo "demo mode on…"
@@ -77,7 +93,16 @@ crop_panel panel-live
 
 echo "camera wall"
 "$cli" wall --mode window >/dev/null; sleep 9; shot "$work/wall.png"; "$cli" wall >/dev/null; sleep 1
-magick "$work/wall.png" -resize '1600x>' "$out/wall.png"
-magick "$work/wall.png" -resize '1600x900^' -gravity center -extent 1600x900 "$repo/preview.png"
-echo "  $out/wall.png"
-echo "  $repo/preview.png"
+magick "$work/wall.png" -resize '1600x>' "$work/out-wall.png"
+magick "$work/wall.png" -resize '1600x900^' -gravity center -extent 1600x900 "$work/out-preview.png"
+
+# Every shot passed its checks: only now write into the repository.
+# Photo-heavy views as JPEG (a fraction of the size), the text-heavy log as PNG.
+for name in panel-grid panel-live wall; do
+  magick "$work/out-$name.png" -quality 88 "$out/$name.jpg"
+  echo "  $out/$name.jpg"
+done
+magick "$work/out-panel-alerts.png" -strip "$out/panel-alerts.png"
+echo "  $out/panel-alerts.png"
+magick "$work/out-preview.png" -quality 85 "$repo/preview.jpg"
+echo "  $repo/preview.jpg"
