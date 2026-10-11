@@ -3,6 +3,35 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
+## 0.3.0 — 2026-10-11
+
+### Added
+
+- **Camera alerts.** Arm a camera (the bell on its tile, or
+  `eld-unifi-protect alert`) and the plugin listens to that console's event
+  stream for a person, a vehicle or a doorbell ring (also animal, package,
+  motion). One connection per console, over the same pinned TLS as
+  everything else. (#16)
+- **The bar icon pulses** in the urgent colour until you open the panel;
+  the tile that alerted gets a border and a badge ("Person · 2 min ago").
+  `alertStatus` IPC for scripts. (#17)
+- **Desktop notifications** with a snapshot from the moment and a "Watch
+  live" button; at most one per camera per minute; on by default. (#18)
+- **Alert log** in the panel: what was seen, where, when and for how long,
+  with snapshots; unseen alerts marked; Clear. (#19)
+- **Demo mode** (`eld-unifi-protect demo on`): made-up consoles and
+  cameras for screenshots, development and trying the plugin without
+  UniFi hardware. **Screenshots** in the README, from the real UI on
+  AI-generated demo images. (#20)
+
+### Fixed
+
+- Tiles could stay on "Loading" on first run, until the panel was
+  reopened. (#20)
+- The LIVE badge covered the camera's burned-in timestamp. (#20)
+- Opening live view from the alert log left the log's buttons in the
+  header. (#20)
+
 ## 0.2.0 — 2026-10-11
 
 ### Fixed
