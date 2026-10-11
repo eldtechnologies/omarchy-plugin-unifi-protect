@@ -102,6 +102,7 @@ eld-unifi-protect remove nvr
 | Live | `M` | Toggle sound |
 | Live | Double-click | Pop out |
 | Live | Esc | Back to the grid |
+| Grid | `A` | Alert log |
 | Panel footer | Click the version | Release notes for that version |
 
 ### Camera wall
@@ -164,6 +165,13 @@ camera's tile is selected, with a red border and a badge such as "Person · 2
 min ago" for ten minutes. Armed cameras carry a bell in their label. If a
 console's event stream can't be reached, the panel says so.
 
+**Alerts** in the panel header (or `A`) opens the alert log: what was seen,
+on which camera, when and for how long, with a snapshot from that moment,
+newest first. Alerts you hadn't seen yet are marked. Click one to watch that
+camera live; **Clear** empties the log, which otherwise keeps the last 24
+hours. When you open the panel because the bar is pulsing, it goes straight
+to the log.
+
 Each alert also sends a **desktop notification**, "Person at Front Door",
 with a snapshot from that moment and a **Watch live** button that opens the
 panel on that camera. To avoid floods there is at most one notification per
@@ -176,6 +184,7 @@ eld-unifi-protect alert "Front Door"                  # person, vehicle, ring
 eld-unifi-protect alert "Driveway" --on vehicle
 eld-unifi-protect alert "Front Door" --off
 eld-unifi-protect alert                               # armed cameras and recent alerts
+eld-unifi-protect alert --clear                       # empty the alert log
 ```
 
 Detection is done by Protect, so a camera needs smart detections enabled in

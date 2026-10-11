@@ -104,6 +104,12 @@ Panel {
   // is opened; a camera's tile stays marked for ten minutes either way.
   property var alertsData: ({})
   property real ackedAt: 0
+  property real clearedAt: 0
+  // The alert log: everything since the last Clear, newest first.
+  property bool alertsView: false
+  property real seenBefore: 0      // alerts newer than this are marked new
+  readonly property var logAlerts: alerts.filter(function(a) { return a.start > root.clearedAt })
+                                         .slice().reverse()
   property real nowSec: Date.now() / 1000
   readonly property var alerts: alertsData && alertsData.alerts ? alertsData.alerts : []
   readonly property var unackedAlerts: alerts.filter(function(a) { return a.start > root.ackedAt })
@@ -142,6 +148,20 @@ Panel {
       if (alerts[i].uid === uid) return root.nowSec - alerts[i].start < 600 ? alerts[i] : null
     }
     return null
+  }
+
+  function openAlertLive(alert) {
+    for (var i = 0; i < allCameras.length; i++) {
+      if (allCameras[i].uid === alert.uid) {
+        root.alertsView = false
+        root.openLive(allCameras[i])
+        return
+      }
+    }
+  }
+
+  function clearAlerts() {
+    Quickshell.execDetached([root.cli, "alert", "--clear"])
   }
 
   function setArmed(camera, armed) {
@@ -467,7 +487,13 @@ Panel {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onLoaded: { try { root.ackedAt = JSON.parse(text()).ackedAt || 0 } catch (error) { } }
+    onLoaded: {
+      try {
+        var ack = JSON.parse(text())
+        root.ackedAt = ack.ackedAt || 0
+        root.clearedAt = ack.clearedAt || 0
+      } catch (error) { }
+    }
   }
 
   // Keeps "2 min ago" and the ten-minute tile marks current.
@@ -505,7 +531,12 @@ Panel {
       // Opening the panel is seeing the alert: select the camera, and
       // acknowledge so the bar stops flashing.
       var newest = root.latestAlert
-      if (newest) Quickshell.execDetached([root.cli, "alert", "--ack"])
+      // Remember what was unseen, to mark it in the log, before acknowledging.
+      root.seenBefore = root.ackedAt
+      if (newest) {
+        Quickshell.execDetached([root.cli, "alert", "--ack"])
+        root.alertsView = true
+      }
       if (root.selectedIndex >= cameras.length) root.selectedIndex = 0
       // The favourite sorts first; select it, and optionally go live.
       if (newest) {
@@ -517,6 +548,7 @@ Panel {
     } else {
       root.closeLive()
       root.showHidden = false
+      root.alertsView = false
       if (root.settingUp) root.cancelSetup()
     }
   }
@@ -656,7 +688,8 @@ Panel {
     contentHeight: panel.fittedContentHeight(
       headerRow.implicitHeight + Style.space(10)
         + (root.liveMode ? liveView.implicitHeight
-           : root.settingUp ? setupCard.implicitHeight : content.implicitHeight),
+           : root.settingUp ? setupCard.implicitHeight
+           : root.alertsView ? alertsColumn.implicitHeight : content.implicitHeight),
       Style.space(1000))
 
     PanelKeyCatcher {
@@ -666,7 +699,8 @@ Panel {
       // shortcuts; Esc in a setup field cancels setup instead.
       blocked: root.settingUp
 
-      onCloseRequested: root.liveMode ? root.closeLive() : root.close()
+      onCloseRequested: root.liveMode ? root.closeLive()
+                        : root.alertsView ? (root.alertsView = false) : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onMoveRequested: function(dx, dy) {
         if (root.liveMode) { if (dx !== 0) root.stepLive(dx) }
@@ -680,6 +714,7 @@ Panel {
         var key = text.toLowerCase()
         if (key === "m") root.muted = !root.muted
         else if (key === "w") root.openWall()
+        else if (key === "a" && !root.liveMode && root.configured) root.alertsView = !root.alertsView
         else if (key === "p") {
           var target = root.liveMode ? root.liveCamera : root.cameras[root.selectedIndex]
           root.popOut(target)
@@ -705,6 +740,7 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             text: root.liveMode ? root.liveCamera.name.toUpperCase()
                   + (root.multiConsole ? "  ·  " + root.liveCamera.consoleName.toUpperCase() : "")
+                : root.alertsView ? "ALERTS" + (root.logAlerts.length ? "  ·  " + root.logAlerts.length : "")
                 : "UNIFI PROTECT" + (root.configured && root.shownCameras.length
                     ? "  ·  " + root.onlineCount + "/" + root.shownCameras.length + " ONLINE" : "")
             color: root.foreground
@@ -740,21 +776,43 @@ Panel {
             }
 
             ActionButton {
-              visible: !root.liveMode && !root.settingUp && root.configured && root.shownCameras.length > 0
+              visible: root.alertsView && root.logAlerts.length > 0
+              label: "Clear"
+              outlined: true
+              onTriggered: root.clearAlerts()
+            }
+
+            ActionButton {
+              visible: root.alertsView
+              label: "Back"
+              outlined: true
+              onTriggered: root.alertsView = false
+            }
+
+            ActionButton {
+              visible: !root.liveMode && !root.settingUp && !root.alertsView && root.configured
+                       && (root.armedCount > 0 || root.logAlerts.length > 0)
+              label: "Alerts"
+              outlined: true
+              onTriggered: root.alertsView = true
+            }
+
+            ActionButton {
+              visible: !root.liveMode && !root.settingUp && !root.alertsView && root.configured && root.shownCameras.length > 0
               label: "Wall"
               outlined: true
               onTriggered: root.openWall()
             }
 
             ActionButton {
-              visible: !root.liveMode && !root.settingUp && root.configured
+              visible: !root.liveMode && !root.settingUp && !root.alertsView && root.configured
               label: "Add console"
               outlined: true
               onTriggered: root.addConsole()
             }
 
             ActionButton {
-              visible: !root.liveMode && !root.settingUp && root.configured
+              visible: !root.liveMode && !root.settingUp && !root.alertsView && root.configured
               label: "Protect"
               outlined: true
               onTriggered: root.openConsole()
@@ -1015,10 +1073,136 @@ Panel {
           }
         }
 
+        // ---- alert log ----
+        Flickable {
+          id: alertsScroll
+          visible: root.alertsView && !root.liveMode
+          width: parent.width
+          height: parent.height - headerRow.height - panelBody.spacing
+          contentHeight: alertsColumn.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          interactive: contentHeight > height
+
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+          Column {
+            id: alertsColumn
+            width: alertsScroll.width
+            spacing: Style.space(4)
+
+            Text {
+              visible: root.logAlerts.length === 0
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: root.armedCount > 0
+                    ? "No alerts in the last 24 hours."
+                    : "No alerts. Arm a camera with the bell on its tile to be told when it sees a person, a vehicle or a doorbell ring."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              topPadding: Style.space(8)
+              bottomPadding: Style.space(8)
+            }
+
+            Repeater {
+              model: root.alertsView ? root.logAlerts : []
+
+              Rectangle {
+                id: alertRow
+                required property var modelData
+                readonly property bool isNew: modelData.start > root.seenBefore
+                width: alertsColumn.width
+                height: Style.space(64)
+                radius: Style.cornerRadius
+                color: alertMouse.containsMouse ? root.surface : "transparent"
+
+                Row {
+                  anchors.fill: parent
+                  anchors.margins: Style.space(5)
+                  spacing: Style.space(10)
+
+                  Rectangle {
+                    width: Style.space(96)
+                    height: Style.space(54)
+                    radius: Style.cornerRadius
+                    color: root.surface
+                    clip: true
+
+                    Image {
+                      anchors.fill: parent
+                      source: alertRow.modelData.image
+                              ? "file://" + root.runtimeDir + "/alerts/" + alertRow.modelData.image : ""
+                      fillMode: Image.PreserveAspectCrop
+                      asynchronous: true
+                      sourceSize.width: 192
+                    }
+                  }
+
+                  Column {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - Style.space(96) - parent.spacing
+                    spacing: Style.space(2)
+
+                    Text {
+                      width: parent.width
+                      textFormat: Text.PlainText
+                      text: (alertRow.isNew ? "● " : "") + root.alertLabel(alertRow.modelData.kind)
+                            + "  ·  " + alertRow.modelData.camera
+                      color: alertRow.isNew ? root.urgent : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                      elide: Text.ElideRight
+                    }
+
+                    Text {
+                      width: parent.width
+                      textFormat: Text.PlainText
+                      text: {
+                        var a = alertRow.modelData
+                        var parts = [Qt.formatTime(new Date(a.start * 1000), "HH:mm:ss") + " (" + root.ago(a.start) + ")"]
+                        parts.push(a.end ? Math.max(1, Math.round(a.end - a.start)) + " s" : "ongoing")
+                        if (root.multiConsole) parts.push(a.consoleName)
+                        return parts.join("  ·  ")
+                      }
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                    }
+                  }
+                }
+
+                MouseArea {
+                  id: alertMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.openAlertLive(alertRow.modelData)
+                }
+              }
+            }
+
+            Text {
+              visible: root.logAlerts.length > 0
+              width: parent.width
+              textFormat: Text.PlainText
+              horizontalAlignment: Text.AlignHCenter
+              text: "Click an alert to watch that camera live  ·  last 24 hours  ·  Esc back"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              topPadding: Style.space(6)
+            }
+          }
+        }
+
         // ---- grid ----
         Flickable {
           id: bodyScroll
-          visible: !root.liveMode && !root.settingUp
+          visible: !root.liveMode && !root.settingUp && !root.alertsView
           width: parent.width
           height: parent.height - headerRow.height - panelBody.spacing
           contentHeight: content.implicitHeight
