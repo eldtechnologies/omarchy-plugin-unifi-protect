@@ -16,6 +16,8 @@ BarWidget {
   readonly property bool configured: panelLoader.item ? panelLoader.item.configured : false
   readonly property bool healthy: panelLoader.item ? panelLoader.item.healthy : true
   readonly property bool stale: panelLoader.item ? panelLoader.item.stale : false
+  // An armed camera saw something that nobody has looked at yet.
+  readonly property bool alerting: panelLoader.item ? panelLoader.item.alerting === true : false
 
   // nf-fa-video_camera
   readonly property string icon: ""
@@ -69,6 +71,15 @@ BarWidget {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.togglePanel() }
+    // For scripts: {"alerting": bool, "latest": {...} | null, "armed": n}
+    function alertStatus(): string {
+      var panel = panelLoader.item
+      return JSON.stringify({
+        alerting: root.alerting,
+        latest: panel ? panel.latestAlert : null,
+        armed: panel ? panel.armedCount : 0
+      })
+    }
     // Fullscreen grid of every visible camera; calling again closes it.
     function wall(): void {
       Quickshell.execDetached([decodeURIComponent(String(Qt.resolvedUrl("bin/eld-unifi-protect"))
@@ -92,10 +103,19 @@ BarWidget {
     horizontalMargin: 9.625
     verticalPadding: 8.75
 
-    active: !root.healthy && root.configured
+    active: (!root.healthy && root.configured) || root.alerting
     useActiveColor: true
 
     tooltipText: panelLoader.item ? panelLoader.item.barTooltip : "UniFi Protect"
+
+    // Pulses in the urgent colour until the panel is opened.
+    SequentialAnimation on opacity {
+      running: root.alerting
+      loops: Animation.Infinite
+      NumberAnimation { to: 0.3; duration: 650; easing.type: Easing.InOutSine }
+      NumberAnimation { to: 1; duration: 650; easing.type: Easing.InOutSine }
+      onRunningChanged: if (!running) button.opacity = 1
+    }
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.togglePanel()

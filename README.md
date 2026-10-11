@@ -96,7 +96,7 @@ eld-unifi-protect remove nvr
 | Grid | Arrows / hjkl | Move the selection |
 | Grid | `1`–`9` | Live view of camera N |
 | Grid | `W` | Camera wall |
-| Grid | Hover a tile | ★ favourite, eye to hide, pop-out button |
+| Grid | Hover a tile | Bell to arm alerts, ★ favourite, eye to hide, pop-out button |
 | Grid / live | `P` | Pop out to mpv |
 | Live | ← / → | Previous / next camera |
 | Live | `M` | Toggle sound |
@@ -154,9 +154,15 @@ eld-unifi-protect hide-offline on     # off / toggle
 
 ### Alerts
 
-Arm a camera and the plugin listens to that console's event stream for what
-you choose: by default a **person**, a **vehicle** or a **doorbell ring**
-(also available: `animal`, `package`, `motion`).
+Hover a tile and click the bell to arm that camera. The plugin then listens
+to the console's event stream for a **person**, a **vehicle** or a **doorbell
+ring** (also available from the command line: `animal`, `package`, `motion`).
+
+When an armed camera sees one, the **bar icon turns red and pulses** until you
+open the panel. Its tooltip says what, where and when. In the panel, that
+camera's tile is selected, with a red border and a badge such as "Person · 2
+min ago" for ten minutes. Armed cameras carry a bell in their label. If a
+console's event stream can't be reached, the panel says so.
 
 ```bash
 eld-unifi-protect alert "Front Door"                  # person, vehicle, ring
@@ -175,6 +181,7 @@ security system: nothing is flagged while your computer is asleep or off.
 eld-unifi-protect wall                  # toggle the camera wall
 omarchy-shell com.eldtechnologies.unifi-protect toggle
 omarchy-shell com.eldtechnologies.unifi-protect live "Front Door"
+omarchy-shell com.eldtechnologies.unifi-protect alertStatus   # JSON: alerting, latest alert
 eld-unifi-protect cameras               # list cameras and their ids
 eld-unifi-protect live <camera-id>      # straight to mpv
 ```
