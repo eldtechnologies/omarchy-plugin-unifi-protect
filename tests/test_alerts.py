@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from helpers import helper as h
 
@@ -136,6 +137,40 @@ class ListenerLifecycle(unittest.TestCase):
         lst = self.listener()
         lst.handle("nvr", {"item": {"id": "e4", "type": "ring", "device": "cam1", "start": 1791700000000}})
         self.assertEqual(lst.alerts[0]["kind"], "ring")
+
+
+class Notifications(unittest.TestCase):
+    def listener(self, enabled=True):
+        listener = h.AlertListener()
+        listener.config = {"consoles": []}
+        listener.notify_enabled = enabled
+        listener.sent = []
+
+        async def fake_send(console, camera, alert):
+            listener.sent.append((camera["uid"], alert["kind"]))
+        listener.send_notification = fake_send
+        return listener
+
+    def notify_twice(self, listener, uids):
+        camera = {"uid": "", "id": "c", "name": "Door", "consoleName": "NVR"}
+
+        async def run():
+            for uid in uids:
+                listener.notify("nvr", dict(camera, uid=uid), {"id": uid, "kind": "person", "start": 0})
+            await asyncio.sleep(0)
+        # Independent of whether this machine has notify-send installed.
+        with mock.patch.object(h.shutil, "which", return_value="/usr/bin/notify-send"):
+            asyncio.run(run())
+
+    def test_at_most_one_notification_per_camera_per_minute(self):
+        lst = self.listener()
+        self.notify_twice(lst, ["nvr_a", "nvr_a", "nvr_b"])
+        self.assertEqual(lst.sent, [("nvr_a", "person"), ("nvr_b", "person")])
+
+    def test_notifications_can_be_turned_off(self):
+        lst = self.listener(enabled=False)
+        self.notify_twice(lst, ["nvr_a"])
+        self.assertEqual(lst.sent, [])
 
 
 @unittest.skipUnless(shutil.which("openssl"), "openssl is needed to make a test certificate")

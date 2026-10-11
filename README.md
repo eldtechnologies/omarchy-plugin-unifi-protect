@@ -164,6 +164,13 @@ camera's tile is selected, with a red border and a badge such as "Person · 2
 min ago" for ten minutes. Armed cameras carry a bell in their label. If a
 console's event stream can't be reached, the panel says so.
 
+Each alert also sends a **desktop notification**, "Person at Front Door",
+with a snapshot from that moment and a **Watch live** button that opens the
+panel on that camera. To avoid floods there is at most one notification per
+camera per minute; every alert is still recorded. Turn them off with
+**Notifications on** in the panel footer, or
+`eld-unifi-protect alert --notify off`.
+
 ```bash
 eld-unifi-protect alert "Front Door"                  # person, vehicle, ring
 eld-unifi-protect alert "Driveway" --on vehicle
@@ -228,7 +235,7 @@ The plugin's own files:
 | `~/.config/eld-unifi-protect/config.json` | Consoles and pinned certificates; API keys only if there is no keyring (mode 0600) |
 | `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras, favourite, armed cameras, read-only setting (no secrets) |
 | `~/.local/state/eld-unifi-protect/state.json` | Last camera list |
-| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs and recent alerts (tmpfs, gone on reboot) |
+| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their notification pictures (tmpfs, gone on reboot) |
 
 ## How it works
 

@@ -1325,6 +1325,14 @@ Panel {
               spacing: Style.space(6)
 
               ActionButton {
+                visible: root.armedCount > 0
+                readonly property bool on: root.state.alertNotify !== false
+                label: on ? "Notifications on" : "Notifications off"
+                outlined: true
+                onTriggered: Quickshell.execDetached([root.cli, "alert", "--notify", on ? "off" : "on"])
+              }
+
+              ActionButton {
                 label: root.hideOffline ? "Show offline" : "Hide offline"
                 outlined: true
                 onTriggered: root.toggleHideOffline()
