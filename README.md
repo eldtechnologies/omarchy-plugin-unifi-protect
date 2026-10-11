@@ -152,6 +152,23 @@ eld-unifi-protect unhide "G6 PTZ"     # or: unhide --all
 eld-unifi-protect hide-offline on     # off / toggle
 ```
 
+### Alerts
+
+Arm a camera and the plugin listens to that console's event stream for what
+you choose: by default a **person**, a **vehicle** or a **doorbell ring**
+(also available: `animal`, `package`, `motion`).
+
+```bash
+eld-unifi-protect alert "Front Door"                  # person, vehicle, ring
+eld-unifi-protect alert "Driveway" --on vehicle
+eld-unifi-protect alert "Front Door" --off
+eld-unifi-protect alert                               # armed cameras and recent alerts
+```
+
+Detection is done by Protect, so a camera needs smart detections enabled in
+Protect for person and vehicle alerts. Alerts are a convenience, not a
+security system: nothing is flagged while your computer is asleep or off.
+
 ### Keybindings and scripts
 
 ```bash
@@ -202,9 +219,9 @@ The plugin's own files:
 |------|----------|
 | Desktop keyring (Secret Service) | API keys, when a keyring is available |
 | `~/.config/eld-unifi-protect/config.json` | Consoles and pinned certificates; API keys only if there is no keyring (mode 0600) |
-| `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras, favourite, read-only setting (no secrets) |
+| `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras, favourite, armed cameras, read-only setting (no secrets) |
 | `~/.local/state/eld-unifi-protect/state.json` | Last camera list |
-| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots and stream URLs (tmpfs, gone on reboot) |
+| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs and recent alerts (tmpfs, gone on reboot) |
 
 ## How it works
 
