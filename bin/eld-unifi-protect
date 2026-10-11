@@ -195,6 +195,8 @@ def load_config():
     config is a list. The original single-console shape is still read and
     converted on the next save.
     """
+    if demo_on():
+        return demo_config()
     try:
         with open(CONFIG_PATH) as handle:
             config = json.load(handle)
@@ -223,6 +225,8 @@ def load_config():
 
 def save_config(config):
     """Write the config; keys held by the keyring are never written out."""
+    if demo_on():
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     stored = dict(config, consoles=[])
     for console in config["consoles"]:
         entry = {k: v for k, v in console.items() if k != "keyError"}
@@ -909,11 +913,13 @@ class AlertListener:
         self.last_captured = {}      # camera uid -> time of its last alert snapshot
 
     def refresh(self):
-        """Re-read config and arming when cameras.json has changed."""
-        try:
-            stamp = os.stat(PREFS_PATH).st_mtime_ns
-        except OSError:
-            stamp = None
+        """Re-read config and arming when cameras.json or config.json change."""
+        stamp = []
+        for path in (PREFS_PATH, CONFIG_PATH):
+            try:
+                stamp.append(os.stat(path).st_mtime_ns)
+            except OSError:
+                stamp.append(None)
         if stamp == self.prefs_stamp and self.config is not None:
             return
         self.prefs_stamp = stamp
@@ -1057,6 +1063,8 @@ class AlertListener:
         while True:
             if self.parent is not None and os.getppid() != self.parent:
                 return  # the shell that started us is gone
+            if demo_on():
+                return  # demo data must never be mixed with real events
             self.refresh()
             if not self.armed:
                 self.status = {}
@@ -1141,7 +1149,171 @@ def cmd_alert(args):
     poll_cameras()
 
 
+# ---- demo mode -----------------------------------------------------------
+#
+# Made-up consoles and cameras for screenshots, development and trying the
+# plugin without UniFi hardware. While the flag file exists, load_config()
+# returns the demo consoles and Protect() returns DemoProtect, so the panel,
+# wall, pop-out and alerts all run their normal code on demo data. Nothing
+# real is changed: saving the config is refused while the demo is on, and
+# the flag lives in the runtime directory, so a reboot always ends it.
+
+DEMO_FLAG = os.path.join(RUNTIME_DIR, "demo.json")
+DEMO_DIR = os.path.join(RUNTIME_DIR, "demo")
+DEMO_SOURCE = os.path.join(PLUGIN_DIR, "docs", "demo")
+DEMO_CONSOLES = [
+    {"id": "gateway", "name": "Gateway", "host": "192.0.2.1"},
+    {"id": "nvr", "name": "NVR", "host": "192.0.2.2"},
+]
+# (console, image slug, name, model); ids and MACs are derived from the slug.
+DEMO_CAMERAS = [
+    ("gateway", "driveway", "Driveway", "G5 Bullet"),
+    ("gateway", "garage", "Garage", "G4 Instant"),
+    ("nvr", "front-door", "Front Door", "G4 Doorbell Pro"),
+    ("nvr", "garden", "Garden", "G5 Flex"),
+    ("nvr", "gate", "Gate", "G6 Bullet"),
+    ("nvr", "side-path", "Side Path", "G6 Instant"),
+]
+DEMO_ARMED = ("Front Door", "Driveway")
+# (minutes ago, camera, kind, seconds long or None for ongoing)
+DEMO_ALERTS = [(240, "Gate", "vehicle", 22), (95, "Garden", "animal", 41),
+               (38, "Front Door", "ring", 9), (14, "Driveway", "vehicle", 17),
+               (2, "Front Door", "person", None)]
+
+
+def demo_on():
+    return os.path.exists(DEMO_FLAG)
+
+
+def demo_camera_id(slug):
+    return hashlib.sha1(slug.encode()).hexdigest()[:24]
+
+
+def demo_config():
+    consoles = [dict(c, apiKey="demo", certSha256="", demo=True) for c in DEMO_CONSOLES]
+    return {"consoles": consoles, "timeoutSec": 8}
+
+
+class DemoProtect:
+    """Stands in for Protect while the demo is on: local files, no network."""
+
+    def __init__(self, console):
+        self.console = console
+        self.host = console["host"]
+
+    def info(self):
+        return {"applicationVersion": "demo"}
+
+    def cameras(self):
+        return [{"id": demo_camera_id(slug), "name": name, "type": f"UVC {model}",
+                 "mac": hashlib.md5(slug.encode()).hexdigest()[:12], "state": "CONNECTED"}
+                for console, slug, name, model in DEMO_CAMERAS if console == self.console["id"]]
+
+    def snapshot(self, camera_id, high_quality=False):
+        with open(os.path.join(DEMO_DIR, f"{camera_id}.jpg"), "rb") as handle:
+            return handle.read()
+
+    def stream_urls(self, camera_id, qualities):
+        url = "file://" + os.path.join(DEMO_DIR, f"{camera_id}.mp4")
+        return {q: url for q in qualities}
+
+    def stream_url(self, camera_id, quality):
+        return self.stream_urls(camera_id, [quality])[quality]
+
+
+def demo_source_image(slug):
+    for ext in ("jpg", "jpeg", "png", "webp"):
+        path = os.path.join(DEMO_SOURCE, f"{slug}.{ext}")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def build_demo_camera(slug, name):
+    """Snapshot with a camera-style timestamp, and a looping 'live' clip."""
+    magick, ffmpeg = shutil.which("magick"), shutil.which("ffmpeg")
+    if not magick or not ffmpeg:
+        raise ProtectError("demo mode needs ImageMagick (magick) and ffmpeg")
+    camera_id = demo_camera_id(slug)
+    snapshot = os.path.join(DEMO_DIR, f"{camera_id}.jpg")
+    source = demo_source_image(slug)
+    if source:
+        # Demo images already carry a camera-style timestamp. Blur the top
+        # left corner, where generated images tend to put a vendor logo:
+        # the screenshots must not suggest an official product.
+        render = [source, "-resize", "1920x1080^", "-gravity", "center", "-extent", "1920x1080",
+                  "-gravity", "NorthWest", "-region", "300x130+0+0", "-blur", "0x22", "+region"]
+    else:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S") + "  " + name
+        render = ["-size", "1920x1080", "gradient:#33434c-#11181c", "-gravity", "center",
+                  "-fill", "#ffffff30", "-pointsize", "96", "-annotate", "0", name,
+                  # Inset enough to survive the clip's slow zoom.
+                  "-gravity", "NorthWest", "-pointsize", "30",
+                  "-fill", "#00000090", "-annotate", "+92+62", stamp,
+                  "-fill", "white", "-annotate", "+90+60", stamp]
+    subprocess.run([magick, *render, "-quality", "88", snapshot], check=True, capture_output=True)
+    # A slow drift, so the 'live' view visibly moves; 60 s, looped by players.
+    subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-loop", "1", "-framerate", "15",
+                    "-i", snapshot, "-t", "60", "-vf",
+                    "scale=1920:1080,zoompan=z='1.04+0.03*sin(on/90)':"
+                    "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1280x720:fps=15,"
+                    # JPEG input is full-range; players expect standard
+                    # (limited-range) yuv420p, or show nothing at all.
+                    "scale=out_range=tv,format=yuv420p",
+                    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                    os.path.join(DEMO_DIR, f"{camera_id}.mp4")],
+                   check=True, capture_output=True)
+    return camera_id
+
+
+def cmd_demo(args):
+    if args.mode == "status":
+        print("demo mode " + ("on" if demo_on() else "off"))
+        return
+    if args.mode == "off":
+        for path in (DEMO_FLAG, ALERTS_PATH, ALERTS_ACK_PATH, SNAP_INDEX):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        for folder in (DEMO_DIR, ALERT_IMAGES_DIR, SNAP_DIR):
+            shutil.rmtree(folder, ignore_errors=True)
+        poll_cameras()
+        print("demo mode off; your consoles are back")
+        return
+    os.makedirs(DEMO_DIR, mode=0o700, exist_ok=True)
+    print("rendering demo cameras…")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        ids = dict(zip([n for _, _, n, _ in DEMO_CAMERAS],
+                       pool.map(lambda c: build_demo_camera(c[1], c[2]), DEMO_CAMERAS)))
+    missing = [slug for _, slug, _, _ in DEMO_CAMERAS if not demo_source_image(slug)]
+    write_json(DEMO_FLAG, {"since": time.time()})
+    # A believable alert log, with snapshots, ending in an unseen alert.
+    now = time.time()
+    alerts = []
+    os.makedirs(ALERT_IMAGES_DIR, mode=0o700, exist_ok=True)
+    for i, (minutes, name, kind, length) in enumerate(DEMO_ALERTS):
+        console = next(c for c, _, n, _ in DEMO_CAMERAS if n == name)
+        image = f"demo-{i}.jpg"
+        shutil.copyfile(os.path.join(DEMO_DIR, f"{ids[name]}.jpg"), os.path.join(ALERT_IMAGES_DIR, image))
+        start = now - minutes * 60
+        alerts.append({"id": f"demo-{i}", "uid": f"{console}_{ids[name]}", "camera": name,
+                       "consoleName": "Gateway" if console == "gateway" else "NVR", "kind": kind,
+                       "start": start, "end": start + length if length else None, "image": image})
+    write_json(ALERTS_PATH, {"updatedAt": now, "alerts": alerts, "consoles": {}})
+    write_json(ALERTS_ACK_PATH, {"ackedAt": now - 20 * 60})
+    poll_cameras()
+    print("demo mode on: 2 consoles, 6 cameras, an alert log. `eld-unifi-protect demo off` ends it.")
+    if missing:
+        print(f"no image yet for: {', '.join(missing)} (placeholders used; add them to {DEMO_SOURCE})")
+
+
 class Protect:
+    def __new__(cls, console, config=None):
+        if console.get("demo"):
+            return DemoProtect(console)
+        return super().__new__(cls)
+
     def __init__(self, console, config=None):
         self.console = console
         self.host = console["host"]
@@ -1340,6 +1512,15 @@ def camera_key(camera):
     return camera.get("mac") or camera.get("uid")
 
 
+def demo_arming(cameras):
+    """In demo mode, show a couple of cameras as armed without touching prefs."""
+    if demo_on():
+        for camera in cameras:
+            if camera["name"] in DEMO_ARMED and not camera.get("alerts"):
+                camera["alerts"] = list(DEFAULT_TRIGGERS)
+    return cameras
+
+
 def apply_prefs(cameras, prefs):
     hidden = set(prefs.get("hidden", []))
     favorite = prefs.get("favorite", "")
@@ -1458,7 +1639,7 @@ def poll_cameras(config=None):
         "consoles": summaries,
         "hideOffline": load_prefs()["hideOffline"],
         "alertNotify": load_prefs()["notify"],
-        "cameras": apply_prefs(merge_cameras(cameras), load_prefs()),
+        "cameras": demo_arming(apply_prefs(merge_cameras(cameras), load_prefs())),
     }
     write_json(STATE_PATH, state)
     return state
@@ -2154,6 +2335,9 @@ def main():
     p = sub.add_parser("events", help="listen for alerts on armed cameras (started by the panel)")
     p.add_argument("--follow-parent", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_events)
+    p = sub.add_parser("demo", help="made-up cameras for screenshots and trying the plugin")
+    p.add_argument("mode", choices=("on", "off", "status"), nargs="?", default="status")
+    p.set_defaults(func=cmd_demo)
     p = sub.add_parser("favorite", help="set the camera the panel opens on (or --clear)")
     p.add_argument("camera", nargs="?")
     p.add_argument("--clear", action="store_true")

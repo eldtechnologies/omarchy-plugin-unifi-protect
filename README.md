@@ -14,8 +14,22 @@ on the last poll.
 
 Version 0.2.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
 
+![The camera wall: six cameras live, maximized, with the Omarchy bar above](docs/screenshots/wall.jpg)
+
+*The camera pictures in these screenshots are AI-generated for demo purposes; they show no real place or person. The screenshots themselves are of the real plugin, running in [demo mode](#developing).*
+
 > **Unofficial.** This is an independent community plugin. It is not made,
 > endorsed, or supported by Ubiquiti Inc. or by the Omarchy project.
+
+## Screenshots
+
+| Camera grid | Alert log |
+|---|---|
+| ![The panel: a grid of six camera snapshots, an alert badge on Front Door, and armed cameras marked with a bell](docs/screenshots/panel-grid.jpg) | ![The alert log: what was seen, where, when and for how long, each with a snapshot](docs/screenshots/panel-alerts.png) |
+
+![Live view of the Front Door camera in the panel](docs/screenshots/panel-live.jpg)
+
+*The camera pictures in these screenshots are AI-generated for demo purposes; they show no real place or person. The screenshots themselves are of the real plugin, running in [demo mode](#developing).*
 
 ## Requirements
 
@@ -347,6 +361,13 @@ run.
 
 The version is set in `manifest.json` only; `eld-unifi-protect --version` reads
 it from there. Record changes in `CHANGELOG.md`.
+
+**Demo mode** shows made-up consoles and cameras instead of yours, for
+screenshots, development, or trying the plugin without UniFi hardware:
+`eld-unifi-protect demo on` (and `demo off`). Your real config is never
+touched, and a reboot always ends it. `tools/screenshots.sh` captures the
+README screenshots from the real UI on demo data; see
+[docs/demo](docs/demo/README.md).
 
 Run the tests (standard library only; they never touch your real config,
 keys or consoles):

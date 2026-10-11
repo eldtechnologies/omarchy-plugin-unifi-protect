@@ -117,7 +117,11 @@ ShellRoot {
       // the track off) rather than decoding it only to mute it.
       audioOutput: stream.playAudio ? audio : null
       activeAudioTrack: stream.playAudio ? 0 : -1
-      playbackOptions.playbackIntent: PlaybackOptions.PlaybackIntent.LowLatencyStreaming
+      // Low-latency mode suits live network streams; for a local file (the
+      // demo) it drops every frame, so only RTSP gets it.
+      playbackOptions.playbackIntent: String(source).indexOf("rtsp") === 0
+                                      ? PlaybackOptions.PlaybackIntent.LowLatencyStreaming
+                                      : PlaybackOptions.PlaybackIntent.Playback
       playbackOptions.networkTimeoutMs: 8000
       onErrorOccurred: function(error, errorString) {
         stream.error = errorString || "stream failed"
