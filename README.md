@@ -348,6 +348,13 @@ run.
 The version is set in `manifest.json` only; `eld-unifi-protect --version` reads
 it from there. Record changes in `CHANGELOG.md`.
 
+**Demo mode** shows made-up consoles and cameras instead of yours, for
+screenshots, development, or trying the plugin without UniFi hardware:
+`eld-unifi-protect demo on` (and `demo off`). Your real config is never
+touched, and a reboot always ends it. `tools/screenshots.sh` captures the
+README screenshots from the real UI on demo data; see
+[docs/demo](docs/demo/README.md).
+
 Run the tests (standard library only; they never touch your real config,
 keys or consoles):
 

@@ -211,6 +211,7 @@ Panel {
 
   function openLive(camera) {
     if (!camera) return
+    root.alertsView = false
     root.liveError = ""
     root.liveCamera = camera
     for (var i = 0; i < cameras.length; i++) if (cameras[i].uid === camera.uid) root.selectedIndex = i
@@ -521,6 +522,17 @@ Panel {
     onTriggered: if (!eventsProcess.running) eventsProcess.running = true
   }
 
+  // FileView cannot watch a file that does not exist yet, and index.json
+  // only appears after the first snapshot round (first run, or after the
+  // runtime directory was cleared). Re-read it on the refresh interval while
+  // the grid is showing, so tiles never stay stuck on "Loading".
+  Timer {
+    interval: root.snapshotSeconds * 1000
+    repeat: true
+    running: root.opened && !root.liveMode
+    onTriggered: indexFile.reload()
+  }
+
   Component.onCompleted: reloadState()
 
   onOpenedChanged: {
@@ -601,7 +613,11 @@ Panel {
     id: player
     videoOutput: videoOutput
     audioOutput: AudioOutput { muted: root.muted }
-    playbackOptions.playbackIntent: PlaybackOptions.PlaybackIntent.LowLatencyStreaming
+    // Low-latency mode suits live network streams; for a local file (the
+    // demo) it drops every frame, so only RTSP gets it.
+    playbackOptions.playbackIntent: String(source).indexOf("rtsp") === 0
+                                    ? PlaybackOptions.PlaybackIntent.LowLatencyStreaming
+                                    : PlaybackOptions.PlaybackIntent.Playback
     playbackOptions.networkTimeoutMs: 8000
     onErrorOccurred: function(error, errorString) {
       if (root.liveMode) root.liveError = errorString || "playback failed"
@@ -862,9 +878,10 @@ Panel {
             }
 
             // LIVE badge: a frozen stream must never pass for a live one.
+            // Top right: UniFi cameras burn their timestamp in at top left.
             Rectangle {
               visible: root.playing
-              anchors.left: parent.left
+              anchors.right: parent.right
               anchors.top: parent.top
               anchors.margins: Style.space(10)
               width: liveLabel.implicitWidth + Style.space(14)
