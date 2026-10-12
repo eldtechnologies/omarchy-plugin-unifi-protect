@@ -94,6 +94,8 @@ class RelayEndToEnd(unittest.TestCase):
             {"id": "evil", "name": "Impostor", "host": "127.0.0.1", "certSha256": "0" * 64},
         ]}
         cls.relay = h.Relay(config)
+        # Loopback URLs name a route, never Protect's alias.
+        cls.routes = {c: h.register_relay_route(c, "/AbC") for c in ("nvr", "evil")}
         threading.Thread(target=cls.relay.serve, daemon=True).start()
 
     @classmethod
@@ -106,7 +108,8 @@ class RelayEndToEnd(unittest.TestCase):
         return sock, sock.makefile("rb")
 
     def url(self, console="nvr", token=None):
-        return f"rtsp://127.0.0.1:{self.relay.port}/{token or self.relay.token}/{console}/AbC"
+        return (f"rtsp://127.0.0.1:{self.relay.port}/{token or self.relay.token}/{console}/"
+                f"{self.routes[console]}")
 
     def request(self, sock, reader, method, url, cseq, extra=()):
         headers = [("CSeq", str(cseq)), *extra]
@@ -128,6 +131,8 @@ class RelayEndToEnd(unittest.TestCase):
         self.assertEqual(start, "RTSP/1.0 200 OK")
 
         _, _, headers, body = self.request(sock, reader, "DESCRIBE", url, 2)
+        # The player never learns the alias...
+        self.assertNotIn("AbC", body.decode() + str(headers))
         # Console URLs in the response point back at the relay...
         self.assertEqual(h.header_value(headers, "content-base"), url + "/")
         self.assertIn(f"a=control:{url}/trackID=0", body.decode())
@@ -153,6 +158,20 @@ class RelayEndToEnd(unittest.TestCase):
         self.assertTrue(all(f"rtsps://127.0.0.1:{self.console.port}/AbC" in r for r in upstream))
         self.assertEqual(sum(r.startswith("SETUP") for r in self.console.requests), 1)
         self.assertNotIn(self.relay.token, " ".join(self.console.requests))
+
+    def test_unknown_or_foreign_routes_are_refused(self):
+        for url in (f"rtsp://127.0.0.1:{self.relay.port}/{self.relay.token}/nvr/AbC",
+                    f"rtsp://127.0.0.1:{self.relay.port}/{self.relay.token}/nvr/{self.routes['evil']}"):
+            sock, reader = self.connect()
+            _, start, _, _ = self.request(sock, reader, "OPTIONS", url, 1)
+            self.assertTrue(start.startswith("RTSP/1.0 404"), (url, start))
+
+    def test_idle_connections_cannot_lock_players_out(self):
+        hogs = [self.connect() for _ in range(h.RELAY_MAX_PENDING + 2)]
+        sock, reader = self.connect()
+        _, start, _, _ = self.request(sock, reader, "OPTIONS", self.url(), 1)
+        self.assertEqual(start, "RTSP/1.0 200 OK")
+        self.assertTrue(hogs)
 
     def test_oversized_or_silent_clients_are_dropped_before_the_token(self):
         # A huge Content-Length is refused without buffering the body.

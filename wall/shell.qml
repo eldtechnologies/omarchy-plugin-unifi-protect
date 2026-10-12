@@ -25,6 +25,9 @@ ShellRoot {
   property bool muted: true
   // Sound for an enlarged camera (the bar's "sound" setting); tiles are silent.
   property bool soundDefault: true
+  property string cli: ""
+  property string gridQuality: "low"
+  property string focusQuality: "high"
   readonly property MediaDevices mediaDevices: MediaDevices {}
 
   readonly property int count: cameras.length
@@ -61,6 +64,9 @@ ShellRoot {
         shell.snapshotDir = data.snapshotDir || ""
         shell.multiConsole = data.multiConsole === true
         shell.soundDefault = data.sound !== false
+        shell.cli = data.cli || ""
+        shell.gridQuality = data.gridQuality || "low"
+        shell.focusQuality = data.focusQuality || "high"
         shell.cameras = data.cameras || []
       } catch (error) {
         Qt.quit()
@@ -79,6 +85,9 @@ ShellRoot {
   component Stream: Item {
     id: stream
     property string url: ""
+    property string uid: ""
+    property string quality: ""
+    property int failures: 0
     property string snapshot: ""
     property bool playAudio: false
     readonly property bool live: player.playbackState === MediaPlayer.PlayingState
@@ -88,6 +97,9 @@ ShellRoot {
 
     function start() {
       if (url === "") return
+      // Setting the same URL again would not reconnect: the player resumes
+      // its dead stream, reports it as buffered and freezes. Clear it first.
+      player.source = ""
       player.source = url
       player.play()
     }
@@ -134,13 +146,17 @@ ShellRoot {
       playbackOptions.networkTimeoutMs: 8000
       onErrorOccurred: function(error, errorString) {
         stream.error = errorString || "stream failed"
+        stream.failures++
         retry.restart()
       }
       onMediaStatusChanged: {
-        if (mediaStatus === MediaPlayer.EndOfMedia || mediaStatus === MediaPlayer.InvalidMedia)
+        if (mediaStatus === MediaPlayer.EndOfMedia || mediaStatus === MediaPlayer.InvalidMedia) {
+          stream.failures++
           retry.restart()
-        else if (mediaStatus === MediaPlayer.BufferedMedia)
+        } else if (mediaStatus === MediaPlayer.BufferedMedia) {
           stream.error = ""
+          stream.failures = 0
+        }
       }
     }
 
@@ -149,7 +165,31 @@ ShellRoot {
     Timer {
       id: retry
       interval: 3000
-      onTriggered: { player.stop(); stream.start() }
+      onTriggered: {
+        player.stop()
+        // Twice in a row: the URL itself may be stale (the relay restarted
+        // with a new port and token). Ask the helper for a fresh one rather
+        // than knocking on a port that is no longer ours.
+        if (stream.failures >= 2 && shell.cli !== "" && stream.uid !== "" && !refresh.running) {
+          refresh.command = [shell.cli, "stream", stream.uid, "--quality", stream.quality]
+          refresh.running = true
+        } else {
+          stream.start()
+        }
+      }
+    }
+
+    Process {
+      id: refresh
+      stdout: StdioCollector { id: refreshOut }
+      onExited: function(exitCode) {
+        var fresh = refreshOut.text.trim()
+        stream.failures = 0
+        if (exitCode === 0 && fresh.indexOf("rtsp://127.0.0.1:") === 0 && fresh !== stream.url)
+          stream.url = fresh      // onUrlChanged starts it
+        else
+          stream.start()
+      }
     }
 
     Text {
@@ -217,6 +257,8 @@ ShellRoot {
             anchors.fill: parent
             anchors.margins: tile.border.width
             url: tile.modelData.grid || ""
+            uid: tile.modelData.uid || ""
+            quality: shell.gridQuality
             snapshot: shell.snapshotDir ? "file://" + shell.snapshotDir + "/" + tile.modelData.uid + ".jpg" : ""
           }
 
@@ -268,6 +310,8 @@ ShellRoot {
         Stream {
           anchors.fill: parent
           url: shell.focusedCamera ? shell.focusedCamera.focus || shell.focusedCamera.grid : ""
+          uid: shell.focusedCamera ? shell.focusedCamera.uid : ""
+          quality: shell.focusedCamera && shell.focusedCamera.focus ? shell.focusQuality : shell.gridQuality
           snapshot: shell.focusedCamera && shell.snapshotDir
                     ? "file://" + shell.snapshotDir + "/" + shell.focusedCamera.uid + ".jpg" : ""
           playAudio: true

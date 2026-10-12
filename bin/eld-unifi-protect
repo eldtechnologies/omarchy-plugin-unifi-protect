@@ -79,7 +79,8 @@ class ProtectError(Exception):
 
 def write_atomic(path, data, mode=0o600):
     directory = os.path.dirname(path)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if directory:   # a bare file name is in the current directory
+        os.makedirs(directory, mode=0o700, exist_ok=True)
     # Unique per call, not per process: the wall resolves streams from
     # several threads, and a shared temp name let one thread rename the
     # other's file away.
@@ -89,8 +90,8 @@ def write_atomic(path, data, mode=0o600):
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
     try:
         with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), mode)    # whatever the umask took off
             handle.write(data if isinstance(data, bytes) else data.encode())
-        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -376,9 +377,16 @@ def load_stream_cache():
 # Nothing unencrypted leaves the machine. The relay forces RTSP-over-TCP
 # (interleaved), so media never travels as separate UDP outside the tunnel,
 # and every URL carries a random token so other local users cannot use it.
+#
+# Nor does a loopback URL carry Protect's stream alias, which is all anyone
+# needs to watch a camera: it names a random route id, which only the relay
+# maps back to the alias (relay-routes.json, private). Whatever answers on a
+# relay port that has gone away learns nothing it could use.
 
 RELAY_INFO = os.path.join(RUNTIME_DIR, "relay.json")
-RELAY_LOCK = os.path.join(RUNTIME_DIR, "relay.lock")
+RELAY_LOCK = os.path.join(RUNTIME_DIR, "relay.lock")      # held by the running relay
+RELAY_GUARD = os.path.join(RUNTIME_DIR, "relay-guard.lock")  # vouching vs. idle exit
+RELAY_ROUTES = os.path.join(RUNTIME_DIR, "relay-routes.json")
 RELAY_IDLE_EXIT = 60
 RTSP_MAX_HEADERS = 64
 RTSP_MAX_BODY = 64 * 1024         # a player's request bodies are tiny
@@ -396,47 +404,102 @@ def read_relay_info():
         return {}
 
 
-def relay_lock_holder():
-    """The pid holding the relay lock, or None when no relay is running.
+def relay_lock_held():
+    """True when a relay holds the relay lock.
 
     Only this user can open the lock (the runtime directory is 0700), so its
     holder is this user's relay. Whether something accepts connections on
     the port is no proof: once a relay exits, any local user can bind it.
     """
     try:
-        st = os.stat(RELAY_LOCK)
-        wanted = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
-        with open("/proc/locks") as handle:
-            for line in handle:
-                # "1: FLOCK  ADVISORY  WRITE 1234 00:2a:5678 0 EOF"; lines for
-                # waiting processes have "->" in the second column.
-                parts = line.split()
-                if len(parts) >= 6 and parts[1] == "FLOCK" and parts[5] == wanted:
-                    return int(parts[4])
-    except (OSError, ValueError):
-        pass
-    return None
+        fd = os.open(RELAY_LOCK, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
 
 
 def relay_alive(info):
-    """True when info describes the relay that holds the lock right now."""
-    return bool(info.get("pid") and info.get("port") and info.get("token")
-                and relay_lock_holder() == info["pid"])
+    """True when info describes the relay that is running right now.
+
+    The relay deletes relay.json when it starts and stops, and records its
+    pid with that process's start time, so a stale file cannot pass even if
+    the pid has been reused.
+    """
+    try:
+        return bool(info.get("port") and info.get("token") and relay_lock_held()
+                    and process_start_time(int(info["pid"])) == info.get("started"))
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
 
 
 RELAY_START_LOCK = threading.Lock()
 
 
+class relay_guard:
+    """Serialises vouching for the relay with the relay's own idle exit.
+
+    Held while a helper checks the relay, renews its lease and registers a
+    route, and by the relay while it decides to exit. So a relay that was
+    just vouched for always lives at least RELAY_IDLE_EXIT more seconds.
+    """
+
+    def __enter__(self):
+        os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+        self.fd = os.open(RELAY_GUARD, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+
+
 def ensure_relay():
     """Return the running relay's info, starting the relay if needed."""
-    with RELAY_START_LOCK:
+    with RELAY_START_LOCK, relay_guard():
         return _ensure_relay()
+
+
+def renew_relay_lease():
+    """The relay stays up at least RELAY_IDLE_EXIT seconds after this."""
+    try:
+        os.utime(RELAY_INFO)
+    except OSError:
+        pass
+
+
+def is_relay_process(pid):
+    """True when pid runs this helper's relay command."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as handle:
+            argv = handle.read().split(b"\0")[:-1]
+    except (OSError, ValueError, TypeError):
+        return False
+    return argv[-2:] == [os.path.realpath(__file__).encode(), b"relay"]
 
 
 def _ensure_relay():
     info = read_relay_info()
     if relay_alive(info):
+        renew_relay_lease()
         return info
+    if relay_lock_held() and is_relay_process(info.get("pid")):
+        # A relay from an older version of the plugin: it cannot route the
+        # URLs this one hands out, so it makes way.
+        try:
+            os.kill(int(info["pid"]), signal.SIGTERM)
+            time.sleep(0.2)
+        except OSError:
+            pass
     subprocess.Popen(
         [sys.executable, "-I", os.path.realpath(__file__), "relay"],
         stdin=subprocess.DEVNULL,
@@ -453,11 +516,36 @@ def _ensure_relay():
     raise ProtectError("the stream relay did not start; run `eld-unifi-protect relay` to see why")
 
 
+def load_relay_routes():
+    try:
+        with open(RELAY_ROUTES) as handle:
+            routes = json.load(handle)
+        return routes if isinstance(routes, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def register_relay_route(console_id, path):
+    """A route id for one console stream path; call under relay_guard()."""
+    routes = load_relay_routes()
+    for route, target in routes.items():
+        if target == {"console": console_id, "path": path}:
+            return route
+    route = secrets.token_urlsafe(12)
+    routes[route] = {"console": console_id, "path": path}
+    write_json(RELAY_ROUTES, routes)
+    return route
+
+
 def relay_url(console_id, rtsps_url):
     """The loopback URL a player opens for one of Protect's RTSPS URLs."""
-    info = ensure_relay()
     path = urllib.parse.urlsplit(rtsps_url).path
-    return f"rtsp://127.0.0.1:{info['port']}/{info['token']}/{console_id}{path}"
+    if not re.fullmatch(r"(/[A-Za-z0-9_.~-]+)+", path or ""):
+        raise ProtectError("console sent an unexpected stream URL")
+    with RELAY_START_LOCK, relay_guard():
+        info = _ensure_relay()
+        route = register_relay_route(console_id, path)
+    return f"rtsp://127.0.0.1:{info['port']}/{info['token']}/{console_id}/{route}"
 
 
 def read_exact(reader, count):
@@ -573,17 +661,30 @@ class RelaySession:
         self.local_base = ""
         self.remote_base = ""
         self.authenticated = False
+        self.route_path = ""     # "/<route id>", what the player sees
+        self.alias_path = ""     # "/<Protect alias>", what the console sees
 
     async def reply(self, code, reason, cseq):
         self.client_writer.write(f"RTSP/1.0 {code} {reason}\r\nCSeq: {cseq}\r\n\r\n".encode())
         await self.client_writer.drain()
 
     def route(self, url):
-        """Check the token and find the console a request URL names."""
+        """Check the token and route; return the console the URL names.
+
+        The route id must be one the helper registered for that console,
+        and a session keeps the route it started with.
+        """
         parts = urllib.parse.urlsplit(url).path.split("/")
-        if len(parts) < 3 or not hmac.compare_digest(parts[1], self.relay.token):
+        if len(parts) < 4 or not hmac.compare_digest(parts[1], self.relay.token):
             return None
-        return self.relay.consoles.get(parts[2])
+        console = self.relay.consoles.get(parts[2])
+        target = self.relay.lookup_route(parts[3])
+        if console is None or target is None or target.get("console") != console["id"]:
+            return None
+        if self.route_path and self.route_path != "/" + parts[3]:
+            return None
+        self.route_path, self.alias_path = "/" + parts[3], target["path"]
+        return console
 
     async def connect(self, console):
         name, _ = split_host(console["host"])
@@ -613,10 +714,14 @@ class RelaySession:
             r"rtsps?://(?:" + re.escape(host) + r"|[^/\s;,\"]+)(?::\d+)?(?=/)", re.I)
 
     def to_upstream(self, text):
-        return text.replace(self.local_base, self.remote_base)
+        text = text.replace(self.local_base, self.remote_base)
+        return text.replace(self.remote_base + self.route_path, self.remote_base + self.alias_path)
 
     def to_client(self, text):
-        return self.remote_pattern.sub(self.local_base, text)
+        # The alias stays between the relay and the console: responses name
+        # the route id instead.
+        text = self.remote_pattern.sub(self.local_base, text)
+        return text.replace(self.local_base + self.alias_path, self.local_base + self.route_path)
 
     async def run(self):
         try:
@@ -650,7 +755,7 @@ class RelaySession:
                     return
                 if not self.authenticated:
                     self.authenticated = True
-                    self.relay.pending -= 1
+                    self.relay.pending.remove(self)
                 transport = header_value(headers, "transport")
                 if method == "SETUP" and "/TCP" not in transport.upper():
                     # Refuse UDP: FFmpeg then retries over TCP, which keeps
@@ -670,8 +775,8 @@ class RelaySession:
         except (OSError, asyncio.TimeoutError):
             pass
         finally:
-            if not self.authenticated:
-                self.relay.pending -= 1
+            if self in self.relay.pending:
+                self.relay.pending.remove(self)
             self.close()
 
     async def pump_upstream(self):
@@ -709,21 +814,29 @@ class Relay:
         # A fresh token and port every start: a token seen by anything that
         # squatted an old port is worthless to the new relay.
         self.token = secrets.token_urlsafe(18)
+        self.routes = {}
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(("127.0.0.1", 0))
         self.port = self.server.getsockname()[1]
         self.server.listen(32)
         self.active = 0
-        self.pending = 0
+        self.pending = []        # sessions that have not shown the token yet
         self.last_activity = time.monotonic()
+
+    def lookup_route(self, route):
+        if route not in self.routes:
+            self.routes = load_relay_routes()
+        target = self.routes.get(route)
+        return target if isinstance(target, dict) and isinstance(target.get("path"), str) else None
 
     def serve(self):
         """Run the relay's event loop; blocks until the relay exits."""
         asyncio.run(self._serve())
 
     async def _serve(self):
-        write_json(RELAY_INFO, {"pid": os.getpid(), "port": self.port, "token": self.token})
+        write_json(RELAY_INFO, {"pid": os.getpid(), "started": process_start_time(os.getpid()),
+                                "port": self.port, "token": self.token})
         server = await asyncio.start_server(self.handle, sock=self.server)
         reaper = asyncio.create_task(self.reap_when_idle())
         async with server:
@@ -734,13 +847,15 @@ class Relay:
         sock = writer.get_extra_info("socket")
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        if self.pending >= RELAY_MAX_PENDING:
-            writer.close()
-            return
-        self.pending += 1
+        session = RelaySession(self, reader, writer)
+        if len(self.pending) >= RELAY_MAX_PENDING:
+            # Make room by dropping the oldest: a real player shows its token
+            # within milliseconds, so idle connections can never crowd it out.
+            self.pending.pop(0).client_writer.close()
+        self.pending.append(session)
         self.active += 1
         try:
-            await RelaySession(self, reader, writer).run()
+            await session.run()
         finally:
             self.active -= 1
             self.last_activity = time.monotonic()
@@ -749,12 +864,34 @@ class Relay:
         while True:
             await asyncio.sleep(5)
             if self.active == 0 and time.monotonic() - self.last_activity > RELAY_IDLE_EXIT:
-                # Leave nothing that names a port this relay no longer holds.
-                try:
-                    os.remove(RELAY_INFO)
-                except OSError:
-                    pass
-                os._exit(0)
+                self.exit_if_unwanted()
+
+    def exit_if_unwanted(self):
+        """Exit, unless a helper vouched for this relay within the idle time.
+
+        Decided under the guard lock, which helpers hold while they vouch,
+        so a relay never exits between being vouched for and being used.
+        """
+        fd = os.open(RELAY_GUARD, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return  # a helper is busy with the relay; ask again next time
+        try:
+            if time.time() - os.stat(RELAY_INFO).st_mtime < RELAY_IDLE_EXIT:
+                os.close(fd)
+                return
+        except OSError:
+            pass
+        # Leave nothing that names a port or route this relay no longer
+        # serves; the locks go with the process.
+        for path in (RELAY_INFO, RELAY_ROUTES):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        os._exit(0)
 
 
 def cmd_relay(args):
@@ -765,15 +902,25 @@ def cmd_relay(args):
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
     lock = open(RELAY_LOCK, "a")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return  # another relay is already running
-    # Until this relay writes its own, relay.json names a dead one.
-    try:
-        os.remove(RELAY_INFO)
-    except OSError:
-        pass
+    # A helper checking for a relay holds a shared lock for an instant;
+    # only a relay holds it for long.
+    for _ in range(40):
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if relay_alive(read_relay_info()):
+                return  # another relay is already running
+            time.sleep(0.05)
+    else:
+        return
+    # Until this relay writes its own, relay.json and the routes belong to a
+    # dead one.
+    for path in (RELAY_INFO, RELAY_ROUTES):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     Relay(require_config()).serve()
 
 
@@ -3262,12 +3409,15 @@ def running_wall():
     """
     try:
         with open(WALL_PID) as handle:
-            pid, started = (int(v) for v in handle.read().split())
+            values = [int(v) for v in handle.read().split()]
+        # "pid started"; a bare pid is from before 0.4.2, still checked by
+        # its exact command line.
+        pid, started = values if len(values) == 2 else (values[0], None)
         with open(f"/proc/{pid}/cmdline", "rb") as handle:
             argv = handle.read().split(b"\0")[:-1]
         if (argv[1:] == [b"--no-duplicate", b"--path", WALL_DIR.encode()]
                 and os.path.basename(argv[0]) in (b"quickshell", b"qs")
-                and process_start_time(pid) == started):
+                and started in (None, process_start_time(pid))):
             return pid
     except (OSError, ValueError, IndexError):
         pass
@@ -3312,7 +3462,10 @@ def cmd_wall(args):
     if pid:
         if args.no_toggle:
             return
-        os.kill(pid, signal.SIGTERM)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # closed on its own just now
         return
 
     config = require_config()
@@ -3340,6 +3493,10 @@ def cmd_wall(args):
         "multiConsole": len(config["consoles"]) > 1,
         # Sound for an enlarged camera; grid tiles never play any.
         "sound": args.sound == "on",
+        # For fresh URLs when a stream keeps failing (say, a relay restart).
+        "cli": os.path.realpath(__file__),
+        "gridQuality": args.quality,
+        "focusQuality": args.focus_quality,
     })
     quickshell = shutil.which("quickshell") or shutil.which("qs")
     if not quickshell:

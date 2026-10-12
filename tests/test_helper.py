@@ -147,63 +147,83 @@ class RtspParsing(unittest.TestCase):
 
 class RelayRewriting(unittest.TestCase):
     def session(self):
-        relay = type("R", (), {"port": 4000, "token": "tok", "consoles": {"nvr": {"id": "nvr"}}})()
+        routes = {"R1": {"console": "nvr", "path": "/AbC"}}
+        relay = type("R", (), {"port": 4000, "token": "tok", "consoles": {"nvr": {"id": "nvr"}},
+                               "lookup_route": staticmethod(routes.get)})()
         session = object.__new__(h.RelaySession)
         session.relay = relay
+        session.route_path = session.alias_path = ""
         session.set_bases({"id": "nvr"}, "192.168.1.240")
         return session
 
     def test_requests_go_to_the_console_over_rtsps(self):
         s = self.session()
-        self.assertEqual(s.to_upstream("rtsp://127.0.0.1:4000/tok/nvr/AbC/trackID=0"),
+        s.route("rtsp://127.0.0.1:4000/tok/nvr/R1")
+        self.assertEqual(s.to_upstream("rtsp://127.0.0.1:4000/tok/nvr/R1/trackID=0"),
                          "rtsps://192.168.1.240:7441/AbC/trackID=0")
 
     def test_console_urls_in_responses_point_back_at_the_relay(self):
         s = self.session()
+        s.route("rtsp://127.0.0.1:4000/tok/nvr/R1")
         for url in ("rtsps://192.168.1.240:7441/AbC/", "rtsp://192.168.1.240:7447/AbC/"):
             self.assertEqual(s.to_client(f"Content-Base: {url}"),
-                             "Content-Base: rtsp://127.0.0.1:4000/tok/nvr/AbC/")
+                             "Content-Base: rtsp://127.0.0.1:4000/tok/nvr/R1/")
 
-    def test_route_requires_the_token(self):
+    def test_route_requires_the_token_and_a_registered_route(self):
         s = self.session()
-        self.assertEqual(s.route("rtsp://127.0.0.1:4000/tok/nvr/AbC"), {"id": "nvr"})
-        self.assertIsNone(s.route("rtsp://127.0.0.1:4000/wrong/nvr/AbC"))
-        self.assertIsNone(s.route("rtsp://127.0.0.1:4000/tok/other/AbC"))
-
+        self.assertEqual(s.route("rtsp://127.0.0.1:4000/tok/nvr/R1"), {"id": "nvr"})
+        self.assertIsNone(self.session().route("rtsp://127.0.0.1:4000/wrong/nvr/R1"))
+        self.assertIsNone(self.session().route("rtsp://127.0.0.1:4000/tok/other/R1"))
+        self.assertIsNone(self.session().route("rtsp://127.0.0.1:4000/tok/nvr/AbC"))
+        # A session keeps its route.
+        self.assertIsNone(s.route("rtsp://127.0.0.1:4000/tok/nvr/R2"))
 
 
 class RelayLiveness(unittest.TestCase):
-    """Only the relay holding the lock counts; a listener on the port does not."""
+    """Only the running relay counts; a listener on its old port does not."""
 
     def setUp(self):
         os.makedirs(os.path.dirname(h.RELAY_LOCK), exist_ok=True)
         self.lock = open(h.RELAY_LOCK, "a")
         self.addCleanup(self.lock.close)
 
+    def info(self, **changes):
+        return dict({"pid": os.getpid(), "started": h.process_start_time(os.getpid()),
+                     "port": 1234, "token": "t"}, **changes)
+
     def test_the_lock_holder_is_the_relay(self):
         import fcntl
-        self.assertIsNone(h.relay_lock_holder())
+        self.assertFalse(h.relay_lock_held())
+        self.assertFalse(h.relay_alive(self.info()))
         fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.addCleanup(fcntl.flock, self.lock, fcntl.LOCK_UN)
-        self.assertEqual(h.relay_lock_holder(), os.getpid())
-        info = {"pid": os.getpid(), "port": 1234, "token": "t"}
-        self.assertTrue(h.relay_alive(info))
-        self.assertFalse(h.relay_alive(dict(info, pid=os.getpid() + 1)))
+        self.assertTrue(h.relay_lock_held())
+        self.assertTrue(h.relay_alive(self.info()))
+        # A stale relay.json whose pid was reused by another process.
+        self.assertFalse(h.relay_alive(self.info(started=1)))
+        self.assertFalse(h.relay_alive(self.info(pid=None)))
 
     def test_a_squatter_on_the_old_port_is_not_the_relay(self):
         squatter = socket.socket()
         squatter.bind(("127.0.0.1", 0))
         squatter.listen(1)
         self.addCleanup(squatter.close)
-        info = {"pid": os.getpid(), "port": squatter.getsockname()[1], "token": "t"}
-        self.assertFalse(h.relay_alive(info))
+        self.assertFalse(h.relay_alive(self.info(port=squatter.getsockname()[1])))
+
+    def test_routes_are_stable_and_private(self):
+        with h.relay_guard():
+            first = h.register_relay_route("nvr", "/AbC")
+            self.assertEqual(h.register_relay_route("nvr", "/AbC"), first)
+            self.assertNotEqual(h.register_relay_route("nvr", "/Other"), first)
+        self.assertNotIn("AbC", first)
+        self.assertEqual(stat.S_IMODE(os.stat(h.RELAY_ROUTES).st_mode), 0o600)
 
 
 class WallPid(unittest.TestCase):
     def test_a_stale_pid_never_names_another_process(self):
         os.makedirs(os.path.dirname(h.WALL_PID), exist_ok=True)
         me = os.getpid()
-        for content in (f"{me} {h.process_start_time(me)}", f"{me}", "garbage", ""):
+        for content in (f"{me} {h.process_start_time(me)}", f"{me}", f"{me} 1", "garbage", ""):
             with open(h.WALL_PID, "w") as handle:
                 handle.write(content)
             self.assertIsNone(h.running_wall(), content)
