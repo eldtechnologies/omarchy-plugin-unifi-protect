@@ -5,7 +5,7 @@
   "version": "0.4.0",
   "author": "ELD Technologies",
   "license": "MIT",
-  "description": "See your UniFi Protect cameras from the Omarchy bar: a snapshot grid, live video in the panel, a fullscreen camera wall, and support for several consoles.",
+  "description": "Your UniFi Protect cameras in the Omarchy bar: snapshot grid, live video with sound, a camera wall, alerts, and playback of recorded detections, across several consoles.",
   "kinds": [
     "bar-widget"
   ],
