@@ -2,11 +2,11 @@
 
 Your UniFi Protect cameras in the Omarchy bar: a grid of auto-refreshing
 snapshots, live video with sound right in the panel, a camera wall with every
-camera live at once, and a pop-out player. Works with several consoles at once, such
-as a gateway and a dedicated NVR, and is set up from the panel itself. Arm a
-camera to be alerted when it sees a person, a vehicle or a doorbell ring,
-and play back what each camera recorded. Video travels encrypted, and API
-keys stay out of the shell.
+camera live at once, and a pop-out player. Works with several consoles at
+once, such as a gateway and a dedicated NVR, and is set up from the panel
+itself. Arm a camera to be alerted when it sees a person, a vehicle or a
+doorbell ring, and play back what each camera recorded. Video travels
+encrypted, and API keys stay out of the shell.
 
 In the bar it is a single camera icon. It pulses in your theme's urgent
 colour when an armed camera has seen something, turns that colour when a
@@ -451,8 +451,8 @@ python3 -m unittest discover -s tests -v
 ```
 
 They include end-to-end tests of the stream relay, and of the recordings
-sign-in and clip export, against a fake TLS console. CI runs them, plus a manifest check and `shellcheck`, on every pull
-request. To report a vulnerability, see [SECURITY.md](SECURITY.md).
+sign-in and clip export, against a fake TLS console. CI runs them, plus a
+manifest check and `shellcheck`, on every pull request. To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Disclaimer
 
@@ -465,8 +465,8 @@ use. See [LICENSE](LICENSE) for the full terms. In particular:
   are missed while your computer is asleep, off, or offline.
 - It stores console API keys, and the recordings password if you use
   recordings, on your machine (in your keyring, or in a file readable only by
-  you) and can enable RTSPS streams on your cameras (unless
-  read-only mode is on). You are responsible for deciding whether that is
+  you) and can enable RTSPS streams on your cameras (unless read-only mode
+  is on). You are responsible for deciding whether that is
   acceptable for your network.
 - It uses UniFi Protect's Integration API, which Ubiquiti may change at any
   time. Recordings use the unpublished endpoints of Protect's own web app,

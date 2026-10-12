@@ -5,8 +5,8 @@
 #
 # Needs Hyprland, grim, ImageMagick and the plugin running in the bar. It
 # switches to an empty workspace (the one given, else the first free one from
-# 10 up, so only the wallpaper is behind the plugin), turns demo mode on, captures each view cropped to the plugin, then
-# returns to your workspace and turns demo mode off again. Demo images come
+# 10 up), so only the wallpaper is behind the plugin, turns demo mode on,
+# captures each view cropped to the plugin, then returns to your workspace and turns demo mode off again. Demo images come
 # from docs/demo/; see docs/demo/README.md.
 
 set -euo pipefail
@@ -27,6 +27,10 @@ home_ws=$(hyprctl activeworkspace -j | python3 -c 'import json,sys; print(json.l
 used_ws=$(hyprctl workspaces -j | python3 -c 'import json,sys; print(" ".join(w["name"] for w in json.load(sys.stdin) if w["windows"]))')
 if [[ -n ${1:-} ]]; then
   empty_ws=$1
+  if [[ ! $empty_ws =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "workspace: a number or a plain name" >&2
+    exit 1
+  fi
   if [[ " $used_ws " == *" $empty_ws "* ]]; then
     echo "workspace $empty_ws has windows on it; pick an empty one" >&2
     exit 1
@@ -36,13 +40,14 @@ else
 fi
 
 goto() { hyprctl dispatch "hl.dsp.focus({ workspace = \"$1\" })" >/dev/null; sleep 1; }
-active_ws() { hyprctl activeworkspace -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])'; }
+active_ws() { hyprctl activeworkspace -j | python3 -c 'import json,sys; w=json.load(sys.stdin); print(w["name"], w["monitor"])'; }
 
-# Never capture anything but the empty workspace: if something switched
-# away (a window asking for attention, a click), stop before saving.
+# Never capture anything but the empty workspace, on the monitor grim
+# captures: if something switched away (a window asking for attention, a
+# click), or the workspace lives on another monitor, stop before saving.
 guard() {
-  if [[ $(active_ws) != "$empty_ws" ]]; then
-    echo "aborted: the screen left workspace $empty_ws during capture; nothing was saved" >&2
+  if [[ $(active_ws) != "$empty_ws $output" ]]; then
+    echo "aborted: the screen left workspace $empty_ws on $output during capture; nothing was saved" >&2
     exit 1
   fi
 }
