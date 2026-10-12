@@ -414,10 +414,13 @@ def load_stream_cache():
 # maps back to the alias (relay-routes.json, private). Whatever answers on a
 # relay port that has gone away learns nothing it could use.
 
-RELAY_INFO = os.path.join(RUNTIME_DIR, "relay.json")
-RELAY_LOCK = os.path.join(RUNTIME_DIR, "relay.lock")      # held by the running relay
-RELAY_GUARD = os.path.join(RUNTIME_DIR, "relay-guard.lock")  # vouching vs. idle exit
-RELAY_ROUTES = os.path.join(RUNTIME_DIR, "relay-routes.json")
+# Versioned names: a relay from before route ids (0.4.1 and older) keeps its
+# own files and serves its last players until it idles out, rather than
+# being killed while they still hold URLs with aliases in them.
+RELAY_INFO = os.path.join(RUNTIME_DIR, "relay2.json")
+RELAY_LOCK = os.path.join(RUNTIME_DIR, "relay2.lock")     # held by the running relay
+RELAY_GUARD = os.path.join(RUNTIME_DIR, "relay2-guard.lock")  # vouching vs. idle exit
+RELAY_ROUTES = os.path.join(RUNTIME_DIR, "relay2-routes.json")
 RELAY_IDLE_EXIT = 60
 RTSP_MAX_HEADERS = 64
 RTSP_MAX_BODY = 64 * 1024         # a player's request bodies are tiny
@@ -487,17 +490,19 @@ class relay_guard:
     def __enter__(self):
         os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
         self.fd = os.open(RELAY_GUARD, os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
-        return self
+        # Bounded: a helper stopped inside the guard (Ctrl+Z) must not hang
+        # every other one.
+        for _ in range(200):
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                time.sleep(0.05)
+        os.close(self.fd)
+        raise ProtectError("the stream relay is busy; try again")
 
     def __exit__(self, *exc):
         os.close(self.fd)
-
-
-def ensure_relay():
-    """Return the running relay's info, starting the relay if needed."""
-    with RELAY_START_LOCK, relay_guard():
-        return _ensure_relay()
 
 
 def renew_relay_lease():
@@ -508,29 +513,11 @@ def renew_relay_lease():
         pass
 
 
-def is_relay_process(pid):
-    """True when pid runs this helper's relay command."""
-    try:
-        with open(f"/proc/{int(pid)}/cmdline", "rb") as handle:
-            argv = handle.read().split(b"\0")[:-1]
-    except (OSError, ValueError, TypeError):
-        return False
-    return argv[-2:] == [os.path.realpath(__file__).encode(), b"relay"]
-
-
 def _ensure_relay():
     info = read_relay_info()
     if relay_alive(info):
         renew_relay_lease()
         return info
-    if relay_lock_held() and is_relay_process(info.get("pid")):
-        # A relay from an older version of the plugin: it cannot route the
-        # URLs this one hands out, so it makes way.
-        try:
-            os.kill(int(info["pid"]), signal.SIGTERM)
-            time.sleep(0.2)
-        except OSError:
-            pass
     subprocess.Popen(
         [sys.executable, "-I", os.path.realpath(__file__), "relay"],
         stdin=subprocess.DEVNULL,
@@ -750,13 +737,17 @@ class RelaySession:
 
     def to_upstream(self, text):
         text = text.replace(self.local_base, self.remote_base)
-        return text.replace(self.remote_base + self.route_path, self.remote_base + self.alias_path)
+        return text.replace(self.route_path, self.alias_path) if self.route_path else text
 
     def to_client(self, text):
         # The alias stays between the relay and the console: responses name
-        # the route id instead.
+        # the route id instead, wherever the alias appears (absolute URLs,
+        # path-only control URLs, error bodies). Both are random strings.
         text = self.remote_pattern.sub(self.local_base, text)
-        return text.replace(self.local_base + self.alias_path, self.local_base + self.route_path)
+        if not self.alias_path:
+            return text
+        text = text.replace(self.alias_path, self.route_path)
+        return text.replace(self.alias_path.rsplit("/", 1)[-1], self.route_path.rsplit("/", 1)[-1])
 
     async def run(self):
         try:
@@ -790,7 +781,7 @@ class RelaySession:
                     return
                 if not self.authenticated:
                     self.authenticated = True
-                    self.relay.pending.remove(self)
+                    self.relay.pending.pop(self, None)
                 transport = header_value(headers, "transport")
                 if method == "SETUP" and "/TCP" not in transport.upper():
                     # Refuse UDP: FFmpeg then retries over TCP, which keeps
@@ -810,8 +801,7 @@ class RelaySession:
         except (OSError, asyncio.TimeoutError):
             pass
         finally:
-            if self in self.relay.pending:
-                self.relay.pending.remove(self)
+            self.relay.pending.pop(self, None)
             self.close()
 
     async def pump_upstream(self):
@@ -856,7 +846,7 @@ class Relay:
         self.port = self.server.getsockname()[1]
         self.server.listen(32)
         self.active = 0
-        self.pending = []        # sessions that have not shown the token yet
+        self.pending = {}        # sessions that have not shown the token yet, oldest first
         self.last_activity = time.monotonic()
 
     def lookup_route(self, route):
@@ -886,8 +876,10 @@ class Relay:
         if len(self.pending) >= RELAY_MAX_PENDING:
             # Make room by dropping the oldest: a real player shows its token
             # within milliseconds, so idle connections can never crowd it out.
-            self.pending.pop(0).client_writer.close()
-        self.pending.append(session)
+            oldest = next(iter(self.pending))
+            del self.pending[oldest]
+            oldest.client_writer.close()
+        self.pending[session] = None
         self.active += 1
         try:
             await session.run()

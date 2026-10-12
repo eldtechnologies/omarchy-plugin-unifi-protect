@@ -5,7 +5,9 @@ import json
 import os
 import socket
 import stat
+import time
 import unittest
+from unittest import mock
 
 from helpers import ROOT, helper as h
 
@@ -169,6 +171,13 @@ class RelayRewriting(unittest.TestCase):
             self.assertEqual(s.to_client(f"Content-Base: {url}"),
                              "Content-Base: rtsp://127.0.0.1:4000/tok/nvr/R1/")
 
+    def test_the_alias_never_reaches_the_player_in_any_form(self):
+        s = self.session()
+        s.route("rtsp://127.0.0.1:4000/tok/nvr/R1")
+        for text in ("a=control:/AbC/trackID=0", "Location: /AbC", "no such stream AbC"):
+            self.assertNotIn("AbC", s.to_client(text))
+        self.assertEqual(s.to_client("a=control:/AbC/trackID=0"), "a=control:/R1/trackID=0")
+
     def test_route_requires_the_token_and_a_registered_route(self):
         s = self.session()
         self.assertEqual(s.route("rtsp://127.0.0.1:4000/tok/nvr/R1"), {"id": "nvr"})
@@ -209,6 +218,23 @@ class RelayLiveness(unittest.TestCase):
         squatter.listen(1)
         self.addCleanup(squatter.close)
         self.assertFalse(h.relay_alive(self.info(port=squatter.getsockname()[1])))
+
+    def test_the_relay_stays_while_its_lease_is_fresh(self):
+        relay = object.__new__(h.Relay)
+        h.write_json(h.RELAY_INFO, {"pid": 1})
+        h.write_json(h.RELAY_ROUTES, {})
+        with mock.patch.object(h.os, "_exit", side_effect=SystemExit):
+            relay.exit_if_unwanted()                       # vouched for just now: stays
+            self.assertTrue(os.path.exists(h.RELAY_INFO))
+            old = time.time() - h.RELAY_IDLE_EXIT - 5
+            os.utime(h.RELAY_INFO, (old, old))
+            with h.relay_guard():                          # a helper is vouching: stays
+                relay.exit_if_unwanted()
+            self.assertTrue(os.path.exists(h.RELAY_INFO))
+            with self.assertRaises(SystemExit):            # idle and unclaimed: goes
+                relay.exit_if_unwanted()
+        self.assertFalse(os.path.exists(h.RELAY_INFO))
+        self.assertFalse(os.path.exists(h.RELAY_ROUTES))
 
     def test_routes_are_stable_and_private(self):
         with h.relay_guard():
