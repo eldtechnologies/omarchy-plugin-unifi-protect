@@ -805,7 +805,7 @@ async def ws_open(console, path, timeout=10):
         writer.close()
         if len(status) > 1 and status[1] in ("401", "403"):
             raise ProtectError("console rejected the API key for events")
-        raise ProtectError(f"event stream refused: {lines[0]}")
+        raise ProtectError(f"event stream refused: {clean_text(lines[0], '', 120)}")
     expected = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
     accept = next((l.split(":", 1)[1].strip() for l in lines[1:]
                    if l.lower().startswith("sec-websocket-accept:")), "")
@@ -1656,7 +1656,7 @@ class Protect:
         if status == 429:
             raise ProtectError("console is rate limiting requests; try again in a moment")
         if status >= 400:
-            detail = data[:200].decode(errors="replace").strip()
+            detail = clean_text(data[:200].decode(errors="replace"), "", 200)
             raise ProtectError(f"HTTP {status} from console: {detail}")
         if raw:
             return data
@@ -2059,7 +2059,7 @@ class ProtectSession:
                 continue
             if response.status == 200:
                 return conn, response
-            detail = response.read(200).decode(errors="replace").strip()
+            detail = clean_text(response.read(200).decode(errors="replace"), "", 200)
             conn.close()
             if response.status in (401, 403):
                 raise ProtectError("this account may not view recordings; give it a Protect role "
@@ -3337,7 +3337,9 @@ def main():
         check_runtime_dir()
         args.func(args)
     except ProtectError as error:
-        print(f"eld-unifi-protect: {error}", file=sys.stderr)
+        # Messages can quote the console; never let it reach the terminal raw
+        # (escape sequences can retitle it or write to the clipboard).
+        print(f"eld-unifi-protect: {clean_text(str(error), 'error', 1000)}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
