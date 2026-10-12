@@ -522,6 +522,8 @@ Panel {
       try {
         var result = JSON.parse(recordingsOut.text)
         root.recordingsNeedLogin = result.needsLogin === true
+        // Asked again because the console turned the saved login down.
+        if (result.loginError) root.loginError = result.loginError
         root.recordingsConsole = result.console || ""
         root.recordingsConsoleName = result.consoleName || ""
         root.recordings = result.events || []

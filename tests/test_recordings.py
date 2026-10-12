@@ -158,11 +158,25 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         h.recordings_for(self.config, f"nvr_{CAMERA}")
         self.assertEqual(FakeConsole.logins, 2)
 
-    def test_wrong_password_is_tried_once(self):
+    def test_wrong_password_is_tried_once_and_asks_again(self):
         FakeConsole.password = "changed"
-        with self.assertRaisesRegex(h.ProtectError, "rejected the username or password"):
-            h.recordings_for(self.config, f"nvr_{CAMERA}")
+        result = h.recordings_for(self.config, f"nvr_{CAMERA}")
+        self.assertTrue(result["needsLogin"])
+        self.assertIn("rejected the username or password", result["loginError"])
+        # Other helper processes don't try again either, for a while.
+        h.recordings_for(self.config, f"nvr_{CAMERA}")
+        with self.assertRaises(h.LoginRejected):
+            h.fetch_clip(self.config, f"nvr_{CAMERA}", time.time() - 60, time.time() - 50, "low")
         self.assertEqual(FakeConsole.logins, 1)
+        # Signing in again (the `login` command) clears it.
+        FakeConsole.password = "right"
+        h.save_config(self.config)
+        with mock.patch.object(h.sys, "stdin", io.StringIO("viewer\nright\n")), \
+                mock.patch.object(h, "poll_cameras"), mock.patch.object(h, "store_login", return_value="file"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_login(argparse.Namespace(console="nvr", stdin=True, json=True))
+        self.assertEqual(len(h.recordings_for(self.config, f"nvr_{CAMERA}")["events"]), 2)
+        os.remove(h.CONFIG_PATH)
 
     def test_a_failed_sign_in_is_never_retried_by_other_requests(self):
         FakeConsole.password = "changed"

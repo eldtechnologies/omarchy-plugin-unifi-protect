@@ -303,6 +303,7 @@ class ListenerEndToEnd(unittest.TestCase):
             listener.alerts = []
             listener.config = {"consoles": [dict(console_config, host=f"127.0.0.1:{port}")]}
             listener.refresh = lambda: None
+            listener.on_new_alert = lambda *args: None   # no snapshot or notification here
             listener.armed = {"nvr": {"cam1": {"uid": "nvr_cam1", "name": "Front Door",
                                                 "consoleName": "NVR", "alerts": ["vehicle"]}}}
             task = asyncio.create_task(listener.watch_console("nvr"))

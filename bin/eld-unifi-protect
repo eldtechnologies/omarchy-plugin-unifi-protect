@@ -74,6 +74,10 @@ class ProtectError(Exception):
     pass
 
 
+class LoginRejected(ProtectError):
+    """The console turned the recordings login down; it needs re-entering."""
+
+
 # ---- files ---------------------------------------------------------------
 
 
@@ -2093,6 +2097,7 @@ LOGIN_SERVICE = KEYRING_SERVICE + "-login"
 PRIVATE_API = "/proxy/protect/api"
 SESSIONS_PATH = os.path.join(RUNTIME_DIR, "sessions.json")
 SESSIONS_LOCK = threading.Lock()
+LOGIN_RETRY_AFTER = 600   # seconds before helpers try a rejected login again
 RECORDINGS_DIR = os.path.join(RUNTIME_DIR, "recordings")
 CLIPS_DIR = os.path.join(RUNTIME_DIR, "clips")
 CLIP_PAD = 3                # seconds of context either side of an event
@@ -2146,7 +2151,18 @@ def store_login(console, user, password):
         return "file"
 
 
+def end_session(console):
+    """Sign the saved session out on the console (best effort), then forget it."""
+    if has_login(console):
+        try:
+            ProtectSession(console).logout()
+        except ProtectError:
+            pass
+    forget_session(console["id"])
+
+
 def clear_login(console):
+    end_session(console)
     if console.get("loginStore") == "keyring":
         _key_cache.pop((LOGIN_SERVICE, console["id"]), None)
         try:
@@ -2271,12 +2287,27 @@ class ProtectSession:
         self.name, self.port = split_host(self.host)
         self.pin = console.get("certSha256")
         self.timeout = float((config or {}).get("timeoutSec", 8))
-        self.session = load_sessions().get(console["id"])
+        saved = load_sessions().get(console["id"])
         # Thumbnails are fetched four at a time through one session.
         self.lock = threading.Lock()
-        # Once a sign-in fails, every later call fails with it: UniFi OS
-        # locks accounts out after a burst of failures.
-        self.login_error = None
+        # Once a sign-in fails, every later call fails with it, in this
+        # process and, for LOGIN_RETRY_AFTER, in every other: UniFi OS
+        # locks accounts out after a burst of failures. `login` clears it.
+        self.login_error, self.login_rejected, self.session = None, False, None
+        if isinstance(saved, dict) and isinstance(saved.get("failed"), (int, float)):
+            if time.time() - saved["failed"] < LOGIN_RETRY_AFTER:
+                self.login_error = str(saved.get("error") or "sign-in failed")
+                self.login_rejected = bool(saved.get("rejected"))
+        elif isinstance(saved, dict) and saved.get("token"):
+            self.session = saved
+
+    def fail_login(self, message, rejected):
+        """Remember a failed sign-in for every helper process, then raise."""
+        with SESSIONS_LOCK:
+            sessions = load_sessions()
+            sessions[self.console["id"]] = {"failed": time.time(), "error": message, "rejected": rejected}
+            write_json(SESSIONS_PATH, sessions)
+        raise (LoginRejected if rejected else ProtectError)(message)
 
     def _send(self, method, path, body=None, params=None, headers=None, timeout=None):
         url = path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
@@ -2310,12 +2341,13 @@ class ProtectSession:
         finally:
             conn.close()
         if response.status == 429:
-            raise ProtectError("the console is limiting sign-ins after failed attempts; wait a few minutes")
+            self.fail_login("the console is limiting sign-ins after failed attempts; wait a few minutes",
+                            rejected=False)
         if response.status in (401, 403):
             if b"MFA" in data or b"2fa" in data.lower():
-                raise ProtectError("this account signs in with two-factor authentication; "
-                                   "use a local account (Restrict to local access only)")
-            raise ProtectError("the console rejected the username or password")
+                self.fail_login("this account signs in with two-factor authentication; "
+                                "use a local account (Restrict to local access only)", rejected=True)
+            self.fail_login("the console rejected the username or password", rejected=True)
         if response.status != 200:
             raise ProtectError(f"sign-in failed: HTTP {response.status}")
         token = next((c.split(";", 1)[0].split("=", 1)[1] for c in cookies
@@ -2333,7 +2365,7 @@ class ProtectSession:
     def logout(self):
         """End the saved session on the console too; best effort."""
         session = self.session
-        if not session:
+        if not session or not session.get("token"):
             return
         headers = {"Cookie": f"TOKEN={session['token']}"}
         if session.get("csrf"):
@@ -2354,12 +2386,13 @@ class ProtectSession:
         for attempt in range(2):
             with self.lock:
                 if self.login_error:
-                    raise ProtectError(self.login_error)
+                    raise (LoginRejected if self.login_rejected else ProtectError)(self.login_error)
                 if not self.session or self.session.get("expires", 0) < time.time() + 60:
                     try:
                         self.login()
                     except ProtectError as error:
                         self.login_error = str(error)
+                        self.login_rejected = isinstance(error, LoginRejected)
                         raise
                 session = self.session
             headers = {"Cookie": f"TOKEN={session['token']}", "Accept": "*/*"}
@@ -2523,7 +2556,11 @@ def recordings_for(config, uid, hours=24, motion=False):
         return dict(result, needsLogin=True, events=[])
     session = ProtectSession(client_console, config)
     now = time.time()
-    events = session.events(camera_id, now - hours * 3600, now, motion=motion)
+    try:
+        events = session.events(camera_id, now - hours * 3600, now, motion=motion)
+    except LoginRejected as error:
+        # The password changed, say: ask for it again rather than retry.
+        return dict(result, needsLogin=True, loginError=str(error), events=[])
     folder = os.path.join(RECORDINGS_DIR, uid)
     os.makedirs(folder, mode=0o700, exist_ok=True)
 
@@ -3057,9 +3094,11 @@ def cmd_login(args):
     if not user or not password:
         raise ProtectError("enter the username and the password")
     previous = {k: console[k] for k in ("loginUser", "loginStore", "loginPassword") if k in console}
+    # The account signed in so far is signed out on the console first; this
+    # also clears any remembered failed sign-in.
+    end_session(console)
     console.pop("loginStore", None)
     console.update(loginUser=user, loginPassword=password)
-    forget_session(console["id"])
     try:
         # Prove it before saving: sign in and list one event.
         now = time.time()
@@ -3095,11 +3134,7 @@ def cmd_logout(args):
     if not console.get("loginUser"):
         print(f"No recordings login stored for {console['name']}.")
         return
-    try:
-        ProtectSession(console, config).logout()
-    except ProtectError:
-        pass
-    clear_login(console)
+    clear_login(console)        # also signs the session out on the console
     save_config(config)
     forget_recordings(console["id"])
     poll_cameras(config)
