@@ -13,7 +13,7 @@ colour when an armed camera has seen something, turns that colour when a
 camera is offline, and gets a small dot when a console could not be reached
 on the last poll.
 
-Version 0.3.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
+Version 0.4.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
 
 ![The camera wall: six cameras live, maximized, with the Omarchy bar above](docs/screenshots/wall.jpg)
 
