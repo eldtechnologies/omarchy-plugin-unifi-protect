@@ -18,16 +18,17 @@ omarchy-shell shell rescanPlugins 2>/dev/null || true
 
 purge=${1:-}
 if [[ $purge != "--purge" && $purge != "--keep-config" && -t 0 ]]; then
-  read -rp "Delete the stored API key and state too? [y/N] " answer
+  read -rp "Delete the stored API keys, recordings logins and state too? [y/N] " answer
   [[ $answer == [yY]* ]] && purge="--purge"
 fi
 if [[ $purge == "--purge" ]]; then
   rm -rf "$config_dir" "$state_dir"
-  # API keys stored in the desktop keyring.
+  # API keys and recordings logins stored in the desktop keyring.
   if command -v secret-tool >/dev/null; then
     secret-tool clear service eld-unifi-protect 2>/dev/null || true
+    secret-tool clear service eld-unifi-protect-login 2>/dev/null || true
   fi
-  echo "Removed. Revoke the API key on the console too: deleting the local copy does not revoke it."
+  echo "Removed. Revoke the API key on the console too, and delete any local recordings account: deleting the local copy does not revoke them."
 else
   echo "Removed. Your config is still in $config_dir"
 fi
