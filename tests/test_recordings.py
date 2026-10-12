@@ -55,6 +55,9 @@ class FakeConsole(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         FakeConsole.log.append(("POST", self.path))
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/api/auth/logout":
+            FakeConsole.valid.discard((self.headers.get("Cookie") or "").removeprefix("TOKEN="))
+            return self.reply(200, b"{}")
         if self.path != "/api/auth/login":
             return self.reply(404)
         FakeConsole.logins += 1
@@ -160,6 +163,25 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         with self.assertRaisesRegex(h.ProtectError, "rejected the username or password"):
             h.recordings_for(self.config, f"nvr_{CAMERA}")
         self.assertEqual(FakeConsole.logins, 1)
+
+    def test_a_failed_sign_in_is_never_retried_by_other_requests(self):
+        FakeConsole.password = "changed"
+        session = h.ProtectSession(self.console, self.config)
+        for _ in range(3):
+            with self.assertRaises(h.ProtectError):
+                session.thumbnail("ev1")
+        self.assertEqual(FakeConsole.logins, 1)
+
+    def test_logout_ends_the_session_on_the_console(self):
+        h.recordings_for(self.config, f"nvr_{CAMERA}")
+        self.assertEqual(len(FakeConsole.valid), 1)
+        h.save_config(self.config)
+        with mock.patch.object(h, "poll_cameras"):
+            h.cmd_logout(argparse.Namespace(console="nvr"))
+        self.assertIn(("POST", "/api/auth/logout"), FakeConsole.log)
+        self.assertEqual(FakeConsole.valid, set())
+        self.assertNotIn("nvr", h.load_sessions())
+        os.remove(h.CONFIG_PATH)
 
     def test_no_login_asks_for_one(self):
         del self.console["loginUser"]

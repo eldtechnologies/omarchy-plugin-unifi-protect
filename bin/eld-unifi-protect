@@ -2084,6 +2084,9 @@ class ProtectSession:
         self.session = load_sessions().get(console["id"])
         # Thumbnails are fetched four at a time through one session.
         self.lock = threading.Lock()
+        # Once a sign-in fails, every later call fails with it: UniFi OS
+        # locks accounts out after a burst of failures.
+        self.login_error = None
 
     def _send(self, method, path, body=None, params=None, headers=None, timeout=None):
         url = path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
@@ -2136,6 +2139,20 @@ class ProtectSession:
             sessions[self.console["id"]] = self.session
             write_json(SESSIONS_PATH, sessions)
 
+    def logout(self):
+        """End the saved session on the console too; best effort."""
+        session = self.session
+        if not session:
+            return
+        headers = {"Cookie": f"TOKEN={session['token']}"}
+        if session.get("csrf"):
+            headers["X-CSRF-Token"] = session["csrf"]
+        try:
+            conn, response = self._send("POST", "/api/auth/logout", body={}, headers=headers)
+            conn.close()
+        except ProtectError:
+            pass
+
     def open(self, path, params=None, timeout=None):
         """GET a recordings endpoint; returns (conn, response) with status 200.
 
@@ -2145,8 +2162,14 @@ class ProtectSession:
         """
         for attempt in range(2):
             with self.lock:
+                if self.login_error:
+                    raise ProtectError(self.login_error)
                 if not self.session or self.session.get("expires", 0) < time.time() + 60:
-                    self.login()
+                    try:
+                        self.login()
+                    except ProtectError as error:
+                        self.login_error = str(error)
+                        raise
                 session = self.session
             headers = {"Cookie": f"TOKEN={session['token']}", "Accept": "*/*"}
             if session.get("csrf"):
@@ -2247,6 +2270,9 @@ class DemoSession:
 
     def __init__(self, console):
         self.console = console
+
+    def logout(self):
+        pass
 
     def events(self, camera_id, since, until, motion=False, limit=100):
         slug = next((s for _, s, _, _ in DEMO_CAMERAS if demo_camera_id(s) == camera_id), "")
@@ -2868,6 +2894,10 @@ def cmd_logout(args):
     if not console.get("loginUser"):
         print(f"No recordings login stored for {console['name']}.")
         return
+    try:
+        ProtectSession(console, config).logout()
+    except ProtectError:
+        pass
     clear_login(console)
     save_config(config)
     forget_recordings(console["id"])
