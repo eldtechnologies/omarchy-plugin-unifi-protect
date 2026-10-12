@@ -1968,15 +1968,10 @@ def cmd_stream(args):
     print(client.stream_url(camera_id, args.quality))
 
 
-def cmd_live(args):
-    client, camera_id = resolve_camera(require_config(), args.camera)
-    url = client.stream_url(camera_id, args.quality)
-    title = args.title or "UniFi Protect"
-    player = shutil.which("mpv")
-    if not player:
-        raise ProtectError("mpv is not installed: omarchy pkg add mpv")
+def mpv_command(player, title, sound=True):
+    """The mpv command line for one camera; the URL itself comes on stdin."""
     input_conf = os.path.join(PLUGIN_DIR, "mpv", "input.conf")
-    command = [
+    return [
         player,
         "--no-terminal",
         # Scroll to zoom, Ctrl+arrows to pan, Ctrl+0 to reset; mpv's own
@@ -1994,7 +1989,8 @@ def cmd_live(args):
         # mpv decodes on the CPU unless told otherwise; a 4K stream costs
         # roughly a third of a core that way, against a few percent on the GPU.
         "--hwdec=auto-safe",
-        "--mute=yes",
+        # One camera on its own: sound on unless asked otherwise (m toggles).
+        f"--mute={'no' if sound else 'yes'}",
         "--keep-open=no",
         "--x11-name=eld-unifi-protect",
         "--wayland-app-id=eld-unifi-protect",
@@ -2003,6 +1999,15 @@ def cmd_live(args):
         # a one-line playlist on stdin instead.
         "--playlist=-",
     ]
+
+
+def cmd_live(args):
+    client, camera_id = resolve_camera(require_config(), args.camera)
+    url = client.stream_url(camera_id, args.quality)
+    player = shutil.which("mpv")
+    if not player:
+        raise ProtectError("mpv is not installed: omarchy pkg add mpv")
+    command = mpv_command(player, args.title or "UniFi Protect", args.sound == "on")
     read_fd, write_fd = os.pipe()
     os.write(write_fd, (url + "\n").encode())
     os.close(write_fd)
@@ -2211,6 +2216,8 @@ def cmd_wall(args):
         "cameras": tiles,
         "snapshotDir": SNAP_DIR,
         "multiConsole": len(config["consoles"]) > 1,
+        # Sound for an enlarged camera; grid tiles never play any.
+        "sound": args.sound == "on",
     })
     quickshell = shutil.which("quickshell") or shutil.which("qs")
     if not quickshell:
@@ -2312,6 +2319,7 @@ def main():
     p.add_argument("camera")
     p.add_argument("--quality", choices=QUALITIES, default="high")
     p.add_argument("--title")
+    p.add_argument("--sound", choices=("on", "off"), default="on", help="start with sound (default on)")
     p.set_defaults(func=cmd_live)
     p = sub.add_parser("hide", help="hide cameras from the panel and wall")
     p.add_argument("cameras", nargs="+", help="camera name, id or MAC")
@@ -2353,6 +2361,8 @@ def main():
     p.add_argument("--mode", choices=("window", "overlay"), default="window",
                    help="window: maximized, keeps workspaces and the bar (default); "
                         "overlay: covers everything")
+    p.add_argument("--sound", choices=("on", "off"), default="on",
+                   help="sound for an enlarged camera (default on); tiles are always silent")
     p.set_defaults(func=cmd_wall)
     p = sub.add_parser("open", help="open Protect in the browser")
     p.add_argument("console", nargs="?")

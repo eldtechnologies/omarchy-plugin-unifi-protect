@@ -97,6 +97,10 @@ class Files(unittest.TestCase):
         leftovers = [n for n in os.listdir(os.path.dirname(path)) if ".tmp." in n]
         self.assertEqual(leftovers, [])
 
+    def test_popout_sound_follows_the_flag(self):
+        self.assertIn("--mute=no", h.mpv_command("mpv", "Door"))
+        self.assertIn("--mute=yes", h.mpv_command("mpv", "Door", sound=False))
+
     def test_version_comes_from_the_manifest(self):
         with open(ROOT / "manifest.json") as handle:
             manifest = json.load(handle)

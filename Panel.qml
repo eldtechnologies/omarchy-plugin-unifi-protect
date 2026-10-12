@@ -69,6 +69,8 @@ Panel {
   readonly property int columns: Math.max(1, Math.min(4, setting("columns", 2)))
   readonly property string liveQuality: validQuality(setting("liveQuality", "medium"), "medium")
   readonly property string popoutQuality: validQuality(setting("popoutQuality", "high"), "high")
+  // Sound whenever a single camera is shown; the grid itself is always silent.
+  readonly property bool soundDefault: setting("sound", true) !== false
 
   property var state: ({})
   property var snapIndex: ({})
@@ -211,6 +213,9 @@ Panel {
 
   function openLive(camera) {
     if (!camera) return
+    // Coming from the grid starts at the default; M carries over while
+    // flipping between cameras.
+    if (!root.liveMode) root.muted = !root.soundDefault
     root.alertsView = false
     root.liveError = ""
     root.liveCamera = camera
@@ -258,8 +263,12 @@ Panel {
 
   function popOut(camera) {
     if (!camera) return
+    // From the live view the pop-out keeps its sound state; from the grid it
+    // starts at the default.
+    var sound = root.liveMode ? !root.muted : root.soundDefault
     Quickshell.execDetached([root.cli, "live", camera.uid,
-                             "--quality", root.popoutQuality, "--title", camera.name])
+                             "--quality", root.popoutQuality, "--title", camera.name,
+                             "--sound", sound ? "on" : "off"])
     root.closeLive()
     root.close()
   }
@@ -314,7 +323,8 @@ Panel {
   readonly property string wallMode: setting("wallMode", "window") === "overlay" ? "overlay" : "window"
 
   function openWall() {
-    Quickshell.execDetached([root.cli, "wall", "--mode", root.wallMode])
+    Quickshell.execDetached([root.cli, "wall", "--mode", root.wallMode,
+                             "--sound", root.soundDefault ? "on" : "off"])
     root.close()
   }
 
