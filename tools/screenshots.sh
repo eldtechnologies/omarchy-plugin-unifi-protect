@@ -1,11 +1,11 @@
 #!/bin/bash
 # Capture the README screenshots from the real UI, on demo data.
 #
-#   tools/screenshots.sh
+#   tools/screenshots.sh [workspace]
 #
 # Needs Hyprland, grim, ImageMagick and the plugin running in the bar. It
-# switches to an empty workspace (so only the wallpaper is behind the
-# plugin), turns demo mode on, captures each view cropped to the plugin, then
+# switches to an empty workspace (the one given, else the first free one from
+# 10 up, so only the wallpaper is behind the plugin), turns demo mode on, captures each view cropped to the plugin, then
 # returns to your workspace and turns demo mode off again. Demo images come
 # from docs/demo/; see docs/demo/README.md.
 
@@ -24,7 +24,16 @@ monitor=$(hyprctl monitors -j | python3 -c 'import json,sys; m=[m for m in json.
 read -r output scale bar_top <<<"$monitor"
 bar_px=$(python3 -c "print(int(($bar_top) * $scale) + 2)")
 home_ws=$(hyprctl activeworkspace -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
-empty_ws=$(hyprctl workspaces -j | python3 -c 'import json,sys; used={w["name"] for w in json.load(sys.stdin) if w["windows"]}; print(next(str(n) for n in range(10, 30) if str(n) not in used))')
+used_ws=$(hyprctl workspaces -j | python3 -c 'import json,sys; print(" ".join(w["name"] for w in json.load(sys.stdin) if w["windows"]))')
+if [[ -n ${1:-} ]]; then
+  empty_ws=$1
+  if [[ " $used_ws " == *" $empty_ws "* ]]; then
+    echo "workspace $empty_ws has windows on it; pick an empty one" >&2
+    exit 1
+  fi
+else
+  empty_ws=$(python3 -c 'import sys; used=set(sys.argv[1].split()); print(next(str(n) for n in range(10, 30) if str(n) not in used))' "$used_ws")
+fi
 
 goto() { hyprctl dispatch "hl.dsp.focus({ workspace = \"$1\" })" >/dev/null; sleep 1; }
 active_ws() { hyprctl activeworkspace -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])'; }
@@ -38,13 +47,17 @@ guard() {
   fi
 }
 shot() { guard; grim -o "$output" "$1"; guard; }
-seen_alerts() { printf '{"ackedAt": %s}\n' "$(python3 -c "import time; print(time.time() - $1)")" >"$runtime/alerts-ack.json"; }
+# Which alerts count as seen is yours: kept aside, put back at the end.
+ack="$runtime/alerts-ack.json"
+[[ -f $ack ]] && cp -p "$ack" "$work/alerts-ack.json"
+seen_alerts() { printf '{"ackedAt": %s}\n' "$(python3 -c "import time; print(time.time() - $1)")" >"$ack"; }
 
 cleanup() {
   "${ipc[@]}" close >/dev/null 2>&1 || true
   "$cli" wall --no-toggle >/dev/null 2>&1 && "$cli" wall >/dev/null 2>&1 || true
   goto "$home_ws"
   "$cli" demo off >/dev/null
+  if [[ -f $work/alerts-ack.json ]]; then cp -p "$work/alerts-ack.json" "$ack"; else rm -f "$ack"; fi
 }
 trap 'cleanup; rm -rf "$work"' EXIT
 

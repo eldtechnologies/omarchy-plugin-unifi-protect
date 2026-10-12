@@ -1,8 +1,8 @@
 # UniFi Protect for Omarchy
 
 Your UniFi Protect cameras in the Omarchy bar: a grid of auto-refreshing
-snapshots, live video right in the panel, a camera wall with every camera
-live at once, and a pop-out player. Works with several consoles at once, such
+snapshots, live video with sound right in the panel, a camera wall with every
+camera live at once, and a pop-out player. Works with several consoles at once, such
 as a gateway and a dedicated NVR, and is set up from the panel itself. Arm a
 camera to be alerted when it sees a person, a vehicle or a doorbell ring,
 and play back what each camera recorded. Video travels encrypted, and API
@@ -28,7 +28,9 @@ Version 0.3.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologie
 |---|---|
 | ![The panel: a grid of six camera snapshots, an alert badge on Front Door, and armed cameras marked with a bell](docs/screenshots/panel-grid.jpg) | ![The alert log: what was seen, where, when and for how long, each with a snapshot](docs/screenshots/panel-alerts.png) |
 
-![Live view of the Front Door camera in the panel](docs/screenshots/panel-live.jpg)
+| Live view | Recordings |
+|---|---|
+| ![Live view of the Front Door camera in the panel](docs/screenshots/panel-live.jpg) | ![Recordings of the Front Door camera: a doorbell ring playing back with a REC badge and a seek bar, above a list of detections with thumbnails](docs/screenshots/panel-recordings.jpg) |
 
 *The camera pictures in these screenshots are AI-generated for demo purposes; they show no real place or person. The screenshots themselves are of the real plugin, running in [demo mode](#developing).*
 
@@ -41,7 +43,10 @@ Version 0.3.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologie
 - `secret-tool` from `libsecret` and a keyring such as `gnome-keyring` (both
   ship with Omarchy) to keep API keys in the keyring; optional, see below
 - `qt6-multimedia-ffmpeg` for live video (ships with Omarchy)
-- `mpv`, optional, for the pop-out player: `omarchy pkg add mpv`
+- `mpv`, optional, for the pop-out player and recorded clips in their own
+  window: `omarchy pkg add mpv`
+- For [recordings](#recordings), optional: a local UniFi account on each
+  console that records
 - `notify-send` from `libnotify` for alert notifications (ships with Omarchy)
 
 ## Install
@@ -131,7 +136,9 @@ eld-unifi-protect remove nvr
 ### Sound
 
 Sound plays whenever exactly one camera is on screen: the panel's live view,
-an enlarged camera on the wall, and the pop-out player. The grid and the
+a recording playing back, an enlarged camera on the wall, and the pop-out
+player. It goes to your system's default output and follows it, so
+headphones connected after login are picked up. The grid and the
 wall's tiles are always silent (they don't even decode audio). `M` mutes;
 the choice carries over while you flip between cameras, and opening a camera
 from the grid again starts with sound. Set `sound` to `false` to start
@@ -315,11 +322,11 @@ The plugin's own files:
 
 | Path | Contents |
 |------|----------|
-| Desktop keyring (Secret Service) | API keys, when a keyring is available |
-| `~/.config/eld-unifi-protect/config.json` | Consoles and pinned certificates; API keys only if there is no keyring (mode 0600) |
+| Desktop keyring (Secret Service) | API keys and recordings passwords, when a keyring is available |
+| `~/.config/eld-unifi-protect/config.json` | Consoles, pinned certificates and recordings usernames; API keys and passwords only if there is no keyring (mode 0600) |
 | `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras, favourite, armed cameras, read-only setting (no secrets) |
 | `~/.local/state/eld-unifi-protect/state.json` | Last camera list |
-| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their notification pictures (tmpfs, gone on reboot) |
+| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their notification pictures, recordings sessions, thumbnails and clips (tmpfs, gone on reboot) |
 
 ## How it works
 
@@ -402,18 +409,21 @@ If you installed with `omarchy plugin add`:
 omarchy plugin remove com.eldtechnologies.unifi-protect
 rm -rf ~/.config/eld-unifi-protect ~/.local/state/eld-unifi-protect
 secret-tool clear service eld-unifi-protect
+secret-tool clear service eld-unifi-protect-login
 ```
 
-`omarchy plugin remove` deletes only the plugin folder, so the last two lines
-are needed to delete your settings and API keys (the last one clears keys
-held in the keyring).
+`omarchy plugin remove` deletes only the plugin folder, so the last three
+lines are needed to delete your settings, API keys and recordings passwords
+(the `secret-tool` lines clear what is held in the keyring).
 
 If you installed with `./install.sh`, run `./uninstall.sh` from the checkout.
 It also removes the `eld-unifi-protect` command and asks whether to delete your
-API keys (`--purge` says yes, `--keep-config` says no).
+API keys and recordings passwords (`--purge` says yes, `--keep-config` says
+no).
 
-Either way, revoke the API keys on each console as well: deleting the local
-copy does not revoke them.
+Either way, revoke the API keys on each console as well, and delete the local
+recordings account if you made one: deleting the local copy does not revoke
+them.
 
 ## Developing
 
@@ -429,9 +439,9 @@ it from there. Record changes in `CHANGELOG.md`.
 **Demo mode** shows made-up consoles and cameras instead of yours, for
 screenshots, development, or trying the plugin without UniFi hardware:
 `eld-unifi-protect demo on` (and `demo off`). Your real config is never
-touched, and a reboot always ends it. `tools/screenshots.sh` captures the
-README screenshots from the real UI on demo data; see
-[docs/demo](docs/demo/README.md).
+touched, and a reboot always ends it. `tools/screenshots.sh [workspace]`
+captures the README screenshots from the real UI on demo data, on an empty
+workspace; see [docs/demo](docs/demo/README.md).
 
 Run the tests (standard library only; they never touch your real config,
 keys or consoles):
@@ -440,8 +450,8 @@ keys or consoles):
 python3 -m unittest discover -s tests -v
 ```
 
-They include an end-to-end test of the stream relay against a fake TLS
-console. CI runs them, plus a manifest check and `shellcheck`, on every pull
+They include end-to-end tests of the stream relay, and of the recordings
+sign-in and clip export, against a fake TLS console. CI runs them, plus a manifest check and `shellcheck`, on every pull
 request. To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Disclaimer
@@ -453,12 +463,14 @@ use. See [LICENSE](LICENSE) for the full terms. In particular:
 - It is not a security or monitoring system. Do not rely on it to record,
   detect, or alert on anything; use UniFi Protect itself for that. Alerts
   are missed while your computer is asleep, off, or offline.
-- It stores console API keys on your machine (in your keyring, or in a file
-  readable only by you) and can enable RTSPS streams on your cameras (unless
+- It stores console API keys, and the recordings password if you use
+  recordings, on your machine (in your keyring, or in a file readable only by
+  you) and can enable RTSPS streams on your cameras (unless
   read-only mode is on). You are responsible for deciding whether that is
   acceptable for your network.
 - It uses UniFi Protect's Integration API, which Ubiquiti may change at any
-  time.
+  time. Recordings use the unpublished endpoints of Protect's own web app,
+  which may change without notice.
 
 UniFi, UniFi Protect and Ubiquiti are trademarks of Ubiquiti Inc. Omarchy
 belongs to its authors. These names are used here only to describe what this
