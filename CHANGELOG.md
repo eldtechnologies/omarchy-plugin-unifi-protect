@@ -14,6 +14,26 @@ All notable changes to this plugin. The version is set in `manifest.json`;
 - mpv pop-out and clip windows get their title on stdin rather than as
   `--title`, and the panel no longer passes camera names to the helper.
   Reported in the marketplace review.
+- The stream relay is trusted only while it holds its lock. Before, once it
+  exited after a minute idle, another local user could listen on its old
+  port and receive the next stream request, including the camera's stream
+  alias. Each relay start now gets a fresh token, and requests without the
+  token are cut off early and kept small.
+- The camera wall shows camera names and errors as plain text; a name
+  written as HTML could make it load an image from any address.
+- Text a console sends is stripped of terminal escape sequences before it
+  is printed.
+- Everything a console sends is size-limited and checked: API responses,
+  event-stream messages, and event times (NaN or Infinity could break the
+  alert log).
+- The wall toggle only ever signals the wall it started, never another
+  process that reused its pid.
+- Files are created with their final permissions; cameras.json is now 0600.
+- After a failed recordings sign-in, nothing tries again behind your back,
+  and `logout` also ends the session on the console.
+- `migrate-keys` reports keys the keyring refused, and keyring labels no
+  longer contain console names or addresses.
+- CI actions are pinned to commits.
 
 ## 0.4.1 — 2026-10-12
 

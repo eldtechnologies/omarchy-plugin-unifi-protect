@@ -1775,7 +1775,8 @@ Panel {
 
                     Image {
                       anchors.fill: parent
-                      source: alertRow.modelData.image
+                      // Only a plain "<id>.jpg" inside the alert folder, as the helper writes.
+                      source: /^[A-Za-z0-9_-]{1,64}\.jpg$/.test(alertRow.modelData.image || "")
                               ? "file://" + root.runtimeDir + "/alerts/" + alertRow.modelData.image : ""
                       fillMode: Image.PreserveAspectCrop
                       asynchronous: true
