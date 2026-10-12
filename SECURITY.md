@@ -24,8 +24,12 @@ the source before installing. In short, this plugin:
 
 - talks only to the UniFi consoles you configure, over HTTPS with a pinned
   certificate;
-- keeps API keys out of the shell process, in your keyring (or a file only
-  you can read when no keyring is available);
+- keeps API keys, and the optional recordings login, out of the shell
+  process, in your keyring (or a file only you can read when no keyring is
+  available);
+- keeps fetched recordings in memory only (the runtime directory, mode
+  0700), deleted at logout, when the console is removed, and at reboot;
+  only `clip -o` writes one to disk, where you asked;
 - carries video over TLS through a local relay that listens on 127.0.0.1 only
   and requires a per-session token;
 - installs no service, runs no code at install time, and never uses `sudo`.

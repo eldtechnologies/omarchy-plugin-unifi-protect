@@ -91,6 +91,10 @@ echo "panel: live view"
 "${ipc[@]}" live "Front Door" >/dev/null; sleep 6; shot "$work/panel-live.png"; "${ipc[@]}" close >/dev/null; sleep 1
 crop_panel panel-live
 
+echo "panel: recordings"
+"${ipc[@]}" recordings "Front Door" >/dev/null; sleep 9; shot "$work/panel-recordings.png"; "${ipc[@]}" close >/dev/null; sleep 1
+crop_panel panel-recordings
+
 echo "camera wall"
 "$cli" wall --mode window >/dev/null; sleep 9; shot "$work/wall.png"; "$cli" wall >/dev/null; sleep 1
 magick "$work/wall.png" -resize '1600x>' "$work/out-wall.png"
@@ -98,7 +102,7 @@ magick "$work/wall.png" -resize '1600x900^' -gravity center -extent 1600x900 "$w
 
 # Every shot passed its checks: only now write into the repository.
 # Photo-heavy views as JPEG (a fraction of the size), the text-heavy log as PNG.
-for name in panel-grid panel-live wall; do
+for name in panel-grid panel-live panel-recordings wall; do
   magick "$work/out-$name.png" -quality 88 "$out/$name.jpg"
   echo "  $out/$name.jpg"
 done

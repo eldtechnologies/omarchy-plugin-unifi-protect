@@ -5,6 +5,18 @@ All notable changes to this plugin. The version is set in `manifest.json`;
 
 ## Unreleased
 
+### Added
+
+- **Recordings.** `R` (or **Recordings**) in a camera's live view lists what
+  it detected in the last 24 hours, with thumbnails, and plays the newest at
+  once. Enter plays another, Space pauses, ←/→ and the progress bar seek, and
+  a REC badge shows the time on screen. `P` opens the clip in mpv. Clicking
+  an alert in the alert log plays its recording.
+- Recordings need a local UniFi account per console, signed in from the panel
+  or with `eld-unifi-protect login`; the password goes to the keyring. New
+  commands `login`, `logout`, `recordings` and `clip` (`--play`, `-o`), and a
+  `recordings` IPC call.
+
 ### Changed
 
 - **Sound when one camera is shown.** The live view, an enlarged wall camera
