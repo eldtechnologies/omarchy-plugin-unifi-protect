@@ -138,6 +138,44 @@ class ListenerLifecycle(unittest.TestCase):
         lst.handle("nvr", {"item": {"id": "e4", "type": "ring", "device": "cam1", "start": 1791700000000}})
         self.assertEqual(lst.alerts[0]["kind"], "ring")
 
+    def test_unsafe_event_ids_are_dropped(self):
+        # The ID names the alert's snapshot file, so a console must not be
+        # able to point it anywhere else.
+        lst = self.listener()
+        for event_id in ("../../evil", "/tmp/evil", "a/b", "..", "x" * 65, "e 1"):
+            lst.handle("nvr", {"item": {"id": event_id, "type": "ring", "device": "cam1"}})
+        self.assertEqual(lst.alerts, [])
+
+
+class AlertImages(unittest.TestCase):
+    def test_paths_stay_in_the_alert_folder(self):
+        self.assertEqual(h.alert_image_path("abc123.jpg"), os.path.join(h.ALERT_IMAGES_DIR, "abc123.jpg"))
+        for name in ("../x.jpg", "/tmp/x.jpg", "a/b.jpg", "x.png", "", None, ".jpg"):
+            self.assertEqual(h.alert_image_path(name), "")
+
+    def test_capture_never_writes_outside_the_folder(self):
+        listener = h.AlertListener()
+        listener.config = {"consoles": [{"id": "nvr"}]}
+        listener.save = lambda: None
+        listener.notify = lambda *args: None
+        alert = {"id": "../../escaped", "kind": "person", "start": 0}
+        camera = {"uid": "nvr_cam1", "id": "cam1"}
+        with mock.patch.object(h, "Protect") as protect:
+            protect.return_value.snapshot.return_value = b"\xff\xd8jpeg\xff\xd9"
+            asyncio.run(listener.capture("nvr", camera, alert))
+        self.assertNotIn("image", alert)
+        self.assertFalse(os.path.exists(os.path.join(h.ALERT_IMAGES_DIR, "../../escaped.jpg")))
+
+    def test_saved_alerts_with_unsafe_ids_or_images_are_not_loaded(self):
+        h.write_json(h.ALERTS_PATH, {"alerts": [
+            {"id": "good", "start": 1, "image": "good.jpg"},
+            {"id": "../bad", "start": 1},
+            {"id": "ok", "start": 1, "image": "../../home.jpg"},
+        ]})
+        alerts = h.load_alerts()
+        self.assertEqual([(a["id"], a.get("image")) for a in alerts], [("good", "good.jpg"), ("ok", None)])
+        os.remove(h.ALERTS_PATH)
+
 
 class AlertLog(unittest.TestCase):
     def test_clear_drops_older_alerts_and_their_snapshots(self):
