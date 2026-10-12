@@ -105,7 +105,7 @@ class Files(unittest.TestCase):
     def test_mpv_command_lines_name_nothing(self):
         # Titles and URLs go on stdin: other users can read command lines.
         for command in (h.mpv_command("mpv"), h.mpv_clip_command("mpv")):
-            self.assertIn("--title=${media-title}", command)
+            self.assertIn("--title=${playlist/0/title}", command)
             self.assertIn("--playlist=-", command)
             self.assertFalse([a for a in command if "://" in a or "Door" in a])
 

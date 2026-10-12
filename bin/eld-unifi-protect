@@ -2376,7 +2376,7 @@ def mpv_clip_command(player, sound=True):
         player,
         "--no-terminal",
         f"--input-conf={os.path.join(PLUGIN_DIR, 'mpv', 'input.conf')}",
-        "--title=${media-title}",
+        "--title=${playlist/0/title}",
         "--force-window=immediate",
         "--hwdec=auto-safe",
         f"--mute={'no' if sound else 'yes'}",
@@ -3030,7 +3030,7 @@ def mpv_command(player, sound=True):
         # A camera stream that drops (Wi-Fi, firmware update, console
         # restart) ends the "file"; looping it reconnects instead of closing.
         "--loop-file=inf",
-        "--title=${media-title}",
+        "--title=${playlist/0/title}",
         "--force-window=immediate",
         "--profile=low-latency",
         "--untimed",
@@ -3060,7 +3060,7 @@ def camera_name(uid):
 
 
 def mpv_playlist(title, target):
-    """A one-entry M3U playlist: the title (mpv's media-title), then target."""
+    """A one-entry M3U playlist: the window title, then target."""
     title = " ".join(str(title).split()) or "UniFi Protect"
     if "\n" in target or "\r" in target or target.startswith("#"):
         raise ProtectError("unexpected media location")
@@ -3070,8 +3070,9 @@ def mpv_playlist(title, target):
 def exec_mpv(player, command, title, target):
     """Replace this process with mpv, playing target under title.
 
-    Both travel as a playlist on stdin, where no other user can read them;
-    mpv's window title is ${media-title}, which the playlist sets.
+    Both travel as a playlist on stdin, where no other user can read them.
+    mpv's window title is that entry's title (${playlist/0/title}); not
+    ${media-title}, which a stream's own metadata overrides.
     """
     playlist = mpv_playlist(title, target)
     read_fd, write_fd = os.pipe()
