@@ -26,6 +26,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import unicodedata
 import ssl
 import subprocess
@@ -915,6 +916,300 @@ def load_alerts():
     return kept
 
 
+# ---- desktop notifications over D-Bus ------------------------------------
+#
+# notify-send would put the camera, the console and the time in its command
+# line, and with --wait it stays running until the notification goes away;
+# every local user can read command lines through /proc. So the helper
+# speaks the session bus itself: just enough D-Bus to call Notify and hear
+# which action was chosen, and nothing private ever reaches an argv.
+
+NOTIFY_NAME = "org.freedesktop.Notifications"
+NOTIFY_PATH = "/org/freedesktop/Notifications"
+DBUS_MAX_MESSAGE = 1 << 20
+
+
+def session_bus_path():
+    """The session bus socket path, or None when there is no session bus."""
+    address = os.environ.get("DBUS_SESSION_BUS_ADDRESS") or ""
+    for part in address.split(";"):
+        kind, _, rest = part.partition(":")
+        if kind != "unix":
+            continue
+        params = dict(item.split("=", 1) for item in rest.split(",") if "=" in item)
+        if params.get("path"):
+            return urllib.parse.unquote(params["path"])
+        if params.get("abstract"):
+            return "\0" + urllib.parse.unquote(params["abstract"])
+    fallback = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "", "bus")
+    return fallback if os.environ.get("XDG_RUNTIME_DIR") and os.path.exists(fallback) else None
+
+
+class DBusWriter:
+    """Little-endian D-Bus marshalling for the few types Notify needs."""
+
+    def __init__(self):
+        self.buf = bytearray()
+
+    def pad(self, n):
+        self.buf += b"\0" * (-len(self.buf) % n)
+
+    def byte(self, value):
+        self.buf.append(value)
+
+    def uint32(self, value):
+        self.pad(4)
+        self.buf += struct.pack("<I", value)
+
+    def int32(self, value):
+        self.pad(4)
+        self.buf += struct.pack("<i", value)
+
+    def string(self, value):
+        data = value.encode()
+        if b"\0" in data:
+            raise ValueError("NUL in D-Bus string")
+        self.uint32(len(data))
+        self.buf += data + b"\0"
+
+    def signature(self, value):
+        data = value.encode()
+        self.byte(len(data))
+        self.buf += data + b"\0"
+
+    def array(self, align, write_items):
+        self.uint32(0)
+        at = len(self.buf) - 4
+        self.pad(align)
+        start = len(self.buf)
+        write_items()
+        struct.pack_into("<I", self.buf, at, len(self.buf) - start)
+
+    def variant(self, code, value):
+        self.signature(code)
+        {"s": self.string, "o": self.string, "u": self.uint32,
+         "y": self.byte, "g": self.signature}[code](value)
+
+
+def dbus_message(kind, serial, fields, signature="", body=b""):
+    """One message: kind 1 is a method call, 2 a reply, 4 a signal."""
+    out = DBusWriter()
+    out.buf += b"l" + bytes([kind, 0, 1])
+    out.uint32(len(body))
+    out.uint32(serial)
+    if signature:
+        fields = fields + [(8, "g", signature)]
+
+    def write_fields():
+        for code, kind_code, value in fields:
+            out.pad(8)
+            out.byte(code)
+            out.variant(kind_code, value)
+    out.array(8, write_fields)
+    out.pad(8)
+    return bytes(out.buf) + body
+
+
+def dbus_call(serial, destination, path, interface, member, signature="", body=b""):
+    return dbus_message(1, serial, [(1, "o", path), (2, "s", interface), (3, "s", member),
+                                    (6, "s", destination)], signature, body)
+
+
+class DBusReader:
+    def __init__(self, data, little=True):
+        self.data, self.pos, self.end = data, 0, "<" if little else ">"
+
+    def align(self, n):
+        self.pos += -self.pos % n
+
+    def take(self, n):
+        if self.pos + n > len(self.data):
+            raise ValueError("truncated D-Bus message")
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return chunk
+
+    def byte(self):
+        return self.take(1)[0]
+
+    def uint32(self):
+        self.align(4)
+        return struct.unpack(self.end + "I", self.take(4))[0]
+
+    def int32(self):
+        self.align(4)
+        return struct.unpack(self.end + "i", self.take(4))[0]
+
+    def string(self):
+        n = self.uint32()
+        value = self.take(n + 1)[:-1]
+        return value.decode(errors="replace")
+
+    def signature(self):
+        n = self.byte()
+        return self.take(n + 1)[:-1].decode(errors="replace")
+
+    def value(self, code):
+        if code in "so":
+            return self.string()
+        if code == "g":
+            return self.signature()
+        if code == "u":
+            return self.uint32()
+        if code == "i":
+            return self.int32()
+        if code == "y":
+            return self.byte()
+        if code == "b":
+            return bool(self.uint32())
+        raise ValueError(f"unsupported D-Bus type {code!r}")
+
+    def variant(self):
+        code = self.signature()
+        return self.value(code) if len(code) == 1 else None
+
+
+def dbus_parse(data):
+    """(kind, header fields, body values, raw body) of a whole message.
+
+    Bodies are read only for the simple signatures the helper expects.
+    """
+    reader = DBusReader(data, little=data[:1] == b"l")
+    reader.pos = 1
+    kind = reader.byte()
+    reader.take(2)
+    body_length = reader.uint32()
+    serial = reader.uint32()
+    fields_length = reader.uint32()
+    fields, end = {"serial": serial}, reader.pos + fields_length
+    while reader.pos < end:
+        reader.align(8)
+        code = reader.byte()
+        fields[code] = reader.variant()
+    reader.align(8)
+    raw = reader.take(body_length)
+    body = DBusReader(raw, little=data[:1] == b"l")
+    values = []
+    signature = fields.get(8) or ""
+    if signature and all(c in "suyibog" for c in signature):
+        values = [body.value(c) for c in signature]
+    return kind, fields, values, raw
+
+
+async def dbus_read(reader):
+    head = await reader.readexactly(16)
+    little = head[:1] == b"l"
+    body_length, _, fields_length = struct.unpack(("<" if little else ">") + "III", head[4:16])
+    total = 16 + fields_length + (-fields_length % 8) + body_length
+    if total > DBUS_MAX_MESSAGE:
+        raise ProtectError("D-Bus message too large")
+    return dbus_parse(head + await reader.readexactly(total - 16))
+
+
+async def dbus_connect(path, timeout=5):
+    """Open and authenticate a session bus connection (EXTERNAL, as this uid)."""
+    # A leading NUL is an abstract socket; asyncio takes those as they are.
+    reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(path), timeout)
+    writer.write(b"\0AUTH EXTERNAL " + str(os.getuid()).encode().hex().encode() + b"\r\n")
+    await writer.drain()
+    answer = await asyncio.wait_for(reader.readline(), timeout)
+    if not answer.startswith(b"OK "):
+        writer.close()
+        raise ProtectError("the session bus refused the connection")
+    writer.write(b"BEGIN\r\n")
+    return reader, writer
+
+
+class DBusConnection:
+    def __init__(self, reader, writer):
+        self.reader, self.writer, self.serial = reader, writer, 0
+        self.signals = []
+
+    async def call(self, destination, path, interface, member, signature="", body=b"", timeout=10):
+        self.serial += 1
+        serial = self.serial
+        self.writer.write(dbus_call(serial, destination, path, interface, member, signature, body))
+        await self.writer.drain()
+        while True:
+            kind, fields, values, _ = await asyncio.wait_for(dbus_read(self.reader), timeout)
+            if kind in (2, 3) and fields.get(5) == serial:
+                if kind == 3:
+                    raise ProtectError(f"D-Bus error: {fields.get(4)}")
+                return values
+            if kind == 4:
+                self.signals.append((fields, values))
+
+    async def signal(self):
+        if self.signals:
+            return self.signals.pop(0)
+        while True:
+            kind, fields, values, _ = await dbus_read(self.reader)
+            if kind == 4:
+                return fields, values
+
+    def close(self):
+        self.writer.close()
+
+
+def notify_body(summary, body, image, actions, timeout_ms=-1):
+    """The body of Notify(susssasa{sv}i)."""
+    out = DBusWriter()
+    out.string("UniFi Protect")
+    out.uint32(0)
+    out.string("")
+    out.string(summary)
+    out.string(body)
+
+    def write_actions():
+        for item in actions:
+            out.string(item)
+    out.array(4, write_actions)
+
+    def write_hints():
+        hints = [("urgency", "y", 1)]
+        if image:
+            hints.append(("image-path", "s", "file://" + image))
+        for key, code, value in hints:
+            out.pad(8)
+            out.string(key)
+            out.variant(code, value)
+    out.array(8, write_hints)
+    out.int32(timeout_ms)
+    return bytes(out.buf)
+
+
+async def send_desktop_notification(summary, body, image="", actions=(), wait=3600):
+    """Show a notification; return the action chosen, or None when it closes."""
+    path = session_bus_path()
+    if not path:
+        raise ProtectError("no session bus")
+    bus = DBusConnection(*await dbus_connect(path))
+    try:
+        await bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello")
+        match = DBusWriter()
+        match.string(f"type='signal',sender='{NOTIFY_NAME}',interface='{NOTIFY_NAME}',path='{NOTIFY_PATH}'")
+        await bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                       "AddMatch", "s", bytes(match.buf))
+        values = await bus.call(NOTIFY_NAME, NOTIFY_PATH, NOTIFY_NAME, "Notify", "susssasa{sv}i",
+                                notify_body(summary, body, image, list(actions)))
+        notification = values[0] if values else None
+        if not actions:
+            return None
+
+        async def chosen():
+            while True:
+                fields, values = await bus.signal()
+                if not values or values[0] != notification:
+                    continue
+                if fields.get(3) == "ActionInvoked" and len(values) > 1:
+                    return values[1]
+                if fields.get(3) == "NotificationClosed":
+                    return None
+        return await asyncio.wait_for(chosen(), wait)
+    finally:
+        bus.close()
+
+
 class AlertListener:
     def __init__(self, follow_parent=False):
         self.parent = os.getppid() if follow_parent else None
@@ -1017,7 +1312,7 @@ class AlertListener:
 
     def notify(self, console_id, camera, alert):
         """Desktop notification for a new alert, at most once a minute per camera."""
-        if not self.notify_enabled or not shutil.which("notify-send"):
+        if not self.notify_enabled or not session_bus_path():
             return
         now = time.time()
         if now - self.last_notified.get(camera["uid"], 0) < NOTIFY_EVERY:
@@ -1036,16 +1331,10 @@ class AlertListener:
                 "package": "Package", "ring": "Doorbell", "motion": "Motion"}.get(alert["kind"], alert["kind"])
         summary = f"Doorbell at {camera['name']}" if alert["kind"] == "ring" else f"{what} at {camera['name']}"
         body = f"{camera['consoleName']} · {time.strftime('%H:%M', time.localtime(alert['start']))}"
-        command = ["notify-send", "--app-name=UniFi Protect", "--urgency=normal",
-                   "--action=live=Watch live", "--wait"]
-        if image:
-            command.append(f"--hint=string:image-path:file://{image}")
-        command += [summary, body]
+        # Straight to the notification service: nothing private in an argv.
         try:
-            process = await asyncio.create_subprocess_exec(
-                *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            chosen = (await process.communicate())[0].decode().strip()
-        except OSError:
+            chosen = await send_desktop_notification(summary, body, image, ["live", "Watch live"])
+        except (OSError, ProtectError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
             return
         if chosen == "live" and shutil.which("omarchy-shell"):
             # Open the panel on this camera's live view.
@@ -1949,19 +2238,23 @@ def fetch_clip(config, uid, start, end, quality):
     return {"path": path, "start": clip_start, "end": clip_end}
 
 
-def mpv_clip_command(player, title, sound=True):
-    """mpv for a recorded clip: seekable, stays open at the end."""
+def mpv_clip_command(player, sound=True):
+    """mpv for a recorded clip: seekable, stays open at the end.
+
+    The clip and its title come on stdin (see exec_mpv).
+    """
     return [
         player,
         "--no-terminal",
         f"--input-conf={os.path.join(PLUGIN_DIR, 'mpv', 'input.conf')}",
-        f"--title={title}",
+        "--title=${media-title}",
         "--force-window=immediate",
         "--hwdec=auto-safe",
         f"--mute={'no' if sound else 'yes'}",
         "--keep-open=yes",
         "--x11-name=eld-unifi-protect",
         "--wayland-app-id=eld-unifi-protect",
+        "--playlist=-",
     ]
 
 
@@ -2496,9 +2789,9 @@ def cmd_clip(args):
         player = shutil.which("mpv")
         if not player:
             raise ProtectError("mpv is not installed: omarchy pkg add mpv")
-        title = (args.title or "UniFi Protect") + " · " + time.strftime(
+        title = (args.title or camera_name(uid)) + " · " + time.strftime(
             "%H:%M:%S", time.localtime(args.start))
-        os.execv(player, mpv_clip_command(player, title, args.sound == "on") + ["--", clip["path"]])
+        exec_mpv(player, mpv_clip_command(player, args.sound == "on"), title, os.path.abspath(clip["path"]))
     print(json.dumps(clip) if args.json else clip["path"])
 
 
@@ -2578,8 +2871,8 @@ def cmd_stream(args):
     print(client.stream_url(camera_id, args.quality))
 
 
-def mpv_command(player, title, sound=True):
-    """The mpv command line for one camera; the URL itself comes on stdin."""
+def mpv_command(player, sound=True):
+    """The mpv command line for one camera; the URL and title come on stdin."""
     input_conf = os.path.join(PLUGIN_DIR, "mpv", "input.conf")
     return [
         player,
@@ -2590,7 +2883,7 @@ def mpv_command(player, title, sound=True):
         # A camera stream that drops (Wi-Fi, firmware update, console
         # restart) ends the "file"; looping it reconnects instead of closing.
         "--loop-file=inf",
-        f"--title={title}",
+        "--title=${media-title}",
         "--force-window=immediate",
         "--profile=low-latency",
         "--untimed",
@@ -2604,11 +2897,42 @@ def mpv_command(player, title, sound=True):
         "--keep-open=no",
         "--x11-name=eld-unifi-protect",
         "--wayland-app-id=eld-unifi-protect",
-        # The URL carries the relay token. Command lines are readable by
-        # every local user through /proc/<pid>/cmdline, so it goes to mpv as
-        # a one-line playlist on stdin instead.
+        # The URL carries the relay token, and the title names the camera.
+        # Command lines are readable by every local user through
+        # /proc/<pid>/cmdline, so both go to mpv as a playlist on stdin.
         "--playlist=-",
     ]
+
+
+def camera_name(uid):
+    """A camera's name from the last camera list, for window titles."""
+    for camera in previous_state().get("cameras", []):
+        if camera.get("uid") == uid or camera.get("id") == uid:
+            return camera.get("name") or "UniFi Protect"
+    return "UniFi Protect"
+
+
+def mpv_playlist(title, target):
+    """A one-entry M3U playlist: the title (mpv's media-title), then target."""
+    title = " ".join(str(title).split()) or "UniFi Protect"
+    if "\n" in target or "\r" in target or target.startswith("#"):
+        raise ProtectError("unexpected media location")
+    return f"#EXTM3U\n#EXTINF:-1,{title}\n{target}\n".encode()
+
+
+def exec_mpv(player, command, title, target):
+    """Replace this process with mpv, playing target under title.
+
+    Both travel as a playlist on stdin, where no other user can read them;
+    mpv's window title is ${media-title}, which the playlist sets.
+    """
+    playlist = mpv_playlist(title, target)
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, playlist)
+    os.close(write_fd)
+    os.dup2(read_fd, 0)
+    os.close(read_fd)
+    os.execv(player, command)
 
 
 def cmd_live(args):
@@ -2617,13 +2941,8 @@ def cmd_live(args):
     player = shutil.which("mpv")
     if not player:
         raise ProtectError("mpv is not installed: omarchy pkg add mpv")
-    command = mpv_command(player, args.title or "UniFi Protect", args.sound == "on")
-    read_fd, write_fd = os.pipe()
-    os.write(write_fd, (url + "\n").encode())
-    os.close(write_fd)
-    os.dup2(read_fd, 0)
-    os.close(read_fd)
-    os.execv(player, command)
+    title = args.title or camera_name(args.camera)
+    exec_mpv(player, mpv_command(player, args.sound == "on"), title, url)
 
 
 def cmd_open(args):

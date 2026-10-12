@@ -98,8 +98,22 @@ class Files(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
     def test_popout_sound_follows_the_flag(self):
-        self.assertIn("--mute=no", h.mpv_command("mpv", "Door"))
-        self.assertIn("--mute=yes", h.mpv_command("mpv", "Door", sound=False))
+        self.assertIn("--mute=no", h.mpv_command("mpv"))
+        self.assertIn("--mute=yes", h.mpv_command("mpv", sound=False))
+
+    def test_mpv_command_lines_name_nothing(self):
+        # Titles and URLs go on stdin: other users can read command lines.
+        for command in (h.mpv_command("mpv"), h.mpv_clip_command("mpv")):
+            self.assertIn("--title=${media-title}", command)
+            self.assertIn("--playlist=-", command)
+            self.assertFalse([a for a in command if "://" in a or "Door" in a])
+
+    def test_mpv_playlist_carries_title_and_target(self):
+        self.assertEqual(h.mpv_playlist("Front\nDoor", "rtsp://127.0.0.1:1/x"),
+                         b"#EXTM3U\n#EXTINF:-1,Front Door\nrtsp://127.0.0.1:1/x\n")
+        for bad in ("a\nb", "#EXTINF:-1,x"):
+            with self.assertRaises(h.ProtectError):
+                h.mpv_playlist("t", bad)
 
     def test_version_comes_from_the_manifest(self):
         with open(ROOT / "manifest.json") as handle:

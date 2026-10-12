@@ -32,6 +32,9 @@ the source before installing. In short, this plugin:
   only `clip -o` writes one to disk, where you asked;
 - carries video over TLS through a local relay that listens on 127.0.0.1 only
   and requires a per-session token;
+- keeps camera and console names, stream URLs and secrets out of command
+  lines, which other local users can read: mpv gets them on stdin, and
+  notifications go to the notification service over D-Bus;
 - installs no service, runs no code at install time, and never uses `sudo`.
 
 See "How it works" in the [README](README.md) for the details.

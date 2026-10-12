@@ -3,6 +3,18 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
+## Unreleased
+
+### Security
+
+- Notifications no longer run `notify-send` with the camera, console and
+  time in its command line, where other local users could read them for as
+  long as the notification stayed up. The helper now sends them to the
+  notification service over D-Bus itself.
+- mpv pop-out and clip windows get their title on stdin rather than as
+  `--title`, and the panel no longer passes camera names to the helper.
+  Reported in the marketplace review.
+
 ## 0.4.1 — 2026-10-12
 
 ### Security
