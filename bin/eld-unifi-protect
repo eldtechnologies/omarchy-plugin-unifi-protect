@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import http.client
 import json
+import math
 import os
 import random
 import re
@@ -83,14 +84,26 @@ def write_atomic(path, data, mode=0o600):
     # several threads, and a shared temp name let one thread rename the
     # other's file away.
     tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
-    with open(tmp, "wb") as handle:
-        handle.write(data if isinstance(data, bytes) else data.encode())
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    # Created with its final mode, never through a link: no moment where a
+    # file holding keys is readable by others, whatever the umask.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data if isinstance(data, bytes) else data.encode())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def write_json(path, value):
-    write_atomic(path, json.dumps(value, indent=2) + "\n")
+    # allow_nan=False: NaN and Infinity are not JSON, and the panel's parser
+    # rejects the whole file over one of them.
+    write_atomic(path, json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
 def slugify(text):
@@ -235,8 +248,10 @@ def save_config(config):
         if entry.get("keyStore") == "keyring":
             entry.pop("apiKey", None)
         stored["consoles"].append(entry)
-    write_json(CONFIG_PATH, stored)
+    # Tighten the folder first, in case it was made by hand with looser rights.
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     os.chmod(CONFIG_DIR, 0o700)
+    write_json(CONFIG_PATH, stored)
 
 
 def require_config():
@@ -812,12 +827,21 @@ def alert_kind(event, triggers):
 
 
 def event_time(value):
-    """Protect timestamps are epoch milliseconds; return epoch seconds."""
+    """Protect timestamps are epoch milliseconds; return epoch seconds.
+
+    None for anything that is not a plausible time (NaN, Infinity, or outside
+    2000-2100): a console's numbers end up in alerts.json and in strftime.
+    """
+    if isinstance(value, bool):
+        return None
     try:
         value = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    return value / 1000 if value > 1e11 else value
+    if not math.isfinite(value):
+        return None
+    value = value / 1000 if value > 1e11 else value
+    return value if 946684800 <= value <= 4102444800 else None
 
 
 def ws_frame(opcode, payload=b""):
@@ -895,6 +919,11 @@ async def ws_messages(reader, writer, idle=60):
         elif length == 127:
             length = int.from_bytes(await reader.readexactly(8), "big")
         if length > 1 << 20:
+            raise ProtectError("event message too large")
+        if opcode & 0x8 and length > 125:
+            raise ProtectError("event stream sent an oversized control frame")
+        if opcode in (0x0, 0x1) and len(fragments) + length > 1 << 20:
+            # Fragments add up: cap the whole message, not just each frame.
             raise ProtectError("event message too large")
         mask = await reader.readexactly(4) if masked else None
         payload = await reader.readexactly(length)
@@ -1673,6 +1702,9 @@ def cmd_demo(args):
         print(f"no image yet for: {', '.join(missing)} (placeholders used; add them to {DEMO_SOURCE})")
 
 
+API_MAX_BYTES = 16 * 1024 * 1024   # a 4K snapshot is a few MB
+
+
 class Protect:
     def __new__(cls, console, config=None):
         if console.get("demo"):
@@ -1702,7 +1734,9 @@ class Protect:
                 delay = float(headers.get("Retry-After") or 0)
             except ValueError:
                 delay = 0
-            time.sleep(min(10.0, delay or 0.5 * 2 ** attempt))
+            if not math.isfinite(delay) or delay <= 0:
+                delay = 0.5 * 2 ** attempt
+            time.sleep(min(10.0, delay))
         if status in (401, 403):
             raise ProtectError("console rejected the API key (HTTP %d)" % status)
         if status == 404:
@@ -1714,7 +1748,10 @@ class Protect:
             raise ProtectError(f"HTTP {status} from console: {detail}")
         if raw:
             return data
-        return json.loads(data) if data else None
+        try:
+            return json.loads(data) if data else None
+        except ValueError:
+            raise ProtectError("console sent something that is not JSON")
 
     def _send(self, method, path, body, params):
         url = API_BASE + path
@@ -1729,7 +1766,11 @@ class Protect:
         try:
             conn.request(method, url, body=payload, headers=headers)
             response = conn.getresponse()
-            return response.status, response.headers, response.read()
+            # A console could stream forever; nothing here is near this size.
+            data = response.read(API_MAX_BYTES + 1)
+            if len(data) > API_MAX_BYTES:
+                raise ProtectError("console sent too large a response")
+            return response.status, response.headers, data
         except ProtectError:
             raise
         except (OSError, http.client.HTTPException) as error:
@@ -1741,7 +1782,10 @@ class Protect:
         return self.request("GET", "/meta/info")
 
     def cameras(self):
-        return self.request("GET", "/cameras") or []
+        data = self.request("GET", "/cameras") or []
+        if not isinstance(data, list):
+            raise ProtectError("console sent an unexpected camera list")
+        return [camera for camera in data if isinstance(camera, dict)]
 
     def snapshot(self, camera_id, high_quality=False):
         data = self.request(
@@ -1771,6 +1815,8 @@ class Protect:
             return {q: relay_url(self.console["id"], known[q]) for q in qualities}
 
         streams = self.request("GET", f"/cameras/{camera_id}/rtsps-stream") or {}
+        if not isinstance(streams, dict):
+            streams = {}
         missing = [q for q in qualities if not streams.get(q)]
         if missing and load_prefs()["readOnly"]:
             # Read-only: never switch streams on. Fall back to whichever
@@ -1789,11 +1835,12 @@ class Protect:
             created = self.request(
                 "POST", f"/cameras/{camera_id}/rtsps-stream", body={"qualities": missing}
             ) or {}
-            streams.update({k: v for k, v in created.items() if v})
+            if isinstance(created, dict):
+                streams.update({k: v for k, v in created.items() if v})
         urls = {}
         for quality in qualities:
             url = streams.get(quality)
-            if not url:
+            if not url or not isinstance(url, str):
                 raise ProtectError(f"console did not return a {quality} stream for this camera")
             urls[quality] = url
         with STREAM_CACHE_LOCK:
@@ -2338,7 +2385,7 @@ def load_prefs():
 
 
 def save_prefs(prefs):
-    write_atomic(PREFS_PATH, json.dumps(prefs, indent=2) + "\n", mode=0o644)
+    write_atomic(PREFS_PATH, json.dumps(prefs, indent=2) + "\n")
 
 
 def camera_key(camera):

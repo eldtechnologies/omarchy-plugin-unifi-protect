@@ -39,6 +39,9 @@ class Matching(unittest.TestCase):
         self.assertEqual(h.event_time(1791700000000), 1791700000)
         self.assertEqual(h.event_time(1791700000), 1791700000)
         self.assertIsNone(h.event_time(None))
+        # A console's numbers reach alerts.json and strftime: nothing absurd.
+        for bad in (float("nan"), float("inf"), "Infinity", 1e300, -5, True, 12):
+            self.assertIsNone(h.event_time(bad))
 
 
 def unmask(frame):
@@ -100,6 +103,16 @@ class WebSocketFrames(unittest.TestCase):
         body = json.dumps({"x": "y" * 500}).encode()
         texts, _ = self.collect(server_frame(0x1, body) + server_frame(0x8, b""))
         self.assertEqual(texts, [body.decode()])
+
+    def test_fragments_cannot_add_up_past_the_cap(self):
+        chunk = b"x" * 60000
+        data = server_frame(0x1, chunk, fin=False) + server_frame(0x0, chunk, fin=False) * 20
+        with self.assertRaisesRegex(h.ProtectError, "too large"):
+            self.collect(data)
+
+    def test_oversized_control_frames_are_refused(self):
+        with self.assertRaisesRegex(h.ProtectError, "control frame"):
+            self.collect(server_frame(0x9, b"p" * 200))
 
 
 class ListenerLifecycle(unittest.TestCase):
