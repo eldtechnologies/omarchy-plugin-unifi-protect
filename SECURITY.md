@@ -36,7 +36,8 @@ the source before installing. In short, this plugin:
 - keeps camera and console names, event times, stream URLs and secrets out
   of command lines, which other local users can read: they travel on stdin,
   in the environment (private to you), or to the notification service over
-  D-Bus. Command lines carry only opaque ids, and a console's address
+  D-Bus. Command lines carry only ids: a console's short id (made from its
+  name when it was added) with Protect's camera id, and a console's address
   during setup or when opening Protect in the browser;
 - installs no service, runs no code at install time, and never uses `sudo`.
 

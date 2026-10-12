@@ -72,6 +72,26 @@ class FakeConsole(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
         FakeConsole.log.append(("GET", url.path))
+        if url.path == "/slow":
+            # Headers, then a byte now and then: only a total deadline ends it.
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            for _ in range(40):
+                try:
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.1)
+            return
+        if url.path == "/short":
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            self.wfile.write(b"x" * 500)
+            self.close_connection = True
+            return
         token = (self.headers.get("Cookie") or "").removeprefix("TOKEN=")
         if token in FakeConsole.no_role:
             return self.reply(403)
@@ -190,12 +210,42 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         h.recordings_for(self.config, f"nvr_{CAMERA}")
         self.assertEqual(len(FakeConsole.valid), 1)
         h.save_config(self.config)
-        with mock.patch.object(h, "poll_cameras"):
+        with mock.patch.object(h, "poll_cameras"), mock.patch("sys.stdout", new_callable=io.StringIO):
             h.cmd_logout(argparse.Namespace(console="nvr"))
         self.assertIn(("POST", "/api/auth/logout"), FakeConsole.log)
         self.assertEqual(FakeConsole.valid, set())
         self.assertNotIn("nvr", h.load_sessions())
         os.remove(h.CONFIG_PATH)
+
+    def test_a_mistyped_new_login_keeps_the_saved_logins_failure(self):
+        FakeConsole.password = "changed"
+        h.recordings_for(self.config, f"nvr_{CAMERA}")       # saved login rejected: 1
+        h.save_config(self.config)
+        with mock.patch.object(h.sys, "stdin", io.StringIO("viewer\ntypo\n")):
+            with self.assertRaises(h.LoginRejected):
+                h.cmd_login(argparse.Namespace(console="nvr", stdin=True, json=True))   # 2
+        # The saved (rejected) login is still not retried behind the user's back.
+        result = h.recordings_for(h.load_config(), f"nvr_{CAMERA}")
+        self.assertTrue(result["needsLogin"])
+        self.assertEqual(FakeConsole.logins, 2)
+        os.remove(h.CONFIG_PATH)
+
+    def test_a_failure_from_the_future_does_not_block(self):
+        h.write_json(h.SESSIONS_PATH, {"nvr": {"failed": time.time() + 3600, "error": "x", "rejected": True}})
+        self.assertEqual(len(h.recordings_for(self.config, f"nvr_{CAMERA}")["events"]), 2)
+
+    def test_reads_are_bounded_in_time_and_must_be_whole(self):
+        session = h.ProtectSession(self.console, self.config)
+        started = time.monotonic()
+        conn, response = session._send("GET", "/slow", deadline=1)
+        with self.assertRaises(h.ProtectError):
+            h.read_body(response, 1 << 20)
+        conn.finish()
+        self.assertLess(time.monotonic() - started, 3)
+        conn, response = session._send("GET", "/short")
+        with self.assertRaisesRegex(h.ProtectError, "partway|mid-answer"):
+            h.read_body(response, 1 << 20)
+        conn.finish()
 
     def test_no_login_asks_for_one(self):
         del self.console["loginUser"]
@@ -205,13 +255,14 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
 
     def test_a_rejected_login_keeps_the_working_one(self):
         h.recordings_for(self.config, f"nvr_{CAMERA}")
+        session_before = h.load_sessions()["nvr"]
         h.save_config(self.config)
         args = argparse.Namespace(console="nvr", stdin=True, json=True)
         with mock.patch.object(h.sys, "stdin", io.StringIO("norole\nright\n")):
             with self.assertRaisesRegex(h.ProtectError, "may not view recordings"):
                 h.cmd_login(args)
-        # The trial session is gone, so the old account signs in afresh.
-        self.assertNotIn("nvr", h.load_sessions())
+        # The working account keeps its session: no new sign-in needed.
+        self.assertEqual(h.load_sessions()["nvr"], session_before)
         config = h.load_config()
         self.assertEqual(config["consoles"][0]["loginUser"], "viewer")
         self.assertEqual(len(h.recordings_for(config, f"nvr_{CAMERA}")["events"]), 2)

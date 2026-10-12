@@ -334,16 +334,43 @@ def fetch_cert_fingerprint(host, timeout=8):
 
 
 class PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, port, pin, timeout):
+    """HTTPS to a console: its pinned certificate, and a deadline.
+
+    The socket timeout bounds each read only, so a console trickling a byte
+    every few seconds could hold a request open for hours; after `deadline`
+    seconds in total the connection is cut instead.
+    """
+
+    def __init__(self, host, port, pin, timeout, deadline=60):
         context = ssl.create_default_context()
         if pin:
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
         super().__init__(host, port, timeout=timeout, context=context)
         self._pin = pin
+        self._raw = None
+        self._timer = threading.Timer(deadline, self._expire)
+        self._timer.daemon = True
+
+    def _expire(self):
+        # The raw socket: http.client hands it to the response and drops
+        # its own reference while the body is still being read.
+        if self._raw is not None:
+            try:
+                self._raw.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def finish(self):
+        """Done with the request and its response: stop the clock, close."""
+        self._timer.cancel()
+        self.close()
 
     def connect(self):
+        if not self._timer.is_alive() and not self._timer.finished.is_set():
+            self._timer.start()
         super().connect()
+        self._raw = self.sock
         if self._pin:
             der = self.sock.getpeercert(binary_form=True)
             if hashlib.sha256(der).hexdigest() != self._pin:
@@ -969,6 +996,12 @@ ALERTS_MAX_AGE = 24 * 3600
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
+def smart_types(event):
+    """An event's smartDetectTypes, only if it really is a list of strings."""
+    seen = event.get("smartDetectTypes")
+    return [t for t in seen if isinstance(t, str)] if isinstance(seen, list) else []
+
+
 def alert_kind(event, triggers):
     """The armed trigger an event matches, or None."""
     kind = event.get("type")
@@ -977,7 +1010,7 @@ def alert_kind(event, triggers):
     if kind == "motion":
         return "motion" if "motion" in triggers else None
     if kind in SMART_EVENT_TYPES:
-        for detected in event.get("smartDetectTypes") or []:
+        for detected in smart_types(event):
             if detected in triggers:
                 return detected
     return None
@@ -1506,14 +1539,14 @@ class AlertListener:
         prune_alert_images({a.get("image") for a in self.alerts})
 
     def handle(self, console_id, message):
-        item = message.get("item") or {}
-        if item.get("modelKey", "event") != "event" or not item.get("id"):
+        item = message.get("item") if isinstance(message, dict) else None
+        if not isinstance(item, dict) or item.get("modelKey", "event") != "event" or not item.get("id"):
             return
         event_id = str(item["id"])
         if not EVENT_ID.fullmatch(event_id):
             return  # not a Protect ID; it would name the snapshot file
         camera_id = item.get("device") or self.event_cameras.get(event_id)
-        if not camera_id:
+        if not isinstance(camera_id, str) or not CAMERA_ID.fullmatch(camera_id):
             return
         self.event_cameras[event_id] = camera_id
         if len(self.event_cameras) > 1000:
@@ -1614,8 +1647,8 @@ class AlertListener:
                     async for text in ws_messages(reader, writer):
                         try:
                             self.handle(console_id, json.loads(text))
-                        except ValueError:
-                            continue
+                        except (ValueError, TypeError, AttributeError, KeyError, RecursionError):
+                            continue   # a malformed message is skipped, never fatal
                 finally:
                     writer.close()
                 error = "event stream closed"
@@ -1877,25 +1910,24 @@ def cmd_demo(args):
 
 
 API_MAX_BYTES = 16 * 1024 * 1024   # a 4K snapshot is a few MB
-API_READ_DEADLINE = 60               # seconds for a whole response body
+def read_body(response, limit):
+    """A whole response body of at most limit bytes.
 
-
-def read_body(response, limit, deadline=API_READ_DEADLINE):
-    """Up to limit bytes of a response, in bounded time.
-
-    The socket timeout only bounds each read; a console trickling one byte
-    every few seconds would otherwise hold a request open indefinitely.
+    Time is bounded by the connection's deadline (PinnedHTTPSConnection).
     """
-    data, until = bytearray(), time.monotonic() + deadline
-    while len(data) <= limit:
-        chunk = response.read1(min(65536, limit + 1 - len(data)))
-        if not chunk:
-            break
-        data += chunk
-        if time.monotonic() > until:
-            raise ProtectError("console is answering too slowly")
+    data = bytearray()
+    try:
+        while len(data) <= limit:
+            chunk = response.read1(min(65536, limit + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+    except (OSError, http.client.HTTPException):
+        raise ProtectError("the console stopped answering partway")
     if len(data) > limit:
         raise ProtectError("console sent too large a response")
+    if response.length:   # Content-Length promised more than arrived
+        raise ProtectError("console closed the connection mid-answer")
     return bytes(data)
 
 
@@ -1968,7 +2000,7 @@ class Protect:
             # Exception text can quote the console (a bad status line).
             raise ProtectError(f"cannot reach {self.host}: {clean_text(str(error), 'no answer', 200)}")
         finally:
-            conn.close()
+            conn.finish()
 
     def info(self):
         data = self.request("GET", "/meta/info")
@@ -2109,6 +2141,7 @@ CLIP_MAX_SECONDS = 300      # longer events are cut to their first five minutes
 CLIP_ONGOING_SECONDS = 60   # an event still in progress: its first minute so far
 CLIPS_MAX_BYTES = 600 * 1024 * 1024   # clips live in RAM (the runtime dir)
 CLIPS_KEEP = 25
+CLIP_DEADLINE = 900        # seconds for a whole export, even a slow 600 MB one
 CLIP_CHANNELS = {"high": 0, "medium": 1, "low": 2}
 RECORDING_KINDS = ("person", "vehicle", "animal", "package", "face", "licensePlate")
 
@@ -2155,18 +2188,39 @@ def store_login(console, user, password):
         return "file"
 
 
-def end_session(console):
+def restore_session(console_id, entry):
+    """Put a console's sessions.json entry back as it was (or remove it)."""
+    with SESSIONS_LOCK:
+        sessions = load_sessions()
+        if entry is None:
+            sessions.pop(console_id, None)
+        else:
+            sessions[console_id] = entry
+        write_json(SESSIONS_PATH, sessions)
+
+
+def logout_session(console, session, config=None):
+    """Sign one session out on the console; best effort."""
+    try:
+        client = ProtectSession(console, config, fresh=True)
+        client.session = session
+        client.logout()
+    except ProtectError:
+        pass
+
+
+def end_session(console, config=None):
     """Sign the saved session out on the console (best effort), then forget it."""
     if has_login(console):
         try:
-            ProtectSession(console).logout()
+            ProtectSession(console, config).logout()
         except ProtectError:
             pass
     forget_session(console["id"])
 
 
-def clear_login(console):
-    end_session(console)
+def clear_login(console, config=None):
+    end_session(console, config)
     if console.get("loginStore") == "keyring":
         _key_cache.pop((LOGIN_SERVICE, console["id"]), None)
         try:
@@ -2221,7 +2275,7 @@ def event_kind(event):
     """What a Protect event saw, as one word for the timeline."""
     kind = event.get("type")
     if kind in SMART_EVENT_TYPES:
-        seen = [t for t in event.get("smartDetectTypes") or [] if t in RECORDING_KINDS]
+        seen = [t for t in smart_types(event) if t in RECORDING_KINDS]
         return seen[0] if seen else "motion"
     if kind == "ring":
         return "ring"
@@ -2277,12 +2331,12 @@ def prune_clips(keep_path=None):
 class ProtectSession:
     """Signed-in access to the recordings endpoints of one console."""
 
-    def __new__(cls, console, config=None):
+    def __new__(cls, console, config=None, fresh=False):
         if console.get("demo"):
             return DemoSession(console)
         return super().__new__(cls)
 
-    def __init__(self, console, config=None):
+    def __init__(self, console, config=None, fresh=False):
         if not has_login(console):
             raise ProtectError("no login for recordings on this console; "
                                f"run `eld-unifi-protect login {console['id']}`")
@@ -2291,7 +2345,9 @@ class ProtectSession:
         self.name, self.port = split_host(self.host)
         self.pin = console.get("certSha256")
         self.timeout = float((config or {}).get("timeoutSec", 8))
-        saved = load_sessions().get(console["id"])
+        # A trial of new credentials (`login`) starts clean: no saved session,
+        # no remembered failure.
+        saved = None if fresh else load_sessions().get(console["id"])
         # Thumbnails are fetched four at a time through one session.
         self.lock = threading.Lock()
         # Once a sign-in fails, every later call fails with it, in this
@@ -2299,7 +2355,7 @@ class ProtectSession:
         # locks accounts out after a burst of failures. `login` clears it.
         self.login_error, self.login_rejected, self.session = None, False, None
         if isinstance(saved, dict) and isinstance(saved.get("failed"), (int, float)):
-            if time.time() - saved["failed"] < LOGIN_RETRY_AFTER:
+            if 0 <= time.time() - saved["failed"] < LOGIN_RETRY_AFTER:
                 self.login_error = str(saved.get("error") or "sign-in failed")
                 self.login_rejected = bool(saved.get("rejected"))
         elif isinstance(saved, dict) and saved.get("token"):
@@ -2313,22 +2369,22 @@ class ProtectSession:
             write_json(SESSIONS_PATH, sessions)
         raise (LoginRejected if rejected else ProtectError)(message)
 
-    def _send(self, method, path, body=None, params=None, headers=None, timeout=None):
+    def _send(self, method, path, body=None, params=None, headers=None, timeout=None, deadline=60):
         url = path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
         headers = dict(headers or {})
         payload = None
         if body is not None:
             payload = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
-        conn = PinnedHTTPSConnection(self.name, self.port, self.pin, timeout or self.timeout)
+        conn = PinnedHTTPSConnection(self.name, self.port, self.pin, timeout or self.timeout, deadline)
         try:
             conn.request(method, url, body=payload, headers=headers)
             return conn, conn.getresponse()
         except ProtectError:
-            conn.close()
+            conn.finish()
             raise
         except (OSError, http.client.HTTPException) as error:
-            conn.close()
+            conn.finish()
             # Exception text can quote the console (a bad status line).
             raise ProtectError(f"cannot reach {self.host}: {clean_text(str(error), 'no answer', 200)}")
 
@@ -2340,10 +2396,10 @@ class ProtectSession:
             "username": self.console["loginUser"], "password": password,
             "rememberMe": False, "token": ""})
         try:
-            data = response.read(4096)
+            data = read_body(response, 64 * 1024)
             cookies = response.headers.get_all("Set-Cookie") or []
         finally:
-            conn.close()
+            conn.finish()
         if response.status == 429:
             self.fail_login("the console is limiting sign-ins after failed attempts; wait a few minutes",
                             rejected=False)
@@ -2376,11 +2432,11 @@ class ProtectSession:
             headers["X-CSRF-Token"] = session["csrf"]
         try:
             conn, response = self._send("POST", "/api/auth/logout", body={}, headers=headers)
-            conn.close()
+            conn.finish()
         except ProtectError:
             pass
 
-    def open(self, path, params=None, timeout=None):
+    def open(self, path, params=None, timeout=None, deadline=60):
         """GET a recordings endpoint; returns (conn, response) with status 200.
 
         Signs in when there is no session or it has run out, and once more if
@@ -2403,9 +2459,9 @@ class ProtectSession:
             if session.get("csrf"):
                 headers["X-CSRF-Token"] = session["csrf"]
             conn, response = self._send("GET", PRIVATE_API + path, params=params,
-                                        headers=headers, timeout=timeout)
+                                        headers=headers, timeout=timeout, deadline=deadline)
             if response.status == 401 and attempt == 0:
-                conn.close()
+                conn.finish()
                 with self.lock:
                     # Another thread may have signed in again already.
                     if self.session is session:
@@ -2413,8 +2469,11 @@ class ProtectSession:
                 continue
             if response.status == 200:
                 return conn, response
-            detail = clean_text(response.read(200).decode(errors="replace"), "", 200)
-            conn.close()
+            try:
+                detail = clean_text(read_body(response, 64 * 1024)[:200].decode(errors="replace"), "", 200)
+            except (ProtectError, OSError, http.client.HTTPException):
+                detail = ""
+            conn.finish()
             if response.status in (401, 403):
                 raise ProtectError("this account may not view recordings; give it a Protect role "
                                    "that can (View Only or higher)")
@@ -2429,7 +2488,7 @@ class ProtectSession:
         try:
             return read_body(response, limit)
         finally:
-            conn.close()
+            conn.finish()
 
     def events(self, camera_id, since, until, motion=False, limit=100):
         """Events newest first; camera_id None lists every camera's."""
@@ -2470,7 +2529,7 @@ class ProtectSession:
         """Write the recording between two times (seconds) to path as MP4."""
         conn, response = self.open("/video/export", params={
             "camera": camera_id, "start": int(start * 1000), "end": int(end * 1000),
-            "channel": CLIP_CHANNELS[quality]}, timeout=120)
+            "channel": CLIP_CHANNELS[quality]}, timeout=120, deadline=CLIP_DEADLINE)
         partial = f"{path}.{os.getpid()}.part"
         written = 0
         try:
@@ -2485,15 +2544,21 @@ class ProtectSession:
                     out.write(chunk)
             with open(partial, "rb") as handle:
                 head = handle.read(12)
+            if response.length:
+                raise ProtectError("the console stopped sending the clip partway; try again")
             # An MP4 starts with an "ftyp" box; anything else is an error page.
             if written < 1024 or head[4:8] != b"ftyp":
                 raise ProtectError("the console sent no video for that time; "
                                    "is the camera recording it?")
             os.replace(partial, path)
+        except http.client.HTTPException:
+            raise ProtectError("the console stopped sending the clip partway; try again")
         except OSError as error:
+            if error.filename is None:   # the connection, not a file
+                raise ProtectError("the console stopped sending the clip partway; try again")
             raise ProtectError(f"cannot save the clip: {error}")
         finally:
-            conn.close()
+            conn.finish()
             if os.path.exists(partial):
                 os.remove(partial)
 
@@ -2862,7 +2927,7 @@ def save_console(config, existing, host, pin, key, name):
         # A new key or certificate keeps the recordings login.
         entry.update({k: existing[k] for k in ("loginUser", "loginStore", "loginPassword") if k in existing})
     elif existing:
-        clear_login(existing)
+        clear_login(existing, config)
     if existing and existing.get("keyStore") == "keyring" and existing.get("id") != console_id:
         keyring_clear(existing["id"])
     where = store_key(config, entry, key)
@@ -3009,7 +3074,7 @@ def cmd_remove(args):
     if not args.yes and input(f"Remove {console['name']} ({console['host']})? [y/N] ").strip().lower() not in ("y", "yes"):
         raise ProtectError("not changed")
     config["consoles"].remove(console)
-    clear_login(console)
+    clear_login(console, config)
     forget_recordings(console["id"])
     if console.get("keyStore") == "keyring":
         try:
@@ -3099,22 +3164,25 @@ def cmd_login(args):
     if not user or not password:
         raise ProtectError("enter the username and the password")
     previous = {k: console[k] for k in ("loginUser", "loginStore", "loginPassword") if k in console}
-    # The account signed in so far is signed out on the console first; this
-    # also clears any remembered failed sign-in.
-    end_session(console)
+    old_session = load_sessions().get(console["id"])
     console.pop("loginStore", None)
     console.update(loginUser=user, loginPassword=password)
     try:
-        # Prove it before saving: sign in and list one event.
+        # Prove it before saving: sign in and list one event. The trial starts
+        # clean, but nothing about the saved login changes unless it works.
         now = time.time()
-        ProtectSession(console, config).events(None, now - 3600, now, limit=1)
+        ProtectSession(console, config, fresh=True).events(None, now - 3600, now, limit=1)
     except ProtectError:
         for field in ("loginUser", "loginPassword"):
             console.pop(field, None)
         console.update(previous)
-        # The trial sign-in may have saved a session for the rejected account.
-        forget_session(console["id"])
+        # The trial wrote its own session or failure; put back what the
+        # saved login had (a working session, or its remembered failure).
+        restore_session(console["id"], old_session)
         raise
+    # The new login works: sign the old session out on the console.
+    if isinstance(old_session, dict) and old_session.get("token"):
+        logout_session(console, old_session, config)
     where = store_login(console, user, password)
     save_config(config)
     poll_cameras(config)
@@ -3139,7 +3207,7 @@ def cmd_logout(args):
     if not console.get("loginUser"):
         print(f"No recordings login stored for {console['name']}.")
         return
-    clear_login(console)        # also signs the session out on the console
+    clear_login(console, config)        # also signs the session out on the console
     save_config(config)
     forget_recordings(console["id"])
     poll_cameras(config)
@@ -3154,7 +3222,9 @@ def cmd_recordings(args):
         print(json.dumps(result))
         return
     if result.get("needsLogin"):
-        raise ProtectError(f"no login for recordings on {result['consoleName']}; "
+        why = (f"the console turned the saved login down ({result['loginError']})"
+               if result.get("loginError") else "no login for recordings")
+        raise ProtectError(f"{why} on {result['consoleName']}; "
                            f"run `eld-unifi-protect login {result['console']}`")
     for event in result["events"]:
         length = f"{round(event['end'] - event['start'])} s" if event["end"] else "ongoing"
@@ -3176,7 +3246,7 @@ def cmd_clip(args):
             event = json.loads(os.environ.get("ELD_UNIFI_PROTECT_EVENT") or "")
             args.start = float(event["start"])
             args.end = float(event["end"]) if event.get("end") else None
-        except (ValueError, TypeError, KeyError):
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
             raise ProtectError("give --start (and --end) for the event")
     if not math.isfinite(args.start) or (args.end is not None and not math.isfinite(args.end)):
         raise ProtectError("event times must be numbers")

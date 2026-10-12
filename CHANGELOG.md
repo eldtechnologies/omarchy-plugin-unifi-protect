@@ -14,7 +14,8 @@ Security-focused hardening release.
   time for as long as they are shown; the helper sends them to the
   notification service over D-Bus itself. mpv gets its title and video on
   stdin; the panel passes event times in the environment and the console
-  name typed at setup on stdin. Keyring labels carry only the console id.
+  name typed at setup on stdin. Keyring labels carry only the console's
+  short id.
 - **Stream relay.** Loopback stream URLs no longer contain the camera's
   Protect stream alias, only a random route id the relay maps back
   privately. Before, once the relay exited after a minute idle, another

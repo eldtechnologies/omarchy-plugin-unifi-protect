@@ -151,6 +151,15 @@ class ListenerLifecycle(unittest.TestCase):
         lst.handle("nvr", {"item": {"id": "e4", "type": "ring", "device": "cam1", "start": 1791700000000}})
         self.assertEqual(lst.alerts[0]["kind"], "ring")
 
+    def test_malformed_messages_are_ignored(self):
+        lst = self.listener()
+        for message in ([], {"item": []}, {"item": {"id": "e9", "device": ["cam1"], "type": "ring"}},
+                        {"item": {"id": "e9", "device": "cam1", "type": "smartDetectZone",
+                                  "smartDetectTypes": 5}}):
+            lst.handle("nvr", message)
+        self.assertEqual(lst.alerts, [])
+        self.assertEqual(h.event_kind({"type": "smartDetectZone", "smartDetectTypes": 5}), "motion")
+
     def test_unsafe_event_ids_are_dropped(self):
         # The ID names the alert's snapshot file, so a console must not be
         # able to point it anywhere else.
