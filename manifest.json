@@ -25,7 +25,8 @@
       "wallMode": "window",
       "refresh": "balanced",
       "framing": "fill",
-      "openFavoriteLive": false
+      "openFavoriteLive": false,
+      "sound": true
     },
     "schema": [
       {
@@ -75,6 +76,12 @@
         "type": "string",
         "label": "Pop-out player quality (high, medium, low)",
         "defaultValue": "high"
+      },
+      {
+        "key": "sound",
+        "type": "boolean",
+        "label": "Sound when one camera is shown (live view, enlarged wall camera, pop-out)",
+        "defaultValue": true
       },
       {
         "key": "wallMode",

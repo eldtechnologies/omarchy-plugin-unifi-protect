@@ -23,6 +23,8 @@ ShellRoot {
   property int focusedIndex: -1
   property int selectedIndex: 0
   property bool muted: true
+  // Sound for an enlarged camera (the bar's "sound" setting); tiles are silent.
+  property bool soundDefault: true
 
   readonly property int count: cameras.length
   readonly property int columns: count <= 1 ? 1 : count <= 4 ? 2 : count <= 9 ? 3 : count <= 16 ? 4 : 5
@@ -32,6 +34,9 @@ ShellRoot {
   function focusCamera(index) {
     if (index < 0 || index >= count) return
     selectedIndex = index
+    // Enlarging from the grid starts at the default; M carries over while
+    // flipping between cameras.
+    if (focusedIndex < 0) muted = !soundDefault
     focusedIndex = cameras[index].error ? -1 : index
   }
 
@@ -54,6 +59,7 @@ ShellRoot {
         var data = JSON.parse(text())
         shell.snapshotDir = data.snapshotDir || ""
         shell.multiConsole = data.multiConsole === true
+        shell.soundDefault = data.sound !== false
         shell.cameras = data.cameras || []
       } catch (error) {
         Qt.quit()
@@ -274,7 +280,7 @@ ShellRoot {
             anchors.centerIn: parent
             text: "● " + (shell.focusedCamera ? shell.focusedCamera.name : "")
                   + (shell.multiConsole && shell.focusedCamera ? "  ·  " + shell.focusedCamera.consoleName : "")
-                  + (shell.muted ? "" : "  ·  sound on")
+                  + (shell.muted ? "  ·  muted" : "")
             color: "white"
             font.pixelSize: 18
             font.bold: true
@@ -304,7 +310,7 @@ ShellRoot {
         id: hints
         anchors.centerIn: parent
         text: shell.focusedIndex >= 0
-              ? "←/→ next camera  ·  M sound  ·  Esc or click back to grid  ·  Q close"
+              ? "←/→ next camera  ·  M mute  ·  Esc or click back to grid  ·  Q close"
               : "Click or 1–9 enlarge  ·  arrows select  ·  Enter enlarge  ·  Esc close"
         color: "white"
         font.pixelSize: 14

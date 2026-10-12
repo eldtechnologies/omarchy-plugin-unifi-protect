@@ -116,17 +116,27 @@ eld-unifi-protect remove nvr
 | Grid | Hover a tile | Bell to arm alerts, ★ favourite, eye to hide, pop-out button |
 | Grid / live | `P` | Pop out to mpv |
 | Live | ← / → | Previous / next camera |
-| Live | `M` | Toggle sound |
+| Live | `M` | Mute / unmute |
 | Live | Double-click | Pop out |
 | Live | Esc | Back to the grid |
 | Grid | `A` | Alert log |
 | Panel footer | Click the version | Release notes for that version |
 
+### Sound
+
+Sound plays whenever exactly one camera is on screen: the panel's live view,
+an enlarged camera on the wall, and the pop-out player. The grid and the
+wall's tiles are always silent (they don't even decode audio). `M` mutes;
+the choice carries over while you flip between cameras, and opening a camera
+from the grid again starts with sound. Set `sound` to `false` to start
+muted instead. Cameras with the microphone turned off in Protect have no
+sound to play.
+
 ### Camera wall
 
 **Wall** in the panel header, or `W`, shows every visible camera live. Click
 a camera or press `1`–`9` to enlarge it at high quality. ←/→ flips cameras,
-`M` toggles sound, Esc goes back to the grid, and Esc (or `Q`) again closes
+`M` mutes, Esc goes back to the grid, and Esc (or `Q`) again closes
 the wall. Streams that drop reconnect on their own.
 
 It opens in one of two modes, set with `wallMode`:
@@ -230,8 +240,8 @@ o.bind("SUPER + SHIFT + ALT + C", "Camera wall (overlay)", "eld-unifi-protect wa
 
 `P` (or double-click in live view) opens the camera in its own mpv window at
 high quality. Scroll to zoom in on a detail, horizontal scroll or
-Ctrl+arrows to pan, and Ctrl+0 to reset; `f` toggles fullscreen and `q`
-closes it. If the stream drops, the window reconnects on its own.
+Ctrl+arrows to pan, and Ctrl+0 to reset; `m` mutes, `f` toggles fullscreen
+and `q` closes it. If the stream drops, the window reconnects on its own.
 
 The mpv window uses the app id `eld-unifi-protect`, for window rules.
 
@@ -247,6 +257,7 @@ Widget settings live in `~/.config/omarchy/shell.json` and reload on save:
 | `columns` | `2` | Grid columns |
 | `liveQuality` | `medium` | Stream for the in-panel live view |
 | `popoutQuality` | `high` | Stream for the mpv window |
+| `sound` | `true` | Sound when one camera is shown (live view, enlarged wall camera, pop-out); `false` starts muted |
 | `wallMode` | `window` | Camera wall as a maximized `window` or a full-screen `overlay` |
 
 ```json

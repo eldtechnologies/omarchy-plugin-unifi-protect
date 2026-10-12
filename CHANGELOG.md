@@ -3,6 +3,15 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
+## Unreleased
+
+### Changed
+
+- **Sound when one camera is shown.** The live view, an enlarged wall camera
+  and the pop-out player now start with sound; the grid and wall tiles stay
+  silent. `M` mutes and carries over while flipping cameras. New `sound`
+  setting (default `true`) to start muted instead.
+
 ## 0.3.0 — 2026-10-11
 
 ### Added
