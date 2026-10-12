@@ -193,7 +193,9 @@ def resolve_keys(config):
 def store_key(config, console, key):
     """Put a console's key in the keyring if possible, else in the file."""
     try:
-        keyring_store(console["id"], f"UniFi Protect API key ({console['name']}, {console['host']})", key)
+        # secret-tool takes the label as an argument, visible to other users
+        # while it runs: the console id (already the lookup key), no more.
+        keyring_store(console["id"], f"UniFi Protect API key ({console['id']})", key)
         console["keyStore"] = "keyring"
         console["apiKey"] = key
         return "keyring"
@@ -1940,7 +1942,7 @@ def store_login(console, user, password):
     """Keyring if possible, else the config file (mode 0600)."""
     console["loginUser"] = user
     try:
-        result = _secret_tool(["store", f"--label=UniFi Protect login ({console['name']}, {console['host']})",
+        result = _secret_tool(["store", f"--label=UniFi Protect login ({console['id']})",
                                "service", LOGIN_SERVICE, "console", console["id"]], secret=password)
         if result.returncode != 0:
             raise KeyringUnavailable("the keyring refused to store the password")
@@ -2766,17 +2768,31 @@ def cmd_migrate_keys(args):
             raise ProtectError(f"{console['name']}: {console['keyError']}")
     if args.to == "keyring" and not keyring_available():
         raise ProtectError("no keyring available (Secret Service via secret-tool)")
-    moved = 0
+    moved, left = 0, []
+    to_clear = []
     for console in config["consoles"]:
         in_keyring = console.get("keyStore") == "keyring"
         if args.to == "keyring" and not in_keyring:
-            store_key(config, console, console["apiKey"])
-            moved += 1
+            # store_key falls back to the file when the keyring says no.
+            if store_key(config, console, console["apiKey"]) == "keyring":
+                moved += 1
+            else:
+                left.append(console["name"])
         elif args.to == "file" and in_keyring:
-            keyring_clear(console["id"])
             console.pop("keyStore", None)
+            to_clear.append(console["id"])
             moved += 1
+    # Write the file before clearing the keyring, so a failed save never
+    # loses a key.
     save_config(config)
+    for console_id in to_clear:
+        try:
+            keyring_clear(console_id)
+        except KeyringUnavailable as error:
+            print(f"Could not remove a key from the keyring: {error}", file=sys.stderr)
+    if left:
+        raise ProtectError(f"{moved} key(s) moved, but the keyring refused the key for "
+                           f"{', '.join(left)}; it is still in {CONFIG_PATH}")
     where = "your keyring" if args.to == "keyring" else CONFIG_PATH
     print(f"{moved} key(s) moved; all keys are now in {where}")
 
