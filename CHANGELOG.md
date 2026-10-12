@@ -5,8 +5,7 @@ All notable changes to this plugin. The version is set in `manifest.json`;
 
 ## Unreleased
 
-A security release: two findings from the marketplace review, and a full
-review of the plugin that followed.
+Security-focused hardening release.
 
 ### Security
 
