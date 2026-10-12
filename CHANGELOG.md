@@ -3,6 +3,16 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
+## Unreleased
+
+### Security
+
+- Alert event IDs from a console's event stream are checked before they name
+  the alert's snapshot file, and alert snapshots are only ever read or written
+  inside the plugin's alert folder. Before, a console sending an ID with a
+  path in it could overwrite a JPEG file elsewhere in your home directory.
+  Reported in the marketplace review.
+
 ## 0.4.0 — 2026-10-12
 
 ### Added

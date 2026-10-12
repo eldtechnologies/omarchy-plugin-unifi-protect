@@ -732,6 +732,9 @@ ALERTS_ACK_PATH = os.path.join(RUNTIME_DIR, "alerts-ack.json")
 EVENTS_LOCK = os.path.join(RUNTIME_DIR, "events.lock")
 ALERTS_KEEP = 50
 ALERT_IMAGES_DIR = os.path.join(RUNTIME_DIR, "alerts")
+# Event IDs come from the console; anything else never names a file.
+EVENT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+ALERT_IMAGE = re.compile(r"[A-Za-z0-9_-]{1,64}\.jpg")
 NOTIFY_EVERY = 60   # seconds; at most one notification per camera per minute
 CAPTURE_EVERY = 5   # seconds; at most one alert snapshot per camera
 PLUGIN_ID = "com.eldtechnologies.unifi-protect"
@@ -877,6 +880,11 @@ def read_ack():
         return {}
 
 
+def alert_image_path(name):
+    """An alert snapshot's path, only ever inside ALERT_IMAGES_DIR; else ""."""
+    return os.path.join(ALERT_IMAGES_DIR, name) if ALERT_IMAGE.fullmatch(str(name or "")) else ""
+
+
 def prune_alert_images(keep):
     """Delete alert snapshots no longer referenced by the log."""
     try:
@@ -894,9 +902,17 @@ def prune_alert_images(keep):
 def load_alerts():
     try:
         with open(ALERTS_PATH) as handle:
-            return json.load(handle).get("alerts", [])
-    except (OSError, ValueError):
+            alerts = json.load(handle).get("alerts", [])
+    except (OSError, ValueError, AttributeError):
         return []
+    # Only alerts with a valid event ID, and an image only if its name is safe.
+    kept = []
+    for alert in alerts if isinstance(alerts, list) else []:
+        if isinstance(alert, dict) and EVENT_ID.fullmatch(str(alert.get("id") or "")):
+            if alert.get("image") and not alert_image_path(alert["image"]):
+                alert = dict(alert, image=None)
+            kept.append(alert)
+    return kept
 
 
 class AlertListener:
@@ -942,6 +958,8 @@ class AlertListener:
         if item.get("modelKey", "event") != "event" or not item.get("id"):
             return
         event_id = str(item["id"])
+        if not EVENT_ID.fullmatch(event_id):
+            return  # not a Protect ID; it would name the snapshot file
         camera_id = item.get("device") or self.event_cameras.get(event_id)
         if not camera_id:
             return
@@ -985,9 +1003,12 @@ class AlertListener:
             try:
                 data = await asyncio.to_thread(
                     lambda: Protect(console, self.config).snapshot(camera["id"]))
-                os.makedirs(ALERT_IMAGES_DIR, mode=0o700, exist_ok=True)
                 name = f"{alert['id']}.jpg"
-                write_atomic(os.path.join(ALERT_IMAGES_DIR, name), data)
+                path = alert_image_path(name)
+                if not path:
+                    raise ProtectError("unsafe alert id")
+                os.makedirs(ALERT_IMAGES_DIR, mode=0o700, exist_ok=True)
+                write_atomic(path, data)
                 alert["image"] = name
                 self.save()
             except (ProtectError, OSError):
@@ -1010,7 +1031,7 @@ class AlertListener:
 
     async def send_notification(self, console, camera, alert):
         # The snapshot taken for the alert log is the notification's picture.
-        image = os.path.join(ALERT_IMAGES_DIR, alert["image"]) if alert.get("image") else ""
+        image = alert_image_path(alert.get("image"))
         what = {"person": "Person", "vehicle": "Vehicle", "animal": "Animal",
                 "package": "Package", "ring": "Doorbell", "motion": "Motion"}.get(alert["kind"], alert["kind"])
         summary = f"Doorbell at {camera['name']}" if alert["kind"] == "ring" else f"{what} at {camera['name']}"
@@ -1504,7 +1525,6 @@ CLIP_ONGOING_SECONDS = 60   # an event still in progress: its first minute so fa
 CLIPS_MAX_BYTES = 600 * 1024 * 1024   # clips live in RAM (the runtime dir)
 CLIPS_KEEP = 25
 CLIP_CHANNELS = {"high": 0, "medium": 1, "low": 2}
-EVENT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 RECORDING_KINDS = ("person", "vehicle", "animal", "package", "face", "licensePlate")
 
 
