@@ -180,13 +180,25 @@ class AlertImages(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(h.ALERT_IMAGES_DIR, "../../escaped.jpg")))
 
     def test_saved_alerts_with_unsafe_ids_or_images_are_not_loaded(self):
+        now = time.time()
         h.write_json(h.ALERTS_PATH, {"alerts": [
-            {"id": "good", "start": 1, "image": "good.jpg"},
-            {"id": "../bad", "start": 1},
-            {"id": "ok", "start": 1, "image": "../../home.jpg"},
+            {"id": "good", "start": now, "image": "good.jpg"},
+            {"id": "../bad", "start": now},
+            {"id": "ok", "start": now, "image": "../../home.jpg"},
         ]})
         alerts = h.load_alerts()
         self.assertEqual([(a["id"], a.get("image")) for a in alerts], [("good", "good.jpg"), ("ok", None)])
+
+    def test_saved_alerts_with_impossible_times_are_repaired_or_dropped(self):
+        # As an older version could write them: not valid JSON, but Python reads it.
+        os.makedirs(os.path.dirname(h.ALERTS_PATH), exist_ok=True)
+        with open(h.ALERTS_PATH, "w") as handle:
+            handle.write('{"alerts": [{"id": "a", "start": Infinity}, {"id": "b", "start": %f, "end": NaN}]}'
+                         % time.time())
+        alerts = h.load_alerts()
+        self.assertEqual([(a["id"], a["end"]) for a in alerts], [("b", None)])
+        listener = h.AlertListener()
+        listener.save()     # writes strict JSON again
         os.remove(h.ALERTS_PATH)
 
 

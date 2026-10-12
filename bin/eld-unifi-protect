@@ -1063,10 +1063,12 @@ async def ws_messages(reader, writer, idle=60):
         pinged = False
         fin, opcode = head[0] & 0x80, head[0] & 0x0F
         masked, length = head[1] & 0x80, head[1] & 0x7F
+        # Once a frame has begun, the rest must follow promptly: a console
+        # that stalls mid-frame would otherwise freeze alerts unnoticed.
         if length == 126:
-            length = int.from_bytes(await reader.readexactly(2), "big")
+            length = int.from_bytes(await asyncio.wait_for(reader.readexactly(2), idle), "big")
         elif length == 127:
-            length = int.from_bytes(await reader.readexactly(8), "big")
+            length = int.from_bytes(await asyncio.wait_for(reader.readexactly(8), idle), "big")
         if length > 1 << 20:
             raise ProtectError("event message too large")
         if opcode & 0x8 and length > 125:
@@ -1074,8 +1076,8 @@ async def ws_messages(reader, writer, idle=60):
         if opcode in (0x0, 0x1) and len(fragments) + length > 1 << 20:
             # Fragments add up: cap the whole message, not just each frame.
             raise ProtectError("event message too large")
-        mask = await reader.readexactly(4) if masked else None
-        payload = await reader.readexactly(length)
+        mask = await asyncio.wait_for(reader.readexactly(4), idle) if masked else None
+        payload = await asyncio.wait_for(reader.readexactly(length), idle)
         if mask:
             payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
         if opcode == 0x9:
@@ -1139,12 +1141,19 @@ def load_alerts():
     except (OSError, ValueError, AttributeError):
         return []
     # Only alerts with a valid event ID, and an image only if its name is safe.
+    # Times are checked again too: an older version could save NaN or
+    # Infinity, which no JSON writer or strftime takes.
     kept = []
     for alert in alerts if isinstance(alerts, list) else []:
-        if isinstance(alert, dict) and EVENT_ID.fullmatch(str(alert.get("id") or "")):
-            if alert.get("image") and not alert_image_path(alert["image"]):
-                alert = dict(alert, image=None)
-            kept.append(alert)
+        if not isinstance(alert, dict) or not EVENT_ID.fullmatch(str(alert.get("id") or "")):
+            continue
+        start = event_time(alert.get("start"))
+        if start is None:
+            continue
+        alert = dict(alert, start=start, end=event_time(alert.get("end")))
+        if alert.get("image") and not alert_image_path(alert["image"]):
+            alert["image"] = None
+        kept.append(alert)
     return kept
 
 
@@ -1860,6 +1869,26 @@ def cmd_demo(args):
 
 
 API_MAX_BYTES = 16 * 1024 * 1024   # a 4K snapshot is a few MB
+API_READ_DEADLINE = 60               # seconds for a whole response body
+
+
+def read_body(response, limit, deadline=API_READ_DEADLINE):
+    """Up to limit bytes of a response, in bounded time.
+
+    The socket timeout only bounds each read; a console trickling one byte
+    every few seconds would otherwise hold a request open indefinitely.
+    """
+    data, until = bytearray(), time.monotonic() + deadline
+    while len(data) <= limit:
+        chunk = response.read1(min(65536, limit + 1 - len(data)))
+        if not chunk:
+            break
+        data += chunk
+        if time.monotonic() > until:
+            raise ProtectError("console is answering too slowly")
+    if len(data) > limit:
+        raise ProtectError("console sent too large a response")
+    return bytes(data)
 
 
 class Protect:
@@ -1907,7 +1936,7 @@ class Protect:
             return data
         try:
             return json.loads(data) if data else None
-        except ValueError:
+        except (ValueError, RecursionError):
             raise ProtectError("console sent something that is not JSON")
 
     def _send(self, method, path, body, params):
@@ -1924,19 +1953,18 @@ class Protect:
             conn.request(method, url, body=payload, headers=headers)
             response = conn.getresponse()
             # A console could stream forever; nothing here is near this size.
-            data = response.read(API_MAX_BYTES + 1)
-            if len(data) > API_MAX_BYTES:
-                raise ProtectError("console sent too large a response")
-            return response.status, response.headers, data
+            return response.status, response.headers, read_body(response, API_MAX_BYTES)
         except ProtectError:
             raise
         except (OSError, http.client.HTTPException) as error:
-            raise ProtectError(f"cannot reach {self.host}: {error}")
+            # Exception text can quote the console (a bad status line).
+            raise ProtectError(f"cannot reach {self.host}: {clean_text(str(error), 'no answer', 200)}")
         finally:
             conn.close()
 
     def info(self):
-        return self.request("GET", "/meta/info")
+        data = self.request("GET", "/meta/info")
+        return data if isinstance(data, dict) else {}
 
     def cameras(self):
         data = self.request("GET", "/cameras") or []
@@ -2030,7 +2058,8 @@ def summarize_camera(camera, console):
     camera_id = str(camera.get("id") or "")
     if not CAMERA_ID.fullmatch(camera_id):
         return None  # not a Protect ID; never let it near a path or URL
-    flags = camera.get("featureFlags") or {}
+    flags = camera.get("featureFlags")
+    flags = flags if isinstance(flags, dict) else {}
     state = clean_text(camera.get("state"), "UNKNOWN", 32)
     model = clean_text(camera.get("type") or camera.get("modelKey"))
     return {
@@ -2152,14 +2181,20 @@ def token_expiry(token):
     is off from the console's neither expires sessions early nor keeps dead
     ones. Without iat, exp itself; without either, an hour from now.
     """
+    now = time.time()
     try:
         payload = token.split(".")[1]
         claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
         if "iat" in claims:
-            return time.time() + float(claims["exp"]) - float(claims["iat"])
-        return float(claims["exp"])
-    except (IndexError, KeyError, TypeError, ValueError):
-        return time.time() + 3600
+            expires = now + float(claims["exp"]) - float(claims["iat"])
+        else:
+            expires = float(claims["exp"])
+    except (IndexError, KeyError, TypeError, ValueError, OverflowError, RecursionError):
+        return now + 3600
+    # A console's numbers: nothing infinite, nothing beyond a week.
+    if not math.isfinite(expires):
+        return now + 3600
+    return min(expires, now + 7 * 24 * 3600)
 
 
 def event_kind(event):
@@ -2259,7 +2294,8 @@ class ProtectSession:
             raise
         except (OSError, http.client.HTTPException) as error:
             conn.close()
-            raise ProtectError(f"cannot reach {self.host}: {error}")
+            # Exception text can quote the console (a bad status line).
+            raise ProtectError(f"cannot reach {self.host}: {clean_text(str(error), 'no answer', 200)}")
 
     def login(self):
         password = login_password(self.console)
@@ -2354,7 +2390,7 @@ class ProtectSession:
     def get(self, path, params=None, limit=8 * 1024 * 1024):
         conn, response = self.open(path, params)
         try:
-            return response.read(limit)
+            return read_body(response, limit)
         finally:
             conn.close()
 
@@ -2367,9 +2403,14 @@ class ProtectSession:
                   "orderDirection": "DESC", "withoutDescriptions": "true", "types": types}
         if camera_id:
             params["cameras"] = camera_id
-        raw = json.loads(self.get("/events", params=params))
+        try:
+            raw = json.loads(self.get("/events", params=params))
+        except (ValueError, RecursionError):
+            raise ProtectError("console sent an unreadable event list")
         events = []
         for event in raw if isinstance(raw, list) else []:
+            if not isinstance(event, dict):
+                continue
             event_id = str(event.get("id") or "")
             start = event_time(event.get("start"))
             # The filter is applied here too: the console's own may change.
@@ -2643,6 +2684,9 @@ def fetch_console(console, config):
         return {"cameras": cameras, "error": None}
     except ProtectError as error:
         return {"cameras": None, "error": str(error)}
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        # One console sending nonsense must not stop the others' polling.
+        return {"cameras": None, "error": "console sent unexpected data"}
 
 
 def poll_cameras(config=None):
@@ -2890,7 +2934,7 @@ def cmd_setup(args):
     info, cameras = verify_console(config, host, pin, key)
     online = sum(1 for c in cameras if c.get("state") == "CONNECTED")
     print(
-        f"\nConnected to UniFi Protect {info.get('applicationVersion', '')}".rstrip()
+        f"\nConnected to UniFi Protect {clean_text(info.get('applicationVersion'), '', 40)}".rstrip()
         + f" · {online}/{len(cameras)} camera(s) online"
     )
 
@@ -3138,7 +3182,7 @@ def cmd_cameras(args):
     state = poll_cameras(require_config())
     for console in state.get("consoles", []):
         if console.get("error"):
-            print(f"! {console['name']}: {console['error']}", file=sys.stderr)
+            print(f"! {console['name']}: {clean_text(console['error'], 'error', 300)}", file=sys.stderr)
     for camera in state["cameras"]:
         status = "online " if camera["online"] else "OFFLINE"
         status += " hidden" if camera.get("hidden") else "       "
@@ -3278,6 +3322,8 @@ def cmd_doctor(args):
     def report(good, label, detail=""):
         nonlocal ok
         ok = ok and good
+        # Details can quote the console: printable text only.
+        detail = clean_text(detail, "", 300)
         print(("  ok   " if good else "  FAIL ") + label + (f" — {detail}" if detail else ""))
 
     config = load_config()
