@@ -950,10 +950,17 @@ Panel {
     }
   }
 
+  // Qt keeps the output that was the default when the shell started, so a
+  // headset connected later never heard a thing; follow the default instead.
+  MediaDevices { id: mediaDevices }
+
   MediaPlayer {
     id: player
     videoOutput: videoOutput
-    audioOutput: AudioOutput { muted: root.muted }
+    audioOutput: AudioOutput {
+      device: mediaDevices.defaultAudioOutput
+      muted: root.muted
+    }
     // Low-latency mode suits live network streams; for a local file (the
     // demo) it drops every frame, so only RTSP gets it.
     playbackOptions.playbackIntent: String(source).indexOf("rtsp") === 0

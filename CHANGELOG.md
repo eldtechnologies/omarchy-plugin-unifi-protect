@@ -24,6 +24,11 @@ All notable changes to this plugin. The version is set in `manifest.json`;
   silent. `M` mutes and carries over while flipping cameras. New `sound`
   setting (default `true`) to start muted instead.
 
+### Fixed
+- Sound in the panel and the wall follows the system's default output. Before,
+  it stayed on whatever was the default when the shell started, so a headset
+  connected later heard nothing.
+
 ## 0.3.0 — 2026-10-11
 
 ### Added

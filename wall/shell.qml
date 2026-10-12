@@ -25,6 +25,7 @@ ShellRoot {
   property bool muted: true
   // Sound for an enlarged camera (the bar's "sound" setting); tiles are silent.
   property bool soundDefault: true
+  readonly property MediaDevices mediaDevices: MediaDevices {}
 
   readonly property int count: cameras.length
   readonly property int columns: count <= 1 ? 1 : count <= 4 ? 2 : count <= 9 ? 3 : count <= 16 ? 4 : 5
@@ -113,6 +114,8 @@ ShellRoot {
 
     AudioOutput {
       id: audio
+      // Follow the system default if it changes while the wall is up.
+      device: shell.mediaDevices.defaultAudioOutput
       muted: shell.muted
     }
 
