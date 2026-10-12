@@ -6,7 +6,7 @@ camera live at once, and a pop-out player. Works with several consoles at
 once, such as a gateway and a dedicated NVR, and is set up from the panel
 itself. Arm a camera to be alerted when it sees a person, a vehicle or a
 doorbell ring, and play back what each camera recorded. Video travels
-encrypted, and API keys stay out of the shell.
+encrypted, and API keys are kept in your keyring.
 
 In the bar it is a single camera icon. It pulses in your theme's urgent
 colour when an armed camera has seen something, turns that colour when a
@@ -331,7 +331,8 @@ The plugin's own files:
 
 ## How it works
 
-The Omarchy shell never speaks HTTP and never sees an API key. The helper
+The Omarchy shell never speaks HTTP and never holds an API key: a key typed
+into the panel goes straight to the helper on stdin. The helper
 `bin/eld-unifi-protect` talks to the Protect Integration API
 (`/proxy/protect/integration/v1`), writes camera state and snapshots to disk,
 and resolves stream URLs. The panel watches those files and plays the

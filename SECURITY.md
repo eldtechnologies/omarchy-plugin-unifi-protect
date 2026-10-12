@@ -24,9 +24,10 @@ the source before installing. In short, this plugin:
 
 - talks only to the UniFi consoles you configure, over HTTPS with a pinned
   certificate;
-- keeps API keys, and the optional recordings login, out of the shell
-  process, in your keyring (or a file only you can read when no keyring is
-  available);
+- keeps API keys, and the optional recordings login, in your keyring (or a
+  file only you can read when no keyring is available). When you type one
+  into the panel, the shell only passes it to the helper on stdin and clears
+  the field; it never stores, logs or puts it on a command line;
 - keeps fetched recordings in memory only (the runtime directory, mode
   0700), deleted at logout, when the console is removed, and at reboot;
   only `clip -o` writes one to disk, where you asked;
