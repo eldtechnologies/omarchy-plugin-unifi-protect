@@ -198,5 +198,16 @@ class RelayLiveness(unittest.TestCase):
         info = {"pid": os.getpid(), "port": squatter.getsockname()[1], "token": "t"}
         self.assertFalse(h.relay_alive(info))
 
+
+class WallPid(unittest.TestCase):
+    def test_a_stale_pid_never_names_another_process(self):
+        os.makedirs(os.path.dirname(h.WALL_PID), exist_ok=True)
+        me = os.getpid()
+        for content in (f"{me} {h.process_start_time(me)}", f"{me}", "garbage", ""):
+            with open(h.WALL_PID, "w") as handle:
+                handle.write(content)
+            self.assertIsNone(h.running_wall(), content)
+        os.remove(h.WALL_PID)
+
 if __name__ == "__main__":
     unittest.main()

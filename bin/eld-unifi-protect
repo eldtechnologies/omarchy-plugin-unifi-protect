@@ -3179,14 +3179,29 @@ WALL_CONFIG = os.path.join(RUNTIME_DIR, "wall.json")
 WALL_PID = os.path.join(RUNTIME_DIR, "wall.pid")
 
 
+def process_start_time(pid):
+    """A process's start time in clock ticks since boot (stat field 22)."""
+    with open(f"/proc/{pid}/stat") as handle:
+        # The command name (field 2) may hold spaces and parentheses.
+        return int(handle.read().rsplit(")", 1)[1].split()[19])
+
+
 def running_wall():
+    """The wall's pid, only if that process is still exactly our wall.
+
+    wall.pid outlives the wall, and pids get reused: a stale one must never
+    make the toggle kill some other process (such as the Omarchy shell).
+    """
     try:
         with open(WALL_PID) as handle:
-            pid = int(handle.read().strip())
+            pid, started = (int(v) for v in handle.read().split())
         with open(f"/proc/{pid}/cmdline", "rb") as handle:
-            if b"quickshell" in handle.read():
-                return pid
-    except (OSError, ValueError):
+            argv = handle.read().split(b"\0")[:-1]
+        if (argv[1:] == [b"--no-duplicate", b"--path", WALL_DIR.encode()]
+                and os.path.basename(argv[0]) in (b"quickshell", b"qs")
+                and process_start_time(pid) == started):
+            return pid
+    except (OSError, ValueError, IndexError):
         pass
     return None
 
@@ -3273,7 +3288,7 @@ def cmd_wall(args):
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    write_atomic(WALL_PID, str(process.pid))
+    write_atomic(WALL_PID, f"{process.pid} {process_start_time(process.pid)}")
 
 
 def private_dir_problem(path):
