@@ -443,14 +443,14 @@ Panel {
     player.source = ""
     root.clipError = ""
     root.playingClip = null
-    var args = [root.cli, "clip", root.liveCamera.uid, "--start", String(start),
-                "--quality", root.liveQuality, "--json"]
-    if (end) args.push("--end", String(end))
     root.stopProcess(clipProcess)
     clipProcess.key = root.liveCamera.uid + ":" + start
     clipProcess.eventStart = start
     clipProcess.eventEnd = end
-    clipProcess.command = args
+    // Event times go in the environment, which only this user can read;
+    // command lines are visible to everyone.
+    clipProcess.environment = root.eventEnvironment(start, end)
+    clipProcess.command = [root.cli, "clip", root.liveCamera.uid, "--quality", root.liveQuality, "--json"]
     clipProcess.running = true
   }
 
@@ -473,15 +473,19 @@ Panel {
     recordingsList.positionViewAtIndex(root.recordingIndex, ListView.Contain)
   }
 
+  function eventEnvironment(start, end) {
+    return { ELD_UNIFI_PROTECT_EVENT: JSON.stringify({ start: start, end: end || null }) }
+  }
+
   // The clip in mpv at the pop-out quality: a separate export, then seekable.
   function popOutClip() {
     if (!root.playingClip) return
     var clip = root.playingClip
-    var args = [root.cli, "clip", root.liveCamera.uid, "--start", String(clip.eventStart),
-                "--quality", root.popoutQuality, "--play",
-                "--sound", root.muted ? "off" : "on"]
-    if (clip.eventEnd) args.push("--end", String(clip.eventEnd))
-    Quickshell.execDetached(args)
+    Quickshell.execDetached({
+      command: [root.cli, "clip", root.liveCamera.uid, "--quality", root.popoutQuality, "--play",
+                "--sound", root.muted ? "off" : "on"],
+      environment: root.eventEnvironment(clip.eventStart, clip.eventEnd)
+    })
     root.closeLive()
     root.close()
   }
@@ -719,10 +723,10 @@ Panel {
     }
     root.setupError = ""
     root.setupBusy = "Checking the key with " + root.setupHost + "…"
-    setupSave.secret = keyField.text.trim()
+    // Key, then name, on stdin: nothing typed here lands on a command line.
+    setupSave.secret = keyField.text.trim() + "\n" + nameField.text.trim().replace(/[\r\n]/g, " ")
     keyField.text = ""
-    setupSave.command = [root.cli, "setup-save", "--host", root.setupHost,
-                         "--pin", root.setupPin, "--name", nameField.text.trim()]
+    setupSave.command = [root.cli, "setup-save", "--host", root.setupHost, "--pin", root.setupPin]
     setupSave.running = true
   }
 

@@ -66,6 +66,10 @@ class FakeBus:
                 writer.write(self.reply(serial, fields, "u", body))
                 other = h.DBusWriter(); other.uint32(6); other.string("live")
                 writer.write(self.signal(serial + 1, h.NOTIFY_NAME, "ActionInvoked", "us", other))
+                # Someone else on the bus imitating the service is ignored.
+                spoof = h.DBusWriter(); spoof.uint32(7); spoof.string("spoofed")
+                writer.write(self.signal(serial + 1, h.NOTIFY_NAME, "ActionInvoked", "us", spoof,
+                                         sender=":1.666"))
                 if self.answer:
                     mine = h.DBusWriter(); mine.uint32(7); mine.string(self.answer)
                     writer.write(self.signal(serial + 2, h.NOTIFY_NAME, "ActionInvoked", "us", mine))
@@ -74,15 +78,16 @@ class FakeBus:
                     writer.write(self.signal(serial + 2, h.NOTIFY_NAME, "NotificationClosed", "uu", closed))
             await writer.drain()
 
+    # The bus stamps every message with its sender's unique name.
     @staticmethod
     def reply(serial, fields, signature="", body=None):
-        return h.dbus_message(2, serial, [(5, "u", fields["serial"])], signature,
+        return h.dbus_message(2, serial, [(5, "u", fields["serial"]), (7, "s", ":1.7")], signature,
                               bytes(body.buf) if body else b"")
 
     @staticmethod
-    def signal(serial, interface, member, signature, body):
-        return h.dbus_message(4, serial, [(1, "o", h.NOTIFY_PATH), (2, "s", interface), (3, "s", member)],
-                              signature, bytes(body.buf))
+    def signal(serial, interface, member, signature, body, sender=":1.7"):
+        return h.dbus_message(4, serial, [(1, "o", h.NOTIFY_PATH), (2, "s", interface), (3, "s", member),
+                                          (7, "s", sender)], signature, bytes(body.buf))
 
 
 class Notifications(unittest.TestCase):

@@ -1195,13 +1195,16 @@ async def dbus_connect(path, timeout=5):
     """Open and authenticate a session bus connection (EXTERNAL, as this uid)."""
     # A leading NUL is an abstract socket; asyncio takes those as they are.
     reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(path), timeout)
-    writer.write(b"\0AUTH EXTERNAL " + str(os.getuid()).encode().hex().encode() + b"\r\n")
-    await writer.drain()
-    answer = await asyncio.wait_for(reader.readline(), timeout)
-    if not answer.startswith(b"OK "):
+    try:
+        writer.write(b"\0AUTH EXTERNAL " + str(os.getuid()).encode().hex().encode() + b"\r\n")
+        await writer.drain()
+        answer = await asyncio.wait_for(reader.readline(), timeout)
+        if not answer.startswith(b"OK "):
+            raise ProtectError("the session bus refused the connection")
+        writer.write(b"BEGIN\r\n")
+    except BaseException:
         writer.close()
-        raise ProtectError("the session bus refused the connection")
-    writer.write(b"BEGIN\r\n")
+        raise
     return reader, writer
 
 
@@ -1209,6 +1212,7 @@ class DBusConnection:
     def __init__(self, reader, writer):
         self.reader, self.writer, self.serial = reader, writer, 0
         self.signals = []
+        self.reply_sender = None
 
     async def call(self, destination, path, interface, member, signature="", body=b"", timeout=10):
         self.serial += 1
@@ -1220,6 +1224,7 @@ class DBusConnection:
             if kind in (2, 3) and fields.get(5) == serial:
                 if kind == 3:
                     raise ProtectError(f"D-Bus error: {fields.get(4)}")
+                self.reply_sender = fields.get(7)
                 return values
             if kind == 4:
                 self.signals.append((fields, values))
@@ -1278,13 +1283,16 @@ async def send_desktop_notification(summary, body, image="", actions=(), wait=36
         values = await bus.call(NOTIFY_NAME, NOTIFY_PATH, NOTIFY_NAME, "Notify", "susssasa{sv}i",
                                 notify_body(summary, body, image, list(actions)))
         notification = values[0] if values else None
+        server = bus.reply_sender   # the notification service's unique name
         if not actions:
             return None
 
         async def chosen():
             while True:
                 fields, values = await bus.signal()
-                if not values or values[0] != notification:
+                # Only the service that showed it speaks for the notification.
+                if (fields.get(7) != server or fields.get(2) != NOTIFY_NAME
+                        or fields.get(1) != NOTIFY_PATH or not values or values[0] != notification):
                     continue
                 if fields.get(3) == "ActionInvoked" and len(values) > 1:
                     return values[1]
@@ -2666,6 +2674,8 @@ def cmd_setup_save(args):
     key (to rename it or re-pin its certificate).
     """
     key = sys.stdin.readline().strip()
+    # The panel sends the name on the next line, off the command line.
+    name = sys.stdin.readline().strip() or args.name or ""
     host = normalize_host(args.host)
     config = load_config() or {"consoles": [], "timeoutSec": 8}
     existing = next((c for c in config["consoles"] if c["host"] == host), {})
@@ -2676,7 +2686,7 @@ def cmd_setup_save(args):
     # The pin was shown to the user in step 1; refuse if the console now
     # presents anything else.
     _, cameras = verify_console(config, host, args.pin, key)
-    entry, where = save_console(config, existing, host, args.pin, key, args.name or "")
+    entry, where = save_console(config, existing, host, args.pin, key, name)
     poll_cameras(config)
     print(json.dumps({
         "name": entry["name"],
@@ -2928,6 +2938,17 @@ def cmd_clip(args):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     config = require_config()
     uid = camera_uid(args.camera)
+    if args.start is None:
+        # The panel passes event times in the environment (private to this
+        # user), not on the command line.
+        try:
+            event = json.loads(os.environ.get("ELD_UNIFI_PROTECT_EVENT") or "")
+            args.start = float(event["start"])
+            args.end = float(event["end"]) if event.get("end") else None
+        except (ValueError, TypeError, KeyError):
+            raise ProtectError("give --start (and --end) for the event")
+    if not math.isfinite(args.start) or (args.end is not None and not math.isfinite(args.end)):
+        raise ProtectError("event times must be numbers")
     clip = fetch_clip(config, uid, args.start, args.end, args.quality)
     if args.output:
         shutil.copyfile(clip["path"], args.output)
@@ -3061,7 +3082,7 @@ def camera_name(uid):
 
 def mpv_playlist(title, target):
     """A one-entry M3U playlist: the window title, then target."""
-    title = " ".join(str(title).split()) or "UniFi Protect"
+    title = clean_text(title, "UniFi Protect", 200)
     if "\n" in target or "\r" in target or target.startswith("#"):
         raise ProtectError("unexpected media location")
     return f"#EXTM3U\n#EXTINF:-1,{title}\n{target}\n".encode()
@@ -3460,7 +3481,8 @@ def main():
     p.set_defaults(func=cmd_recordings)
     p = sub.add_parser("clip", help="fetch the recording of an event (see `recordings`)")
     p.add_argument("camera", help="camera uid or name")
-    p.add_argument("--start", type=float, required=True, help="event start, Unix seconds")
+    p.add_argument("--start", type=float, help="event start, Unix seconds "
+                   "(or ELD_UNIFI_PROTECT_EVENT='{\"start\": …, \"end\": …}')")
     p.add_argument("--end", type=float, help="event end; omit for one still in progress")
     p.add_argument("--quality", choices=QUALITIES, default="medium")
     p.add_argument("-o", "--output", help="also save a copy here")

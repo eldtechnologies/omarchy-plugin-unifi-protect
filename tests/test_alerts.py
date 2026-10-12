@@ -231,8 +231,8 @@ class Notifications(unittest.TestCase):
             for uid in uids:
                 listener.notify("nvr", dict(camera, uid=uid), {"id": uid, "kind": "person", "start": 0})
             await asyncio.sleep(0)
-        # Independent of whether this machine has notify-send installed.
-        with mock.patch.object(h.shutil, "which", return_value="/usr/bin/notify-send"):
+        # Independent of whether this machine (or CI) has a session bus.
+        with mock.patch.object(h, "session_bus_path", return_value="/run/user/0/bus"):
             asyncio.run(run())
 
     def test_at_most_one_notification_per_camera_per_minute(self):

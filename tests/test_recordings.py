@@ -216,6 +216,24 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         h.fetch_clip(self.config, f"nvr_{CAMERA}", start, start + 12, "medium")
         self.assertEqual(sum(1 for _, p in FakeConsole.log if p.endswith("/export")), exports)
 
+    def test_clip_times_can_come_from_the_environment(self):
+        # The panel keeps event times off the command line.
+        start = time.time() - 60
+        h.save_config(self.config)
+        args = argparse.Namespace(camera=f"nvr_{CAMERA}", start=None, end=None, quality="low",
+                                  output=None, play=False, title=None, sound="on", json=True)
+        event = json.dumps({"start": start, "end": start + 12})
+        with mock.patch.dict(os.environ, {"ELD_UNIFI_PROTECT_EVENT": event}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            h.cmd_clip(args)
+        self.assertEqual(json.loads(out.getvalue())["start"], start - h.CLIP_PAD)
+        self.assertEqual(int(self.server.last_export["start"][0]), int((start - h.CLIP_PAD) * 1000))
+        args.start = None
+        with mock.patch.dict(os.environ, {"ELD_UNIFI_PROTECT_EVENT": "nonsense"}):
+            with self.assertRaisesRegex(h.ProtectError, "--start"):
+                h.cmd_clip(args)
+        os.remove(h.CONFIG_PATH)
+
     def test_an_error_page_is_not_saved_as_a_clip(self):
         start = time.time() - 60
         with self.assertRaisesRegex(h.ProtectError, "no video"):
