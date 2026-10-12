@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "com.eldtechnologies.unifi-protect",
   "name": "UniFi Protect",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": "ELD Technologies",
   "license": "MIT",
   "description": "Your UniFi Protect cameras in the Omarchy bar: snapshot grid, live video with sound, a camera wall, alerts, and playback of recorded detections, across several consoles.",

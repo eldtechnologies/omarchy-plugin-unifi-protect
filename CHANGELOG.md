@@ -3,7 +3,7 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
-## Unreleased
+## 0.4.1 — 2026-10-12
 
 ### Security
 
@@ -11,7 +11,7 @@ All notable changes to this plugin. The version is set in `manifest.json`;
   the alert's snapshot file, and alert snapshots are only ever read or written
   inside the plugin's alert folder. Before, a console sending an ID with a
   path in it could overwrite a JPEG file elsewhere in your home directory.
-  Reported in the marketplace review.
+  Reported in the marketplace review. (#28)
 
 ## 0.4.0 — 2026-10-12
 
