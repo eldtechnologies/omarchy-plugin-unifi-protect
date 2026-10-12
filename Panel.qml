@@ -153,6 +153,14 @@ Panel {
     return null
   }
 
+  // Stops a run whose answer is no longer wanted. Its exit still arrives,
+  // after anything set up for the next run, so it is counted and skipped.
+  function stopProcess(process) {
+    if (!process.running) return
+    process.stale++
+    process.running = false
+  }
+
   // The recording of the alert when signed in to that console, else live.
   function openAlert(alert) {
     for (var i = 0; i < allCameras.length; i++) {
@@ -236,7 +244,7 @@ Panel {
     // Always ask the CLI: it caches Protect's URLs, and it makes sure the
     // encrypted relay the URL points at is actually running.
     var key = camera.uid + ":" + root.liveQuality
-    if (streamProcess.running) streamProcess.running = false
+    root.stopProcess(streamProcess)
     streamProcess.cameraKey = key
     streamProcess.command = [root.cli, "stream", camera.uid, "--quality", root.liveQuality]
     streamProcess.running = true
@@ -275,7 +283,7 @@ Panel {
   function closeLive() {
     player.stop()
     player.source = ""
-    streamProcess.running = false
+    root.stopProcess(streamProcess)
     root.leaveRecordings()
     root.liveCamera = null
     root.liveError = ""
@@ -363,9 +371,11 @@ Panel {
   function openRecordings(camera, pending, from) {
     if (!camera) return
     if (!root.liveMode) root.muted = !root.soundDefault
+    // Another camera's recordings: drop the old one's runs and sign-in form.
+    root.leaveRecordings()
     player.stop()
     player.source = ""
-    streamProcess.running = false
+    root.stopProcess(streamProcess)
     root.alertsView = false
     root.liveError = ""
     root.liveCamera = camera
@@ -379,13 +389,14 @@ Panel {
     root.recordingIndex = -1
     root.playingClip = null
     root.clipError = ""
-    root.pendingClip = pending ? { start: pending.start, end: pending.end || 0 } : null
+    root.loginError = ""
+    root.pendingClip = pending ? { id: pending.id || "", start: pending.start, end: pending.end || 0 } : null
     if (root.pendingClip) root.playClip(root.pendingClip.start, root.pendingClip.end)
     root.loadRecordings()
   }
 
   function loadRecordings() {
-    recordingsProcess.running = false
+    root.stopProcess(recordingsProcess)
     recordingsProcess.uid = root.liveCamera.uid
     recordingsProcess.command = [root.cli, "recordings", root.liveCamera.uid, "--json"]
     recordingsProcess.running = true
@@ -394,9 +405,9 @@ Panel {
   // Leaves the recordings sub-view without touching the live player.
   function leaveRecordings() {
     if (!root.recordingsView) return
-    recordingsProcess.running = false
-    clipProcess.running = false
-    loginProcess.running = false
+    root.stopProcess(recordingsProcess)
+    root.stopProcess(clipProcess)
+    root.stopProcess(loginProcess)
     loginPasswordField.text = ""
     root.recordingsView = false
     root.playingClip = null
@@ -433,7 +444,7 @@ Panel {
     var args = [root.cli, "clip", root.liveCamera.uid, "--start", String(start),
                 "--quality", root.liveQuality, "--json"]
     if (end) args.push("--end", String(end))
-    clipProcess.running = false
+    root.stopProcess(clipProcess)
     clipProcess.key = root.liveCamera.uid + ":" + start
     clipProcess.eventStart = start
     clipProcess.eventEnd = end
@@ -489,10 +500,13 @@ Panel {
   Process {
     id: recordingsProcess
     property string uid: ""
+    property int stale: 0
     running: false
     stdout: StdioCollector { id: recordingsOut }
     stderr: StdioCollector { id: recordingsErr }
+    onStarted: stale = 0
     onExited: function(exitCode) {
+      if (stale > 0) { stale--; return }
       if (!root.recordingsView || !root.liveCamera || uid !== root.liveCamera.uid) return
       root.recordingsLoaded = true
       if (exitCode !== 0) {
@@ -505,20 +519,27 @@ Panel {
         root.recordingsConsole = result.console || ""
         root.recordingsConsoleName = result.consoleName || ""
         root.recordings = result.events || []
+        root.recordingsError = ""
       } catch (error) {
         root.recordingsError = "Unexpected answer from the helper"
         return
       }
       if (root.recordingsNeedLogin) {
         root.pendingClip = null
-        clipProcess.running = false
+        root.stopProcess(clipProcess)
         Qt.callLater(function() { loginUserField.forceActiveFocus() })
         return
       }
-      // Coming from an alert: select the detection it belongs to.
+      // Coming from an alert: select the detection it belongs to, by its
+      // Protect event id, else the one that started closest to it.
       if (root.pendingClip) {
-        for (var i = 0; i < root.recordings.length; i++)
-          if (Math.abs(root.recordings[i].start - root.pendingClip.start) < 10) root.recordingIndex = i
+        var best = -1
+        for (var i = 0; i < root.recordings.length; i++) {
+          var gap = Math.abs(root.recordings[i].start - root.pendingClip.start)
+          if (root.pendingClip.id !== "" && root.recordings[i].id === root.pendingClip.id) { best = i; break }
+          if (gap < 10 && (best < 0 || gap < Math.abs(root.recordings[best].start - root.pendingClip.start))) best = i
+        }
+        if (best >= 0) root.recordingIndex = best
         root.pendingClip = null
       } else if (root.recordingIndex < 0 && root.recordings.length > 0) {
         // Like Protect's own app: start on the newest detection.
@@ -532,10 +553,13 @@ Panel {
     property string key: ""
     property real eventStart: 0
     property real eventEnd: 0
+    property int stale: 0
     running: false
     stdout: StdioCollector { id: clipOut }
     stderr: StdioCollector { id: clipErr }
+    onStarted: stale = 0
     onExited: function(exitCode) {
+      if (stale > 0) { stale--; return }
       // Ignore a late answer for a clip the user has already left.
       if (!root.recordingsView || key !== root.liveCamera.uid + ":" + eventStart) return
       if (exitCode !== 0) {
@@ -544,6 +568,7 @@ Panel {
       }
       try {
         var clip = JSON.parse(clipOut.text)
+        root.clipError = ""
         root.playingClip = { start: clip.start, end: clip.end, eventStart: eventStart, eventEnd: eventEnd }
         player.source = "file://" + clip.path
         player.play()
@@ -556,15 +581,20 @@ Panel {
   Process {
     id: loginProcess
     property string secret: ""
+    property int stale: 0
     running: false
     stdinEnabled: true
     stdout: StdioCollector { id: loginOut }
     stderr: StdioCollector { id: loginErr }
     onStarted: {
+      stale = 0
       write(secret)
       secret = ""
     }
     onExited: function(exitCode) {
+      // Left while signing in: nothing to report, and the form is hidden.
+      if (stale > 0) { stale--; return }
+      if (!root.recordingsView) return
       if (exitCode !== 0) {
         root.loginError = root.helperError(loginErr.text, "Could not sign in")
         Qt.callLater(function() { loginPasswordField.forceActiveFocus() })
@@ -899,10 +929,13 @@ Panel {
   Process {
     id: streamProcess
     property string cameraKey: ""
+    property int stale: 0
     running: false
     stdout: StdioCollector { id: streamOut }
     stderr: StdioCollector { id: streamErr }
+    onStarted: stale = 0
     onExited: function(exitCode) {
+      if (stale > 0) { stale--; return }
       if (!root.liveMode) return
       if (exitCode !== 0) {
         root.liveError = streamErr.text.trim().replace(/^eld-unifi-protect: /, "")
@@ -1045,7 +1078,7 @@ Panel {
           var selected = root.selectedRecording
           var current = root.playingClip && selected && root.playingClip.eventStart === selected.start
           if ((enter || !root.playingClip) && !current) root.playRecording(root.recordingIndex)
-          else if (current && player.mediaStatus === MediaPlayer.EndOfMedia) {
+          else if (current && (enter || player.mediaStatus === MediaPlayer.EndOfMedia)) {
             player.setPosition(0)
             player.play()
           }

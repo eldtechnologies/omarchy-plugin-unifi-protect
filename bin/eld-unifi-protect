@@ -1513,7 +1513,10 @@ def login_password(console):
     if console.get("loginStore") == "keyring":
         cache_key = (LOGIN_SERVICE, console["id"])
         if cache_key not in _key_cache:
-            result = _secret_tool(["lookup", "service", LOGIN_SERVICE, "console", console["id"]])
+            try:
+                result = _secret_tool(["lookup", "service", LOGIN_SERVICE, "console", console["id"]])
+            except KeyringUnavailable as error:
+                raise ProtectError(f"cannot read the login password from the keyring: {error}")
             _key_cache[cache_key] = result.stdout if result.returncode == 0 else ""
         return _key_cache[cache_key]
     return console.get("loginPassword", "")
@@ -1536,6 +1539,12 @@ def store_login(console, user, password):
         console.pop("loginPassword", None)
         return "keyring"
     except KeyringUnavailable:
+        # A password stored earlier must not outlive the one that replaced it.
+        _key_cache.pop((LOGIN_SERVICE, console["id"]), None)
+        try:
+            _secret_tool(["clear", "service", LOGIN_SERVICE, "console", console["id"]])
+        except KeyringUnavailable:
+            pass
         console.pop("loginStore", None)
         console["loginPassword"] = password
         return "file"
@@ -1570,10 +1579,17 @@ def forget_session(console_id):
 
 
 def token_expiry(token):
-    """The exp claim of a UniFi OS session token (a JWT), or an hour from now."""
+    """When a UniFi OS session token (a JWT) runs out, by this machine's clock.
+
+    The token's lifetime (exp - iat) counts from now, so a desktop clock that
+    is off from the console's neither expires sessions early nor keeps dead
+    ones. Without iat, exp itself; without either, an hour from now.
+    """
     try:
         payload = token.split(".")[1]
         claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        if "iat" in claims:
+            return time.time() + float(claims["exp"]) - float(claims["iat"])
         return float(claims["exp"])
     except (IndexError, KeyError, TypeError, ValueError):
         return time.time() + 3600
@@ -1593,12 +1609,15 @@ def event_kind(event):
 
 
 def clip_window(start, end, now=None):
-    """The (start, end) seconds to export for an event: padded and capped."""
+    """The (start, end) seconds to export for an event: padded and capped.
+
+    Event times come from the console's clock, so this machine's clock only
+    bounds an event still in progress, and never ends a clip before it starts.
+    """
     now = now or time.time()
     if not end:
-        end = min(now, start + CLIP_ONGOING_SECONDS)
-    end = min(end, start + CLIP_MAX_SECONDS)
-    return start - CLIP_PAD, min(now, end + CLIP_PAD)
+        return start - CLIP_PAD, max(start + CLIP_PAD, min(now, start + CLIP_ONGOING_SECONDS))
+    return start - CLIP_PAD, min(end, start + CLIP_MAX_SECONDS) + CLIP_PAD
 
 
 def clip_path(uid, start, end, quality):
@@ -1609,9 +1628,19 @@ def clip_path(uid, start, end, quality):
 def prune_clips(keep_path=None):
     """Oldest-used clips go first once there are too many or they take too much RAM."""
     try:
-        entries = [os.path.join(CLIPS_DIR, n) for n in os.listdir(CLIPS_DIR) if n.endswith(".mp4")]
+        names = os.listdir(CLIPS_DIR)
     except FileNotFoundError:
         return
+    # Downloads cut short leave a .part behind; one untouched for ten minutes
+    # is not coming back.
+    for name in names:
+        path = os.path.join(CLIPS_DIR, name)
+        try:
+            if name.endswith(".part") and os.stat(path).st_mtime < time.time() - 600:
+                os.remove(path)
+        except FileNotFoundError:
+            pass
+    entries = [os.path.join(CLIPS_DIR, n) for n in names if n.endswith(".mp4")]
     entries.sort(key=lambda p: os.stat(p).st_mtime, reverse=True)
     total = 0
     for index, path in enumerate(entries):
@@ -1641,6 +1670,8 @@ class ProtectSession:
         self.pin = console.get("certSha256")
         self.timeout = float((config or {}).get("timeoutSec", 8))
         self.session = load_sessions().get(console["id"])
+        # Thumbnails are fetched four at a time through one session.
+        self.lock = threading.Lock()
 
     def _send(self, method, path, body=None, params=None, headers=None, timeout=None):
         url = path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
@@ -1701,16 +1732,21 @@ class ProtectSession:
         UniFi OS locks accounts out after a burst of those.
         """
         for attempt in range(2):
-            if not self.session or self.session.get("expires", 0) < time.time() + 60:
-                self.login()
-            headers = {"Cookie": f"TOKEN={self.session['token']}", "Accept": "*/*"}
-            if self.session.get("csrf"):
-                headers["X-CSRF-Token"] = self.session["csrf"]
+            with self.lock:
+                if not self.session or self.session.get("expires", 0) < time.time() + 60:
+                    self.login()
+                session = self.session
+            headers = {"Cookie": f"TOKEN={session['token']}", "Accept": "*/*"}
+            if session.get("csrf"):
+                headers["X-CSRF-Token"] = session["csrf"]
             conn, response = self._send("GET", PRIVATE_API + path, params=params,
                                         headers=headers, timeout=timeout)
             if response.status == 401 and attempt == 0:
                 conn.close()
-                self.session = None
+                with self.lock:
+                    # Another thread may have signed in again already.
+                    if self.session is session:
+                        self.session = None
                 continue
             if response.status == 200:
                 return conn, response
@@ -1807,11 +1843,11 @@ class DemoSession:
         events, at = [], until - rng.uniform(120, 900)
         while at > since and len(events) < 14:
             length = rng.uniform(6, 48)
-            events.append({"id": f"demo{len(events)}{camera_id[:8]}", "kind": rng.choice(kinds),
+            events.append({"id": f"demo{len(events)}{(camera_id or '')[:8]}", "kind": rng.choice(kinds),
                            "start": at, "end": at + length, "score": rng.randint(70, 98)})
             at -= rng.uniform(900, 7200)
         if motion:
-            events.append({"id": f"demom{camera_id[:8]}", "kind": "motion", "start": until - 1800,
+            events.append({"id": f"demom{(camera_id or '')[:8]}", "kind": "motion", "start": until - 1800,
                            "end": until - 1790, "score": None})
             events.sort(key=lambda e: e["start"], reverse=True)
         return events
@@ -1825,10 +1861,18 @@ class DemoSession:
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise ProtectError("demo mode needs ffmpeg")
-        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", os.path.join(DEMO_DIR, f"{camera_id}.mp4"),
-                        "-t", f"{min(end - start, 59):.1f}", "-c", "copy", "-f", "mp4", path],
-                       check=True, capture_output=True)
-        os.chmod(path, 0o600)
+        partial = f"{path}.{os.getpid()}.part"
+        try:
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", os.path.join(DEMO_DIR, f"{camera_id}.mp4"),
+                            "-t", f"{min(end - start, 59):.1f}", "-c", "copy", "-f", "mp4", partial],
+                           check=True, capture_output=True)
+            os.chmod(partial, 0o600)
+            os.replace(partial, path)
+        except subprocess.CalledProcessError as error:
+            raise ProtectError(f"demo clip failed: {error.stderr.decode(errors='replace').strip()}")
+        finally:
+            if os.path.exists(partial):
+                os.remove(partial)
 
 
 def recordings_for(config, uid, hours=24, motion=False):
@@ -2282,6 +2326,7 @@ def cmd_remove(args):
         raise ProtectError("not changed")
     config["consoles"].remove(console)
     clear_login(console)
+    forget_recordings(console["id"])
     if console.get("keyStore") == "keyring":
         try:
             keyring_clear(console["id"])
@@ -2341,6 +2386,8 @@ def cmd_login(args):
     """
     config = require_config()
     console = find_console(config, args.console)
+    if console.get("demo"):
+        raise ProtectError("demo consoles need no login")
     if args.stdin:
         user = sys.stdin.readline().strip()
         password = sys.stdin.readline().rstrip("\n")
@@ -2364,6 +2411,8 @@ def cmd_login(args):
         for field in ("loginUser", "loginPassword"):
             console.pop(field, None)
         console.update(previous)
+        # The trial sign-in may have saved a session for the rejected account.
+        forget_session(console["id"])
         raise
     where = store_login(console, user, password)
     save_config(config)
@@ -2375,6 +2424,14 @@ def cmd_login(args):
               + ("your keyring." if where == "keyring" else f"{CONFIG_PATH}."))
 
 
+def forget_recordings(console_id):
+    """Delete what was fetched from a console; clips are not labelled by console."""
+    shutil.rmtree(CLIPS_DIR, ignore_errors=True)
+    for name in os.listdir(RECORDINGS_DIR) if os.path.isdir(RECORDINGS_DIR) else []:
+        if name.startswith(console_id + "_"):
+            shutil.rmtree(os.path.join(RECORDINGS_DIR, name), ignore_errors=True)
+
+
 def cmd_logout(args):
     config = require_config()
     console = find_console(config, args.console)
@@ -2383,11 +2440,7 @@ def cmd_logout(args):
         return
     clear_login(console)
     save_config(config)
-    # Recordings already fetched go too; clips are not labelled by console.
-    shutil.rmtree(CLIPS_DIR, ignore_errors=True)
-    for name in os.listdir(RECORDINGS_DIR) if os.path.isdir(RECORDINGS_DIR) else []:
-        if name.startswith(console["id"] + "_"):
-            shutil.rmtree(os.path.join(RECORDINGS_DIR, name), ignore_errors=True)
+    forget_recordings(console["id"])
     poll_cameras(config)
     print(f"Signed out of {console['name']}; its login and fetched recordings are removed.")
 
@@ -2410,6 +2463,9 @@ def cmd_recordings(args):
 
 
 def cmd_clip(args):
+    # The panel stops a download it no longer wants with SIGTERM; exit through
+    # the finally blocks so the half-written file goes too.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     config = require_config()
     uid = camera_uid(args.camera)
     clip = fetch_clip(config, uid, args.start, args.end, args.quality)

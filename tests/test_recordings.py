@@ -4,9 +4,11 @@ A local TLS server with a throwaway certificate plays the console: the
 UniFi OS sign-in and the Protect endpoints the web app uses.
 """
 
+import argparse
 import base64
 import hashlib
 import http.server
+import io
 import json
 import os
 import shutil
@@ -17,6 +19,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+from unittest import mock
 
 from helpers import helper as h
 
@@ -35,6 +38,7 @@ class FakeConsole(http.server.BaseHTTPRequestHandler):
     log = []            # (method, path) of every request
     logins = 0
     valid = set()       # session tokens the console accepts
+    no_role = set()     # tokens of an account that may not see Protect
     password = "right"
 
     def log_message(self, *args):
@@ -54,10 +58,10 @@ class FakeConsole(http.server.BaseHTTPRequestHandler):
         if self.path != "/api/auth/login":
             return self.reply(404)
         FakeConsole.logins += 1
-        if body.get("username") != "viewer" or body.get("password") != FakeConsole.password:
+        if body.get("username") not in ("viewer", "norole") or body.get("password") != FakeConsole.password:
             return self.reply(401, b'{"code":"AUTHENTICATION_FAILED"}')
         token = jwt(time.time() + 7200) + str(FakeConsole.logins)
-        FakeConsole.valid.add(token)
+        (FakeConsole.no_role if body["username"] == "norole" else FakeConsole.valid).add(token)
         self.reply(200, b"{}", [("Set-Cookie", f"TOKEN={token}; path=/; HttpOnly"),
                                 ("X-Updated-CSRF-Token", "csrf-1")])
 
@@ -66,6 +70,8 @@ class FakeConsole(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(url.query)
         FakeConsole.log.append(("GET", url.path))
         token = (self.headers.get("Cookie") or "").removeprefix("TOKEN=")
+        if token in FakeConsole.no_role:
+            return self.reply(403)
         if token not in FakeConsole.valid:
             return self.reply(401)
         if url.path == "/proxy/protect/api/events":
@@ -116,6 +122,7 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         FakeConsole.log.clear()
         FakeConsole.logins = 0
         FakeConsole.valid.clear()
+        FakeConsole.no_role.clear()
         FakeConsole.password = "right"
         for path in (h.SESSIONS_PATH,):
             if os.path.exists(path):
@@ -160,6 +167,20 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         self.assertTrue(result["needsLogin"])
         self.assertEqual(FakeConsole.log, [])
 
+    def test_a_rejected_login_keeps_the_working_one(self):
+        h.recordings_for(self.config, f"nvr_{CAMERA}")
+        h.save_config(self.config)
+        args = argparse.Namespace(console="nvr", stdin=True, json=True)
+        with mock.patch.object(h.sys, "stdin", io.StringIO("norole\nright\n")):
+            with self.assertRaisesRegex(h.ProtectError, "may not view recordings"):
+                h.cmd_login(args)
+        # The trial session is gone, so the old account signs in afresh.
+        self.assertNotIn("nvr", h.load_sessions())
+        config = h.load_config()
+        self.assertEqual(config["consoles"][0]["loginUser"], "viewer")
+        self.assertEqual(len(h.recordings_for(config, f"nvr_{CAMERA}")["events"]), 2)
+        os.remove(h.CONFIG_PATH)
+
     def test_clip_export_and_cache(self):
         start = time.time() - 60
         clip = h.fetch_clip(self.config, f"nvr_{CAMERA}", start, start + 12, "medium")
@@ -189,6 +210,29 @@ class ClipRules(unittest.TestCase):
     def test_ongoing_event_takes_what_exists_so_far(self):
         self.assertEqual(h.clip_window(1000, None, now=1020), (1000 - h.CLIP_PAD, 1020))
 
+    def test_a_slow_desktop_clock_does_not_cut_the_clip(self):
+        # The console says the event ran 1020-1025; this machine thinks it is 1000.
+        self.assertEqual(h.clip_window(1020, 1025, now=1000), (1020 - h.CLIP_PAD, 1025 + h.CLIP_PAD))
+        start, end = h.clip_window(1020, None, now=1000)
+        self.assertGreater(end, start)
+
+    def test_stale_partial_downloads_are_pruned(self):
+        os.makedirs(h.CLIPS_DIR, exist_ok=True)
+        old, fresh = (os.path.join(h.CLIPS_DIR, f"{n}.mp4.1.part") for n in ("old", "fresh"))
+        for path in (old, fresh):
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+        os.utime(old, (1000, 1000))
+        h.prune_clips()
+        self.assertEqual(os.listdir(h.CLIPS_DIR), ["fresh.mp4.1.part"])
+        shutil.rmtree(h.CLIPS_DIR)
+
+    def test_a_locked_keyring_is_a_clean_error(self):
+        console = {"id": "locked", "loginStore": "keyring", "loginUser": "viewer"}
+        with mock.patch.object(h, "_secret_tool", side_effect=h.KeyringUnavailable("locked")):
+            with self.assertRaisesRegex(h.ProtectError, "keyring"):
+                h.login_password(console)
+
     def test_event_kinds(self):
         self.assertEqual(h.event_kind({"type": "smartDetectLine", "smartDetectTypes": ["animal"]}), "animal")
         self.assertEqual(h.event_kind({"type": "smartDetectZone", "smartDetectTypes": []}), "motion")
@@ -196,6 +240,9 @@ class ClipRules(unittest.TestCase):
 
     def test_session_expiry_comes_from_the_token(self):
         self.assertEqual(h.token_expiry(jwt(1234567890)), 1234567890)
+        # With iat, the lifetime counts from this machine's clock.
+        claims = base64.urlsafe_b64encode(json.dumps({"iat": 1000, "exp": 8200}).encode()).decode().rstrip("=")
+        self.assertAlmostEqual(h.token_expiry(f"e30.{claims}.sig"), time.time() + 7200, delta=5)
         self.assertGreater(h.token_expiry("not-a-jwt"), time.time())
 
     def test_pruning_keeps_the_newest(self):

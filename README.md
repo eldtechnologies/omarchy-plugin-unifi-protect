@@ -249,7 +249,8 @@ The password is kept like the API key: in your keyring, or in a file only you
 can read when there is no keyring. `eld-unifi-protect logout <console>`
 removes it. Clips are exported by Protect as MP4, padded by 3 seconds either
 side and capped at 5 minutes. They are kept in memory (the runtime
-directory), at most 25 clips or 600 MB, and are gone at logout or reboot.
+directory), at most 25 clips or 600 MB, and are gone at logout, when the
+console is removed, or at reboot.
 
 ```bash
 eld-unifi-protect login nvr                       # username, password prompt
