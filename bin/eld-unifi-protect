@@ -587,10 +587,14 @@ def read_rtsp(reader):
             break
         name, _, value = line.partition(":")
         headers.append((name.strip(), value.strip()))
+        if len(headers) > RTSP_MAX_HEADERS:
+            return None
     length = 0
     for name, value in headers:
         if name.lower() == "content-length":
             length = int(value or 0)
+    if length < 0 or length > RTSP_MAX_UPSTREAM_BODY:
+        return None
     body = read_exact(reader, length) if length else b""
     if body is None:
         return None
@@ -3058,7 +3062,8 @@ def cmd_migrate_keys(args):
         raise ProtectError(f"{moved} key(s) moved, but the keyring refused the key for "
                            f"{', '.join(left)}; it is still in {CONFIG_PATH}")
     where = "your keyring" if args.to == "keyring" else CONFIG_PATH
-    print(f"{moved} key(s) moved; all keys are now in {where}")
+    print(f"{moved} key(s) moved; all API keys are now in {where} "
+          "(recordings logins stay where `login` put them)")
 
 
 def camera_uid(wanted):

@@ -6,7 +6,8 @@ camera live at once, and a pop-out player. Works with several consoles at
 once, such as a gateway and a dedicated NVR, and is set up from the panel
 itself. Arm a camera to be alerted when it sees a person, a vehicle or a
 doorbell ring, and play back what each camera recorded. Video travels
-encrypted, and API keys are kept in your keyring.
+encrypted, and API keys are kept in your keyring (or a file only you can
+read).
 
 In the bar it is a single camera icon. It pulses in your theme's urgent
 colour when an armed camera has seen something, turns that colour when a
@@ -371,9 +372,11 @@ streams.
   The relay checks the same pinned certificate as the API, forces all media
   over the encrypted TCP connection (it refuses UDP, and FFmpeg falls back),
   listens only on 127.0.0.1, and requires a random per-session token in every
-  URL, so other local users cannot borrow it. It starts on demand and exits
-  after a minute without viewers. The only unencrypted hop is loopback inside
-  your machine.
+  URL, so other local users cannot borrow it. Those URLs never contain the
+  camera's Protect stream alias, only a random route id that the relay maps
+  back privately, so nothing a player is given could be used against the
+  console. The relay starts on demand and exits after a minute without
+  viewers. The only unencrypted hop is loopback inside your machine.
 - **Streams get switched on:** if a camera has no stream yet for the quality
   you open, the plugin enables one, the same as turning on RTSP in the
   camera's Protect settings. It stays enabled. To forbid that, turn on

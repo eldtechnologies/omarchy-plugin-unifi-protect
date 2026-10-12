@@ -5,35 +5,48 @@ All notable changes to this plugin. The version is set in `manifest.json`;
 
 ## Unreleased
 
+A security release: two findings from the marketplace review, and a full
+review of the plugin that followed.
+
 ### Security
 
-- Notifications no longer run `notify-send` with the camera, console and
-  time in its command line, where other local users could read them for as
-  long as the notification stayed up. The helper now sends them to the
-  notification service over D-Bus itself.
-- mpv pop-out and clip windows get their title on stdin rather than as
-  `--title`, and the panel no longer passes camera names to the helper.
+- **No private details in command lines,** which every local user can read.
+  Notifications no longer run `notify-send` with the camera, console and
+  time for as long as they are shown; the helper sends them to the
+  notification service over D-Bus itself. mpv gets its title and video on
+  stdin; the panel passes event times in the environment and the console
+  name typed at setup on stdin. Keyring labels carry only the console id.
   Reported in the marketplace review.
-- The stream relay is trusted only while it holds its lock. Before, once it
-  exited after a minute idle, another local user could listen on its old
-  port and receive the next stream request, including the camera's stream
-  alias. Each relay start now gets a fresh token, and requests without the
-  token are cut off early and kept small.
-- The camera wall shows camera names and errors as plain text; a name
-  written as HTML could make it load an image from any address.
-- Text a console sends is stripped of terminal escape sequences before it
-  is printed.
-- Everything a console sends is size-limited and checked: API responses,
-  event-stream messages, and event times (NaN or Infinity could break the
-  alert log).
-- The wall toggle only ever signals the wall it started, never another
+- **Stream relay.** Loopback stream URLs no longer contain the camera's
+  Protect stream alias, only a random route id the relay maps back
+  privately. Before, once the relay exited after a minute idle, another
+  local user could listen on its old port and collect the alias from the
+  next player. The relay is now trusted only while it holds its lock, gets
+  a fresh token every start, never exits right after being handed out, and
+  caps and times out connections that have not shown the token.
+- **The camera wall shows text as plain text;** a camera name written as
+  HTML could make it load an image from any address.
+- **Console input is bounded and checked:** API responses (16 MiB, 60 s),
+  event-stream messages (1 MiB, with a time limit once begun), event and
+  token times (no NaN or Infinity, which broke the alert log), and the
+  shapes of camera lists, event lists and server info. Text a console sends
+  is stripped of terminal escape sequences wherever it is printed.
+- **The wall toggle** only ever signals the wall it started, never another
   process that reused its pid.
-- Files are created with their final permissions; cameras.json is now 0600.
-- After a failed recordings sign-in, nothing tries again behind your back,
-  and `logout` also ends the session on the console.
-- `migrate-keys` reports keys the keyring refused, and keyring labels no
-  longer contain console names or addresses.
-- CI actions are pinned to commits.
+- **Recordings sign-in:** a rejected login is remembered for ten minutes
+  across all helper processes instead of being retried (UniFi OS locks
+  accounts after repeated failures), and the panel asks for it again.
+  Dropping a login in any way also signs its session out on the console.
+- **Files** are created with their final permissions; cameras.json is now
+  0600. `migrate-keys` reports keys the keyring refused.
+- **CI** actions are pinned to commits.
+
+### Fixed
+
+- The camera wall recovers when its streams drop: a retry with the same URL
+  used to freeze on the last frame instead of reconnecting, and after
+  repeated failures it now asks for a fresh URL.
+- `snapshot -o` accepts a bare file name.
 
 ## 0.4.1 — 2026-10-12
 

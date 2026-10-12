@@ -281,8 +281,8 @@ ShellRoot {
             color: Qt.rgba(0, 0, 0, 0.55)
 
             Text {
-              textFormat: Text.PlainText
               id: label
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               text: (tile.index < 9 ? (tile.index + 1) + "  " : "") + tile.modelData.name
                     + (shell.multiConsole ? "  ·  " + tile.modelData.consoleName : "")
@@ -327,8 +327,8 @@ ShellRoot {
           color: Qt.rgba(0, 0, 0, 0.55)
 
           Text {
-            textFormat: Text.PlainText
             id: focusLabel
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             text: "● " + (shell.focusedCamera ? shell.focusedCamera.name : "")
                   + (shell.multiConsole && shell.focusedCamera ? "  ·  " + shell.focusedCamera.consoleName : "")
@@ -359,8 +359,8 @@ ShellRoot {
       Behavior on opacity { NumberAnimation { duration: 300 } }
 
       Text {
-        textFormat: Text.PlainText
         id: hints
+        textFormat: Text.PlainText
         anchors.centerIn: parent
         text: shell.focusedIndex >= 0
               ? "←/→ next camera  ·  M mute  ·  Esc or click back to grid  ·  Q close"
