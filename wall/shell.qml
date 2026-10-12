@@ -153,6 +153,8 @@ ShellRoot {
     }
 
     Text {
+      // Console text: never let Qt read it as HTML (an <img> would load).
+      textFormat: Text.PlainText
       anchors.centerIn: parent
       visible: !stream.live
       text: stream.error !== "" ? stream.error + " · retrying" : "Connecting…"
@@ -219,6 +221,7 @@ ShellRoot {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             visible: !!tile.modelData.error
             text: tile.modelData.error || ""
@@ -236,6 +239,7 @@ ShellRoot {
             color: Qt.rgba(0, 0, 0, 0.55)
 
             Text {
+              textFormat: Text.PlainText
               id: label
               anchors.centerIn: parent
               text: (tile.index < 9 ? (tile.index + 1) + "  " : "") + tile.modelData.name
@@ -279,6 +283,7 @@ ShellRoot {
           color: Qt.rgba(0, 0, 0, 0.55)
 
           Text {
+            textFormat: Text.PlainText
             id: focusLabel
             anchors.centerIn: parent
             text: "● " + (shell.focusedCamera ? shell.focusedCamera.name : "")
@@ -310,6 +315,7 @@ ShellRoot {
       Behavior on opacity { NumberAnimation { duration: 300 } }
 
       Text {
+        textFormat: Text.PlainText
         id: hints
         anchors.centerIn: parent
         text: shell.focusedIndex >= 0
