@@ -8,8 +8,8 @@ import qs.Ui
 
 // UniFi Protect popup.
 //
-// Two views share the card: a grid of camera snapshots, and a live view of
-// one camera. The panel never speaks HTTP. `eld-unifi-protect` polls the
+// Three views share the card: a grid of camera snapshots, a live view of
+// one camera, and that camera's recorded detections. The panel never speaks HTTP. `eld-unifi-protect` polls the
 // console, writes state and snapshots to disk, and resolves stream URLs; the
 // panel watches those files and plays the RTSPS stream with QtMultimedia.
 //
@@ -134,7 +134,8 @@ Panel {
 
   function alertLabel(kind) {
     return { person: "Person", vehicle: "Vehicle", animal: "Animal", package: "Package",
-             ring: "Doorbell", motion: "Motion" }[kind] || kind
+             ring: "Doorbell", motion: "Motion", audio: "Sound", face: "Face",
+             licensePlate: "Licence plate" }[kind] || kind
   }
 
   function ago(seconds) {
@@ -152,11 +153,16 @@ Panel {
     return null
   }
 
-  function openAlertLive(alert) {
+  // The recording of the alert when signed in to that console, else live.
+  function openAlert(alert) {
     for (var i = 0; i < allCameras.length; i++) {
       if (allCameras[i].uid === alert.uid) {
-        root.alertsView = false
-        root.openLive(allCameras[i])
+        if (root.consoleHasRecordings(allCameras[i].console)) {
+          root.openRecordings(allCameras[i], alert, "alerts")
+        } else {
+          root.alertsView = false
+          root.openLive(allCameras[i])
+        }
         return
       }
     }
@@ -216,6 +222,7 @@ Panel {
     // Coming from the grid starts at the default; M carries over while
     // flipping between cameras.
     if (!root.liveMode) root.muted = !root.soundDefault
+    root.leaveRecordings()
     root.alertsView = false
     root.liveError = ""
     root.liveCamera = camera
@@ -247,6 +254,18 @@ Panel {
     root.open()
   }
 
+  function openRecordingsByName(name) {
+    var wanted = String(name || "").toLowerCase()
+    for (var i = 0; i < allCameras.length; i++) {
+      if (allCameras[i].name.toLowerCase() === wanted || allCameras[i].uid === name || allCameras[i].id === name) {
+        root.open()
+        root.openRecordings(allCameras[i], null, "live")
+        return
+      }
+    }
+    root.open()
+  }
+
   function stepLive(delta) {
     if (cameras.length === 0) return
     var next = (root.selectedIndex + delta + cameras.length) % cameras.length
@@ -257,12 +276,17 @@ Panel {
     player.stop()
     player.source = ""
     streamProcess.running = false
+    root.leaveRecordings()
     root.liveCamera = null
     root.liveError = ""
   }
 
   function popOut(camera) {
     if (!camera) return
+    if (root.recordingsView) {
+      root.popOutClip()
+      return
+    }
     // From the live view the pop-out keeps its sound state; from the grid it
     // starts at the default.
     var sound = root.liveMode ? !root.muted : root.soundDefault
@@ -277,6 +301,280 @@ Panel {
     if (cameras.length === 0) return
     var next = root.selectedIndex + dx + dy * root.columns
     root.selectedIndex = Math.max(0, Math.min(cameras.length - 1, next))
+  }
+
+  // ---- recordings ----
+  //
+  // A sub-view of one camera: `recordings` lists its detections of the last
+  // day with thumbnails, `clip` exports one from Protect into the runtime
+  // directory, and the same player that shows live video plays the file.
+  // Protect only hands out recordings to a signed-in user, not to an API
+  // key, so a console without a login shows a sign-in form instead.
+  property bool recordingsView: false
+  property string recordingsReturn: "live"     // where Esc goes: "live" or "alerts"
+  property var recordings: []                   // newest first
+  property bool recordingsLoaded: false
+  property string recordingsError: ""
+  property bool recordingsNeedLogin: false
+  property string recordingsConsole: ""
+  property string recordingsConsoleName: ""
+  property int recordingIndex: -1
+  property var pendingClip: null                // an alert to play once the list is in
+  property var playingClip: null                // {start, end, eventStart, eventEnd}
+  property string clipError: ""
+  property string loginError: ""
+  property bool enterPressed: false
+  readonly property bool fetchingClip: clipProcess.running
+  readonly property bool clipLoaded: recordingsView && playingClip !== null
+                                     && player.mediaStatus !== MediaPlayer.NoMedia
+                                     && player.mediaStatus !== MediaPlayer.LoadingMedia
+                                     && player.mediaStatus !== MediaPlayer.InvalidMedia
+                                     && player.mediaStatus !== MediaPlayer.EndOfMedia
+  readonly property var selectedRecording: recordingIndex >= 0 && recordingIndex < recordings.length
+                                           ? recordings[recordingIndex] : null
+
+  function consoleHasRecordings(consoleId) {
+    for (var i = 0; i < consoles.length; i++)
+      if (consoles[i].id === consoleId) return consoles[i].recordings === true
+    return false
+  }
+
+  function consoleHost(consoleId) {
+    for (var i = 0; i < consoles.length; i++) if (consoles[i].id === consoleId) return consoles[i].host
+    return ""
+  }
+
+  function eventWhen(seconds) {
+    var date = new Date(seconds * 1000)
+    var today = new Date()
+    var day = date.toDateString() === today.toDateString() ? ""
+            : date.toDateString() === new Date(today.getTime() - 86400000).toDateString() ? "Yesterday "
+            : Qt.formatDate(date, "ddd ")
+    return day + Qt.formatTime(date, "HH:mm:ss")
+  }
+
+  function clock(ms) {
+    var total = Math.max(0, Math.floor(ms / 1000))
+    var seconds = total % 60
+    return Math.floor(total / 60) + ":" + (seconds < 10 ? "0" : "") + seconds
+  }
+
+  // pending: an alert ({start, end}) to play straight away; from: where Esc returns.
+  function openRecordings(camera, pending, from) {
+    if (!camera) return
+    if (!root.liveMode) root.muted = !root.soundDefault
+    player.stop()
+    player.source = ""
+    streamProcess.running = false
+    root.alertsView = false
+    root.liveError = ""
+    root.liveCamera = camera
+    for (var i = 0; i < cameras.length; i++) if (cameras[i].uid === camera.uid) root.selectedIndex = i
+    root.recordingsView = true
+    root.recordingsReturn = from || "live"
+    root.recordings = []
+    root.recordingsLoaded = false
+    root.recordingsError = ""
+    root.recordingsNeedLogin = false
+    root.recordingIndex = -1
+    root.playingClip = null
+    root.clipError = ""
+    root.pendingClip = pending ? { start: pending.start, end: pending.end || 0 } : null
+    if (root.pendingClip) root.playClip(root.pendingClip.start, root.pendingClip.end)
+    root.loadRecordings()
+  }
+
+  function loadRecordings() {
+    recordingsProcess.running = false
+    recordingsProcess.uid = root.liveCamera.uid
+    recordingsProcess.command = [root.cli, "recordings", root.liveCamera.uid, "--json"]
+    recordingsProcess.running = true
+  }
+
+  // Leaves the recordings sub-view without touching the live player.
+  function leaveRecordings() {
+    if (!root.recordingsView) return
+    recordingsProcess.running = false
+    clipProcess.running = false
+    loginProcess.running = false
+    loginPasswordField.text = ""
+    root.recordingsView = false
+    root.playingClip = null
+    root.pendingClip = null
+    root.clipError = ""
+    root.loginError = ""
+    player.stop()
+    player.source = ""
+    keyCatcher.forceActiveFocus()
+  }
+
+  // Esc: back to the alert log, or to the camera's live view.
+  function backFromRecordings() {
+    if (root.recordingsReturn === "alerts") {
+      root.closeLive()
+      root.alertsView = true
+    } else {
+      root.openLive(root.liveCamera)
+    }
+  }
+
+  function playRecording(index) {
+    var event = root.recordings[index]
+    if (!event) return
+    root.recordingIndex = index
+    root.playClip(event.start, event.end || 0)
+  }
+
+  function playClip(start, end) {
+    player.stop()
+    player.source = ""
+    root.clipError = ""
+    root.playingClip = null
+    var args = [root.cli, "clip", root.liveCamera.uid, "--start", String(start),
+                "--quality", root.liveQuality, "--json"]
+    if (end) args.push("--end", String(end))
+    clipProcess.running = false
+    clipProcess.key = root.liveCamera.uid + ":" + start
+    clipProcess.eventStart = start
+    clipProcess.eventEnd = end
+    clipProcess.command = args
+    clipProcess.running = true
+  }
+
+  // Space: pause and resume; at the end, play again from the start.
+  function togglePause() {
+    if (!root.playingClip) return
+    if (player.playbackState === MediaPlayer.PlayingState) player.pause()
+    else player.play()
+  }
+
+  function seekBy(seconds) {
+    if (!root.clipLoaded || !player.seekable) return
+    player.setPosition(Math.max(0, Math.min(player.duration - 100, player.position + seconds * 1000)))
+  }
+
+  function moveRecording(delta) {
+    if (root.recordings.length === 0) return
+    var next = root.recordingIndex < 0 ? 0 : root.recordingIndex + delta
+    root.recordingIndex = Math.max(0, Math.min(root.recordings.length - 1, next))
+    recordingsList.positionViewAtIndex(root.recordingIndex, ListView.Contain)
+  }
+
+  // The clip in mpv at the pop-out quality: a separate export, then seekable.
+  function popOutClip() {
+    if (!root.playingClip) return
+    var clip = root.playingClip
+    var args = [root.cli, "clip", root.liveCamera.uid, "--start", String(clip.eventStart),
+                "--quality", root.popoutQuality, "--play", "--title", root.liveCamera.name,
+                "--sound", root.muted ? "off" : "on"]
+    if (clip.eventEnd) args.push("--end", String(clip.eventEnd))
+    Quickshell.execDetached(args)
+    root.closeLive()
+    root.close()
+  }
+
+  function signIn() {
+    if (loginProcess.running) return
+    if (loginUserField.text.trim() === "" || loginPasswordField.text === "") {
+      root.loginError = "Enter the username and the password"
+      return
+    }
+    root.loginError = ""
+    loginProcess.secret = loginUserField.text.trim() + "\n" + loginPasswordField.text + "\n"
+    loginPasswordField.text = ""
+    loginProcess.command = [root.cli, "login", root.recordingsConsole, "--stdin", "--json"]
+    loginProcess.running = true
+  }
+
+  Process {
+    id: recordingsProcess
+    property string uid: ""
+    running: false
+    stdout: StdioCollector { id: recordingsOut }
+    stderr: StdioCollector { id: recordingsErr }
+    onExited: function(exitCode) {
+      if (!root.recordingsView || !root.liveCamera || uid !== root.liveCamera.uid) return
+      root.recordingsLoaded = true
+      if (exitCode !== 0) {
+        root.recordingsError = root.helperError(recordingsErr.text, "Could not list the recordings")
+        return
+      }
+      try {
+        var result = JSON.parse(recordingsOut.text)
+        root.recordingsNeedLogin = result.needsLogin === true
+        root.recordingsConsole = result.console || ""
+        root.recordingsConsoleName = result.consoleName || ""
+        root.recordings = result.events || []
+      } catch (error) {
+        root.recordingsError = "Unexpected answer from the helper"
+        return
+      }
+      if (root.recordingsNeedLogin) {
+        root.pendingClip = null
+        clipProcess.running = false
+        Qt.callLater(function() { loginUserField.forceActiveFocus() })
+        return
+      }
+      // Coming from an alert: select the detection it belongs to.
+      if (root.pendingClip) {
+        for (var i = 0; i < root.recordings.length; i++)
+          if (Math.abs(root.recordings[i].start - root.pendingClip.start) < 10) root.recordingIndex = i
+        root.pendingClip = null
+      } else if (root.recordingIndex < 0 && root.recordings.length > 0) {
+        // Like Protect's own app: start on the newest detection.
+        root.playRecording(0)
+      }
+    }
+  }
+
+  Process {
+    id: clipProcess
+    property string key: ""
+    property real eventStart: 0
+    property real eventEnd: 0
+    running: false
+    stdout: StdioCollector { id: clipOut }
+    stderr: StdioCollector { id: clipErr }
+    onExited: function(exitCode) {
+      // Ignore a late answer for a clip the user has already left.
+      if (!root.recordingsView || key !== root.liveCamera.uid + ":" + eventStart) return
+      if (exitCode !== 0) {
+        root.clipError = root.helperError(clipErr.text, "Could not fetch the recording")
+        return
+      }
+      try {
+        var clip = JSON.parse(clipOut.text)
+        root.playingClip = { start: clip.start, end: clip.end, eventStart: eventStart, eventEnd: eventEnd }
+        player.source = "file://" + clip.path
+        player.play()
+      } catch (error) {
+        root.clipError = "Unexpected answer from the helper"
+      }
+    }
+  }
+
+  Process {
+    id: loginProcess
+    property string secret: ""
+    running: false
+    stdinEnabled: true
+    stdout: StdioCollector { id: loginOut }
+    stderr: StdioCollector { id: loginErr }
+    onStarted: {
+      write(secret)
+      secret = ""
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.loginError = root.helperError(loginErr.text, "Could not sign in")
+        Qt.callLater(function() { loginPasswordField.forceActiveFocus() })
+        return
+      }
+      root.recordingsNeedLogin = false
+      root.reloadState()
+      keyCatcher.forceActiveFocus()
+      if (root.recordingsView) root.loadRecordings()
+    }
   }
 
   // ---- state and actions ---------------------------------------------
@@ -630,7 +928,8 @@ Panel {
                                     : PlaybackOptions.PlaybackIntent.Playback
     playbackOptions.networkTimeoutMs: 8000
     onErrorOccurred: function(error, errorString) {
-      if (root.liveMode) root.liveError = errorString || "playback failed"
+      if (root.recordingsView) root.clipError = errorString || "playback failed"
+      else if (root.liveMode) root.liveError = errorString || "playback failed"
     }
   }
 
@@ -723,22 +1022,44 @@ Panel {
       anchors.fill: parent
       // Typing an address or a key must not trigger the panel's letter
       // shortcuts; Esc in a setup field cancels setup instead.
-      blocked: root.settingUp
+      blocked: root.settingUp || loginUserField.activeFocus || loginPasswordField.activeFocus
 
-      onCloseRequested: root.liveMode ? root.closeLive()
+      onCloseRequested: root.recordingsView ? root.backFromRecordings()
+                        : root.liveMode ? root.closeLive()
                         : root.alertsView ? (root.alertsView = false) : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onMoveRequested: function(dx, dy) {
-        if (root.liveMode) { if (dx !== 0) root.stepLive(dx) }
+        if (root.recordingsView) {
+          if (dy !== 0) root.moveRecording(dy)
+          else root.seekBy(dx * 5)
+        }
+        else if (root.liveMode) { if (dx !== 0) root.stepLive(dx) }
         else root.moveSelection(dx, dy)
       }
+      onReturnRequested: root.enterPressed = true
       onActivateRequested: {
+        var enter = root.enterPressed
+        root.enterPressed = false
+        if (root.recordingsView) {
+          // Enter plays the selected detection (again); Space pauses.
+          var selected = root.selectedRecording
+          var current = root.playingClip && selected && root.playingClip.eventStart === selected.start
+          if ((enter || !root.playingClip) && !current) root.playRecording(root.recordingIndex)
+          else if (current && player.mediaStatus === MediaPlayer.EndOfMedia) {
+            player.setPosition(0)
+            player.play()
+          }
+          else root.togglePause()
+          return
+        }
         if (!root.liveMode && root.cameras.length > 0)
           root.openLive(root.cameras[root.selectedIndex])
       }
       onTextKey: function(text) {
         var key = text.toLowerCase()
         if (key === "m") root.muted = !root.muted
+        else if (key === "r" && root.liveMode)
+          root.recordingsView ? root.backFromRecordings() : root.openRecordings(root.liveCamera, null, "live")
         else if (key === "w") root.openWall()
         else if (key === "a" && !root.liveMode && root.configured) root.alertsView = !root.alertsView
         else if (key === "p") {
@@ -766,6 +1087,7 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
             text: root.liveMode ? root.liveCamera.name.toUpperCase()
                   + (root.multiConsole ? "  ·  " + root.liveCamera.consoleName.toUpperCase() : "")
+                  + (root.recordingsView ? "  ·  RECORDINGS" : "")
                 : root.alertsView ? "ALERTS" + (root.logAlerts.length ? "  ·  " + root.logAlerts.length : "")
                 : "UNIFI PROTECT" + (root.configured && root.shownCameras.length
                     ? "  ·  " + root.onlineCount + "/" + root.shownCameras.length + " ONLINE" : "")
@@ -788,7 +1110,7 @@ Panel {
             }
 
             ActionButton {
-              visible: root.liveMode
+              visible: root.liveMode && (!root.recordingsView || root.playingClip !== null)
               label: "Pop out"
               outlined: true
               onTriggered: root.popOut(root.liveCamera)
@@ -796,9 +1118,18 @@ Panel {
 
             ActionButton {
               visible: root.liveMode
+              label: root.recordingsView ? "Live" : "Recordings"
+              outlined: true
+              onTriggered: root.recordingsView ? root.openLive(root.liveCamera)
+                                               : root.openRecordings(root.liveCamera, null, "live")
+            }
+
+            ActionButton {
+              visible: root.liveMode
               label: "Back"
               outlined: true
-              onTriggered: root.closeLive()
+              onTriggered: root.recordingsView && root.recordingsReturn === "alerts"
+                           ? root.backFromRecordings() : root.closeLive()
             }
 
             ActionButton {
@@ -860,12 +1191,16 @@ Panel {
             color: "black"
             clip: true
 
-            // The last snapshot holds the frame while the stream connects.
+            // The last snapshot holds the frame while the stream connects;
+            // in recordings, the selected detection's thumbnail.
             Snapshot {
               anchors.fill: parent
-              visible: !root.playing
+              visible: root.recordingsView ? !root.clipLoaded : !root.playing
               opacity: 0.6
-              url: root.liveMode ? root.snapshotUrl(root.liveCamera.uid) : ""
+              url: !root.liveMode ? ""
+                   : root.recordingsView ? (root.selectedRecording && root.selectedRecording.thumb
+                                            ? "file://" + root.selectedRecording.thumb : "")
+                   : root.snapshotUrl(root.liveCamera.uid)
             }
 
             VideoOutput {
@@ -876,21 +1211,55 @@ Panel {
 
             Text {
               anchors.centerIn: parent
-              visible: !root.playing
+              visible: root.recordingsView ? !root.clipLoaded : !root.playing
               width: parent.width - Style.space(40)
               horizontalAlignment: Text.AlignHCenter
               wrapMode: Text.WordWrap
               textFormat: Text.PlainText
-              text: root.liveError !== "" ? root.liveError : "Connecting…"
-              color: root.liveError !== "" ? root.urgent : "white"
+              readonly property string failure: root.recordingsView
+                ? (root.clipError || root.recordingsError) : root.liveError
+              text: failure !== "" ? failure
+                    : !root.recordingsView ? "Connecting…"
+                    : root.fetchingClip ? "Fetching the recording from Protect…"
+                    : player.mediaStatus === MediaPlayer.EndOfMedia ? "End of the recording · Space plays it again"
+                    : root.recordingsNeedLogin ? "Sign in below to watch recordings"
+                    : !root.recordingsLoaded ? "Loading detections…"
+                    : root.recordings.length === 0 ? "No detections in the last 24 hours"
+                    : "Enter plays the selected detection"
+              color: failure !== "" ? root.urgent : "white"
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
+            }
+
+            // REC badge: a recording, with the time it shows, never live.
+            Rectangle {
+              visible: root.recordingsView && root.clipLoaded
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.margins: Style.space(10)
+              width: recLabel.implicitWidth + Style.space(14)
+              height: recLabel.implicitHeight + Style.space(6)
+              radius: height / 2
+              color: Qt.rgba(0, 0, 0, 0.55)
+
+              Text {
+                id: recLabel
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: (player.playbackState === MediaPlayer.PlayingState ? "▶ " : "❚❚ ")
+                      + "REC  " + (root.playingClip
+                                   ? root.eventWhen(root.playingClip.start + player.position / 1000) : "")
+                color: "white"
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
             }
 
             // LIVE badge: a frozen stream must never pass for a live one.
             // Top right: UniFi cameras burn their timestamp in at top left.
             Rectangle {
-              visible: root.playing
+              visible: root.playing && !root.recordingsView
               anchors.right: parent.right
               anchors.top: parent.top
               anchors.margins: Style.space(10)
@@ -913,7 +1282,56 @@ Panel {
 
             MouseArea {
               anchors.fill: parent
+              onClicked: if (root.recordingsView) root.togglePause()
               onDoubleClicked: root.popOut(root.liveCamera)
+            }
+          }
+
+          // Playhead of a recording: click or drag to seek.
+          Row {
+            visible: root.recordingsView && root.playingClip !== null
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              id: clipTime
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: root.clock(player.position) + " / " + root.clock(player.duration)
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Item {
+              width: parent.width - clipTime.width - parent.spacing
+              height: Style.space(16)
+
+              Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width
+                height: Style.space(4)
+                radius: height / 2
+                color: Util.alpha(root.foreground, 0.15)
+
+                Rectangle {
+                  width: player.duration > 0 ? parent.width * Math.min(1, player.position / player.duration) : 0
+                  height: parent.height
+                  radius: parent.radius
+                  color: Color.accent
+                }
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                function seekTo(x) {
+                  if (player.duration > 0 && player.seekable)
+                    player.setPosition(Math.max(0, Math.min(1, x / width)) * player.duration)
+                }
+                onPressed: function(mouse) { seekTo(mouse.x) }
+                onPositionChanged: function(mouse) { if (pressed) seekTo(mouse.x) }
+              }
             }
           }
 
@@ -921,11 +1339,167 @@ Panel {
             width: parent.width
             textFormat: Text.PlainText
             horizontalAlignment: Text.AlignHCenter
-            text: "←/→ switch camera  ·  1–9 jump  ·  M mute  ·  P or double-click pop out  ·  Esc back"
+            text: root.recordingsView
+                  ? "↑/↓ choose  ·  Enter play  ·  Space pause  ·  ←/→ 5 s  ·  M mute  ·  P pop out  ·  Esc "
+                    + (root.recordingsReturn === "alerts" ? "alerts" : "live")
+                  : "←/→ switch camera  ·  1–9 jump  ·  M mute  ·  R recordings  ·  P or double-click pop out  ·  Esc back"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
+          }
+
+          // ---- detections ----
+          ListView {
+            id: recordingsList
+            visible: root.recordingsView && !root.recordingsNeedLogin && root.recordings.length > 0
+            width: parent.width
+            height: visible ? Math.min(root.recordings.length, 4) * Style.space(68) : 0
+            clip: true
+            spacing: Style.space(4)
+            boundsBehavior: Flickable.StopAtBounds
+            model: root.recordingsView ? root.recordings : []
+
+            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+            delegate: Rectangle {
+              id: recordingRow
+              required property var modelData
+              required property int index
+              readonly property bool selected: index === root.recordingIndex
+              readonly property bool current: root.playingClip !== null
+                                              && root.playingClip.eventStart === modelData.start
+              width: recordingsList.width - Style.space(8)
+              height: Style.space(64)
+              radius: Style.cornerRadius
+              color: recordingMouse.containsMouse || selected ? root.surface : "transparent"
+              border.width: selected ? Math.max(1, Style.space(1)) : 0
+              border.color: Color.accent
+
+              Row {
+                anchors.fill: parent
+                anchors.margins: Style.space(5)
+                spacing: Style.space(10)
+
+                Rectangle {
+                  width: Style.space(96)
+                  height: Style.space(54)
+                  radius: Style.cornerRadius
+                  color: root.surface
+                  clip: true
+
+                  Image {
+                    anchors.fill: parent
+                    source: recordingRow.modelData.thumb ? "file://" + recordingRow.modelData.thumb : ""
+                    fillMode: Image.PreserveAspectCrop
+                    asynchronous: true
+                    sourceSize.width: 192
+                  }
+                }
+
+                Column {
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - Style.space(96) - parent.spacing
+                  spacing: Style.space(2)
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: (recordingRow.current ? "▶ " : "") + root.alertLabel(recordingRow.modelData.kind)
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    width: parent.width
+                    textFormat: Text.PlainText
+                    text: {
+                      var e = recordingRow.modelData
+                      var parts = [root.eventWhen(e.start)]
+                      parts.push(e.end ? Math.max(1, Math.round(e.end - e.start)) + " s" : "ongoing")
+                      if (e.score) parts.push(e.score + "% sure")
+                      return parts.join("  ·  ")
+                    }
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
+              }
+
+              MouseArea {
+                id: recordingMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.playRecording(recordingRow.index)
+              }
+            }
+          }
+
+          // ---- sign-in for recordings ----
+          Column {
+            visible: root.recordingsView && root.recordingsNeedLogin
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: "Protect only gives recordings to a signed-in user; API keys can't fetch them. "
+                  + "Sign in to " + root.recordingsConsoleName + " with a local UniFi account made for "
+                  + "this: on https://" + (root.liveCamera ? root.consoleHost(root.liveCamera.console) : "")
+                  + ", Admins & Users → Add, tick \"Restrict to local access only\", and give it a "
+                  + "view-only Protect role. The password goes to your keyring."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            TextField {
+              id: loginUserField
+              width: parent.width
+              placeholderText: "Username"
+              foreground: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              onAccepted: loginPasswordField.forceActiveFocus()
+              Keys.onEscapePressed: root.backFromRecordings()
+            }
+
+            TextField {
+              id: loginPasswordField
+              width: parent.width
+              password: true
+              placeholderText: "Password"
+              foreground: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              onAccepted: root.signIn()
+              Keys.onEscapePressed: root.backFromRecordings()
+            }
+
+            Text {
+              visible: root.loginError !== "" || loginProcess.running
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: root.loginError !== "" ? root.loginError : "Signing in…"
+              color: root.loginError !== "" ? root.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            ActionButton {
+              label: "Sign in"
+              enabled: !loginProcess.running
+              onTriggered: root.signIn()
+            }
           }
         }
 
@@ -1207,7 +1781,7 @@ Panel {
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.openAlertLive(alertRow.modelData)
+                  onClicked: root.openAlert(alertRow.modelData)
                 }
               }
             }
@@ -1217,7 +1791,9 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               horizontalAlignment: Text.AlignHCenter
-              text: "Click an alert to watch that camera live  ·  last 24 hours  ·  Esc back"
+              text: (root.consoles.some(function(c) { return c.recordings === true })
+                     ? "Click an alert to watch its recording" : "Click an alert to watch that camera live")
+                    + "  ·  last 24 hours  ·  Esc back"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption

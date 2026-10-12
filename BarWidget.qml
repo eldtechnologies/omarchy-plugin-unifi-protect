@@ -93,6 +93,10 @@ BarWidget {
     function live(name: string): void {
       if (panelLoader.item) panelLoader.item.openLiveByName(name)
     }
+    // The same camera's recorded detections, newest playing.
+    function recordings(name: string): void {
+      if (panelLoader.item) panelLoader.item.openRecordingsByName(name)
+    }
   }
 
   WidgetButton {

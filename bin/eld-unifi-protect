@@ -19,6 +19,7 @@ import hmac
 import http.client
 import json
 import os
+import random
 import re
 import secrets
 import shutil
@@ -1276,7 +1277,7 @@ def cmd_demo(args):
                 os.remove(path)
             except FileNotFoundError:
                 pass
-        for folder in (DEMO_DIR, ALERT_IMAGES_DIR, SNAP_DIR):
+        for folder in (DEMO_DIR, ALERT_IMAGES_DIR, SNAP_DIR, RECORDINGS_DIR, CLIPS_DIR):
             shutil.rmtree(folder, ignore_errors=True)
         poll_cameras()
         print("demo mode off; your consoles are back")
@@ -1479,6 +1480,427 @@ def summarize_camera(camera, console):
     }
 
 
+# ---- recordings ------------------------------------------------------------
+#
+# The Integration API has no recordings: API keys can list cameras and play
+# them live, nothing more. Recorded video comes from the endpoints Protect's
+# own web app uses (/proxy/protect/api), which need a signed-in user instead
+# of a key. The plugin signs in with a local UniFi account the user creates
+# for it (ideally view-only), over the same pinned TLS as everything else.
+# The password lives in the keyring like the API key, under its own service
+# name, so a lookup for one can never return the other. These endpoints are
+# not a published API and may change with a Protect update; everything else
+# in the plugin keeps working if they do.
+
+LOGIN_SERVICE = KEYRING_SERVICE + "-login"
+PRIVATE_API = "/proxy/protect/api"
+SESSIONS_PATH = os.path.join(RUNTIME_DIR, "sessions.json")
+SESSIONS_LOCK = threading.Lock()
+RECORDINGS_DIR = os.path.join(RUNTIME_DIR, "recordings")
+CLIPS_DIR = os.path.join(RUNTIME_DIR, "clips")
+CLIP_PAD = 3                # seconds of context either side of an event
+CLIP_MAX_SECONDS = 300      # longer events are cut to their first five minutes
+CLIP_ONGOING_SECONDS = 60   # an event still in progress: its first minute so far
+CLIPS_MAX_BYTES = 600 * 1024 * 1024   # clips live in RAM (the runtime dir)
+CLIPS_KEEP = 25
+CLIP_CHANNELS = {"high": 0, "medium": 1, "low": 2}
+EVENT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+RECORDING_KINDS = ("person", "vehicle", "animal", "package", "face", "licensePlate")
+
+
+def login_password(console):
+    """The console's login password, or "" when none is stored."""
+    if console.get("loginStore") == "keyring":
+        cache_key = (LOGIN_SERVICE, console["id"])
+        if cache_key not in _key_cache:
+            result = _secret_tool(["lookup", "service", LOGIN_SERVICE, "console", console["id"]])
+            _key_cache[cache_key] = result.stdout if result.returncode == 0 else ""
+        return _key_cache[cache_key]
+    return console.get("loginPassword", "")
+
+
+def has_login(console):
+    return bool(console.get("demo") or console.get("loginUser"))
+
+
+def store_login(console, user, password):
+    """Keyring if possible, else the config file (mode 0600)."""
+    console["loginUser"] = user
+    try:
+        result = _secret_tool(["store", f"--label=UniFi Protect login ({console['name']}, {console['host']})",
+                               "service", LOGIN_SERVICE, "console", console["id"]], secret=password)
+        if result.returncode != 0:
+            raise KeyringUnavailable("the keyring refused to store the password")
+        _key_cache[(LOGIN_SERVICE, console["id"])] = password
+        console["loginStore"] = "keyring"
+        console.pop("loginPassword", None)
+        return "keyring"
+    except KeyringUnavailable:
+        console.pop("loginStore", None)
+        console["loginPassword"] = password
+        return "file"
+
+
+def clear_login(console):
+    if console.get("loginStore") == "keyring":
+        _key_cache.pop((LOGIN_SERVICE, console["id"]), None)
+        try:
+            _secret_tool(["clear", "service", LOGIN_SERVICE, "console", console["id"]])
+        except KeyringUnavailable as error:
+            print(f"Could not remove the password from the keyring: {error}", file=sys.stderr)
+    for field in ("loginUser", "loginStore", "loginPassword"):
+        console.pop(field, None)
+    forget_session(console["id"])
+
+
+def load_sessions():
+    try:
+        with open(SESSIONS_PATH) as handle:
+            sessions = json.load(handle)
+        return sessions if isinstance(sessions, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def forget_session(console_id):
+    with SESSIONS_LOCK:
+        sessions = load_sessions()
+        if sessions.pop(console_id, None) is not None:
+            write_json(SESSIONS_PATH, sessions)
+
+
+def token_expiry(token):
+    """The exp claim of a UniFi OS session token (a JWT), or an hour from now."""
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return float(claims["exp"])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return time.time() + 3600
+
+
+def event_kind(event):
+    """What a Protect event saw, as one word for the timeline."""
+    kind = event.get("type")
+    if kind in SMART_EVENT_TYPES:
+        seen = [t for t in event.get("smartDetectTypes") or [] if t in RECORDING_KINDS]
+        return seen[0] if seen else "motion"
+    if kind == "ring":
+        return "ring"
+    if kind == "smartAudioDetect":
+        return "audio"
+    return "motion"
+
+
+def clip_window(start, end, now=None):
+    """The (start, end) seconds to export for an event: padded and capped."""
+    now = now or time.time()
+    if not end:
+        end = min(now, start + CLIP_ONGOING_SECONDS)
+    end = min(end, start + CLIP_MAX_SECONDS)
+    return start - CLIP_PAD, min(now, end + CLIP_PAD)
+
+
+def clip_path(uid, start, end, quality):
+    key = hashlib.sha256(f"{uid}|{start:.3f}|{end:.3f}|{quality}".encode()).hexdigest()[:24]
+    return os.path.join(CLIPS_DIR, f"{key}.mp4")
+
+
+def prune_clips(keep_path=None):
+    """Oldest-used clips go first once there are too many or they take too much RAM."""
+    try:
+        entries = [os.path.join(CLIPS_DIR, n) for n in os.listdir(CLIPS_DIR) if n.endswith(".mp4")]
+    except FileNotFoundError:
+        return
+    entries.sort(key=lambda p: os.stat(p).st_mtime, reverse=True)
+    total = 0
+    for index, path in enumerate(entries):
+        total += os.path.getsize(path)
+        if path != keep_path and (index >= CLIPS_KEEP or total > CLIPS_MAX_BYTES):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+
+class ProtectSession:
+    """Signed-in access to the recordings endpoints of one console."""
+
+    def __new__(cls, console, config=None):
+        if console.get("demo"):
+            return DemoSession(console)
+        return super().__new__(cls)
+
+    def __init__(self, console, config=None):
+        if not has_login(console):
+            raise ProtectError("no login for recordings on this console; "
+                               f"run `eld-unifi-protect login {console['id']}`")
+        self.console = console
+        self.host = console["host"]
+        self.name, self.port = split_host(self.host)
+        self.pin = console.get("certSha256")
+        self.timeout = float((config or {}).get("timeoutSec", 8))
+        self.session = load_sessions().get(console["id"])
+
+    def _send(self, method, path, body=None, params=None, headers=None, timeout=None):
+        url = path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
+        headers = dict(headers or {})
+        payload = None
+        if body is not None:
+            payload = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        conn = PinnedHTTPSConnection(self.name, self.port, self.pin, timeout or self.timeout)
+        try:
+            conn.request(method, url, body=payload, headers=headers)
+            return conn, conn.getresponse()
+        except ProtectError:
+            conn.close()
+            raise
+        except (OSError, http.client.HTTPException) as error:
+            conn.close()
+            raise ProtectError(f"cannot reach {self.host}: {error}")
+
+    def login(self):
+        password = login_password(self.console)
+        if not password:
+            raise ProtectError("the login password is missing; run `eld-unifi-protect login` again")
+        conn, response = self._send("POST", "/api/auth/login", body={
+            "username": self.console["loginUser"], "password": password,
+            "rememberMe": False, "token": ""})
+        try:
+            data = response.read(4096)
+            cookies = response.headers.get_all("Set-Cookie") or []
+        finally:
+            conn.close()
+        if response.status == 429:
+            raise ProtectError("the console is limiting sign-ins after failed attempts; wait a few minutes")
+        if response.status in (401, 403):
+            if b"MFA" in data or b"2fa" in data.lower():
+                raise ProtectError("this account signs in with two-factor authentication; "
+                                   "use a local account (Restrict to local access only)")
+            raise ProtectError("the console rejected the username or password")
+        if response.status != 200:
+            raise ProtectError(f"sign-in failed: HTTP {response.status}")
+        token = next((c.split(";", 1)[0].split("=", 1)[1] for c in cookies
+                      if c.startswith("TOKEN=")), "")
+        if not token:
+            raise ProtectError("the console signed in but sent no session cookie")
+        self.session = {"token": token, "expires": token_expiry(token),
+                        "csrf": response.headers.get("X-Updated-CSRF-Token")
+                                or response.headers.get("X-CSRF-Token") or ""}
+        with SESSIONS_LOCK:
+            sessions = load_sessions()
+            sessions[self.console["id"]] = self.session
+            write_json(SESSIONS_PATH, sessions)
+
+    def open(self, path, params=None, timeout=None):
+        """GET a recordings endpoint; returns (conn, response) with status 200.
+
+        Signs in when there is no session or it has run out, and once more if
+        the console turns the saved one down. Never retries a failed sign-in:
+        UniFi OS locks accounts out after a burst of those.
+        """
+        for attempt in range(2):
+            if not self.session or self.session.get("expires", 0) < time.time() + 60:
+                self.login()
+            headers = {"Cookie": f"TOKEN={self.session['token']}", "Accept": "*/*"}
+            if self.session.get("csrf"):
+                headers["X-CSRF-Token"] = self.session["csrf"]
+            conn, response = self._send("GET", PRIVATE_API + path, params=params,
+                                        headers=headers, timeout=timeout)
+            if response.status == 401 and attempt == 0:
+                conn.close()
+                self.session = None
+                continue
+            if response.status == 200:
+                return conn, response
+            detail = response.read(200).decode(errors="replace").strip()
+            conn.close()
+            if response.status in (401, 403):
+                raise ProtectError("this account may not view recordings; give it a Protect role "
+                                   "that can (View Only or higher)")
+            if response.status == 404:
+                raise ProtectError("not found: the recordings endpoint may have changed in this "
+                                   "Protect version")
+            raise ProtectError(f"HTTP {response.status} from console: {detail}")
+        raise ProtectError("the console keeps refusing the session")
+
+    def get(self, path, params=None, limit=8 * 1024 * 1024):
+        conn, response = self.open(path, params)
+        try:
+            return response.read(limit)
+        finally:
+            conn.close()
+
+    def events(self, camera_id, since, until, motion=False, limit=100):
+        """Events newest first; camera_id None lists every camera's."""
+        types = ["smartDetectZone", "smartDetectLine", "smartDetectLoiter", "ring"]
+        if motion:
+            types.append("motion")
+        params = {"start": int(since * 1000), "end": int(until * 1000), "limit": limit,
+                  "orderDirection": "DESC", "withoutDescriptions": "true", "types": types}
+        if camera_id:
+            params["cameras"] = camera_id
+        raw = json.loads(self.get("/events", params=params))
+        events = []
+        for event in raw if isinstance(raw, list) else []:
+            event_id = str(event.get("id") or "")
+            start = event_time(event.get("start"))
+            # The filter is applied here too: the console's own may change.
+            if (not EVENT_ID.fullmatch(event_id) or start is None
+                    or (camera_id and event.get("camera") not in (None, camera_id))
+                    or event.get("type") not in types):
+                continue
+            events.append({"id": event_id, "kind": event_kind(event), "start": start,
+                           "end": event_time(event.get("end")),
+                           "score": event.get("score") if isinstance(event.get("score"), int) else None})
+        return sorted(events, key=lambda e: e["start"], reverse=True)
+
+    def thumbnail(self, event_id):
+        data = self.get(f"/events/{event_id}/thumbnail", params={"w": 320})
+        if not is_complete_jpeg(data):
+            raise ProtectError("console sent no thumbnail")
+        return data
+
+    def export(self, camera_id, start, end, quality, path):
+        """Write the recording between two times (seconds) to path as MP4."""
+        conn, response = self.open("/video/export", params={
+            "camera": camera_id, "start": int(start * 1000), "end": int(end * 1000),
+            "channel": CLIP_CHANNELS[quality]}, timeout=120)
+        partial = f"{path}.{os.getpid()}.part"
+        written = 0
+        try:
+            with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as out:
+                while True:
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > CLIPS_MAX_BYTES:
+                        raise ProtectError("the clip is too large to keep in memory; try a lower quality")
+                    out.write(chunk)
+            with open(partial, "rb") as handle:
+                head = handle.read(12)
+            # An MP4 starts with an "ftyp" box; anything else is an error page.
+            if written < 1024 or head[4:8] != b"ftyp":
+                raise ProtectError("the console sent no video for that time; "
+                                   "is the camera recording it?")
+            os.replace(partial, path)
+        except OSError as error:
+            raise ProtectError(f"cannot save the clip: {error}")
+        finally:
+            conn.close()
+            if os.path.exists(partial):
+                os.remove(partial)
+
+
+class DemoSession:
+    """Recordings for demo mode: made-up events, clips cut from the demo video."""
+
+    def __init__(self, console):
+        self.console = console
+
+    def events(self, camera_id, since, until, motion=False, limit=100):
+        slug = next((s for _, s, _, _ in DEMO_CAMERAS if demo_camera_id(s) == camera_id), "")
+        rng = random.Random(slug)
+        kinds = ["person", "vehicle", "person", "animal", "ring" if slug == "front-door" else "person"]
+        events, at = [], until - rng.uniform(120, 900)
+        while at > since and len(events) < 14:
+            length = rng.uniform(6, 48)
+            events.append({"id": f"demo{len(events)}{camera_id[:8]}", "kind": rng.choice(kinds),
+                           "start": at, "end": at + length, "score": rng.randint(70, 98)})
+            at -= rng.uniform(900, 7200)
+        if motion:
+            events.append({"id": f"demom{camera_id[:8]}", "kind": "motion", "start": until - 1800,
+                           "end": until - 1790, "score": None})
+            events.sort(key=lambda e: e["start"], reverse=True)
+        return events
+
+    def thumbnail(self, event_id):
+        camera = next(demo_camera_id(s) for _, s, _, _ in DEMO_CAMERAS if demo_camera_id(s)[:8] in event_id)
+        with open(os.path.join(DEMO_DIR, f"{camera}.jpg"), "rb") as handle:
+            return handle.read()
+
+    def export(self, camera_id, start, end, quality, path):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise ProtectError("demo mode needs ffmpeg")
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", os.path.join(DEMO_DIR, f"{camera_id}.mp4"),
+                        "-t", f"{min(end - start, 59):.1f}", "-c", "copy", "-f", "mp4", path],
+                       check=True, capture_output=True)
+        os.chmod(path, 0o600)
+
+
+def recordings_for(config, uid, hours=24, motion=False):
+    """The camera's recent events, with thumbnails on disk, for the panel."""
+    client_console = None
+    console_id, _, camera_id = uid.partition("_")
+    for console in config["consoles"]:
+        if console["id"] == console_id:
+            client_console = console
+    if client_console is None or not CAMERA_ID.fullmatch(camera_id):
+        raise ProtectError(f"no camera {uid!r}")
+    result = {"uid": uid, "console": console_id, "consoleName": client_console["name"]}
+    if not has_login(client_console):
+        return dict(result, needsLogin=True, events=[])
+    session = ProtectSession(client_console, config)
+    now = time.time()
+    events = session.events(camera_id, now - hours * 3600, now, motion=motion)
+    folder = os.path.join(RECORDINGS_DIR, uid)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+
+    def thumb(event):
+        path = os.path.join(folder, event["id"] + ".jpg")
+        if not os.path.exists(path):
+            try:
+                write_atomic(path, session.thumbnail(event["id"]))
+            except ProtectError:
+                return dict(event, thumb="")
+        return dict(event, thumb=path)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        events = list(pool.map(thumb, events))
+    # Thumbnails of events that dropped out of the window go too.
+    wanted = {e["id"] + ".jpg" for e in events}
+    for name in os.listdir(folder):
+        if name not in wanted:
+            os.remove(os.path.join(folder, name))
+    return dict(result, events=events)
+
+
+def fetch_clip(config, uid, start, end, quality):
+    """Export (or reuse) the clip for an event; returns its path and real span."""
+    console_id, _, camera_id = uid.partition("_")
+    console = next((c for c in config["consoles"] if c["id"] == console_id), None)
+    if console is None or not CAMERA_ID.fullmatch(camera_id):
+        raise ProtectError(f"no camera {uid!r}")
+    clip_start, clip_end = clip_window(start, end)
+    path = clip_path(uid, clip_start, clip_end, quality)
+    if os.path.exists(path):
+        os.utime(path)   # most recently used: last to be pruned
+    else:
+        os.makedirs(CLIPS_DIR, mode=0o700, exist_ok=True)
+        ProtectSession(console, config).export(camera_id, clip_start, clip_end, quality, path)
+    prune_clips(keep_path=path)
+    return {"path": path, "start": clip_start, "end": clip_end}
+
+
+def mpv_clip_command(player, title, sound=True):
+    """mpv for a recorded clip: seekable, stays open at the end."""
+    return [
+        player,
+        "--no-terminal",
+        f"--input-conf={os.path.join(PLUGIN_DIR, 'mpv', 'input.conf')}",
+        f"--title={title}",
+        "--force-window=immediate",
+        "--hwdec=auto-safe",
+        f"--mute={'no' if sound else 'yes'}",
+        "--keep-open=yes",
+        "--x11-name=eld-unifi-protect",
+        "--wayland-app-id=eld-unifi-protect",
+    ]
+
+
 # ---- camera preferences ----------------------------------------------------
 #
 # Which cameras to hide. Kept apart from config.json so it holds no secret
@@ -1628,6 +2050,8 @@ def poll_cameras(config=None):
             "stale": stale,
             "error": result["error"],
             "cameraCount": len(listed),
+            # Signed in for recordings (see `login`).
+            "recordings": has_login(console),
         })
 
     state = {
@@ -1708,6 +2132,11 @@ def save_console(config, existing, host, pin, key, name):
     while console_id in taken:
         console_id, n = f"{base}-{n}", n + 1
     entry = {"id": console_id, "name": name, "host": host, "certSha256": pin}
+    if existing and existing.get("id") == console_id:
+        # A new key or certificate keeps the recordings login.
+        entry.update({k: existing[k] for k in ("loginUser", "loginStore", "loginPassword") if k in existing})
+    elif existing:
+        clear_login(existing)
     if existing and existing.get("keyStore") == "keyring" and existing.get("id") != console_id:
         keyring_clear(existing["id"])
     where = store_key(config, entry, key)
@@ -1852,6 +2281,7 @@ def cmd_remove(args):
     if not args.yes and input(f"Remove {console['name']} ({console['host']})? [y/N] ").strip().lower() not in ("y", "yes"):
         raise ProtectError("not changed")
     config["consoles"].remove(console)
+    clear_login(console)
     if console.get("keyStore") == "keyring":
         try:
             keyring_clear(console["id"])
@@ -1890,6 +2320,110 @@ def cmd_migrate_keys(args):
     save_config(config)
     where = "your keyring" if args.to == "keyring" else CONFIG_PATH
     print(f"{moved} key(s) moved; all keys are now in {where}")
+
+
+def camera_uid(wanted):
+    """A camera's uid from its uid, id, MAC or name, online ones first."""
+    found = find_cameras(previous_state().get("cameras", []), wanted)
+    found.sort(key=lambda c: not c.get("online"))
+    if found:
+        return found[0]["uid"]
+    if "_" in wanted:
+        return wanted
+    raise ProtectError(f"no camera {wanted!r}; see `eld-unifi-protect cameras`")
+
+
+def cmd_login(args):
+    """Sign in to a console's recordings with a local UniFi account.
+
+    Interactive by default. --stdin (used by the panel) reads the username
+    and the password as two lines, so the password is never an argument.
+    """
+    config = require_config()
+    console = find_console(config, args.console)
+    if args.stdin:
+        user = sys.stdin.readline().strip()
+        password = sys.stdin.readline().rstrip("\n")
+    else:
+        print(f"Recordings on {console['name']} need a local UniFi account; API keys can't fetch them.\n"
+              f"Create one at https://{console['host']} → Admins & Users → Add: tick "
+              "\"Restrict to local access only\" and give it a view-only Protect role.")
+        user = input("Username: ").strip()
+        password = getpass.getpass("Password: ")
+    if not user or not password:
+        raise ProtectError("enter the username and the password")
+    previous = {k: console[k] for k in ("loginUser", "loginStore", "loginPassword") if k in console}
+    console.pop("loginStore", None)
+    console.update(loginUser=user, loginPassword=password)
+    forget_session(console["id"])
+    try:
+        # Prove it before saving: sign in and list one event.
+        now = time.time()
+        ProtectSession(console, config).events(None, now - 3600, now, limit=1)
+    except ProtectError:
+        for field in ("loginUser", "loginPassword"):
+            console.pop(field, None)
+        console.update(previous)
+        raise
+    where = store_login(console, user, password)
+    save_config(config)
+    poll_cameras(config)
+    if args.json:
+        print(json.dumps({"console": console["id"], "name": console["name"], "store": where}))
+    else:
+        print(f"Signed in to {console['name']} as {user}; password stored in "
+              + ("your keyring." if where == "keyring" else f"{CONFIG_PATH}."))
+
+
+def cmd_logout(args):
+    config = require_config()
+    console = find_console(config, args.console)
+    if not console.get("loginUser"):
+        print(f"No recordings login stored for {console['name']}.")
+        return
+    clear_login(console)
+    save_config(config)
+    # Recordings already fetched go too; clips are not labelled by console.
+    shutil.rmtree(CLIPS_DIR, ignore_errors=True)
+    for name in os.listdir(RECORDINGS_DIR) if os.path.isdir(RECORDINGS_DIR) else []:
+        if name.startswith(console["id"] + "_"):
+            shutil.rmtree(os.path.join(RECORDINGS_DIR, name), ignore_errors=True)
+    poll_cameras(config)
+    print(f"Signed out of {console['name']}; its login and fetched recordings are removed.")
+
+
+def cmd_recordings(args):
+    config = require_config()
+    uid = camera_uid(args.camera)
+    result = recordings_for(config, uid, hours=args.hours, motion=args.motion)
+    if args.json:
+        print(json.dumps(result))
+        return
+    if result.get("needsLogin"):
+        raise ProtectError(f"no login for recordings on {result['consoleName']}; "
+                           f"run `eld-unifi-protect login {result['console']}`")
+    for event in result["events"]:
+        length = f"{round(event['end'] - event['start'])} s" if event["end"] else "ongoing"
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(event['start']))}  "
+              f"{event['kind']:<10} {length:>8}  --start {event['start']:.3f}"
+              + (f" --end {event['end']:.3f}" if event["end"] else ""))
+
+
+def cmd_clip(args):
+    config = require_config()
+    uid = camera_uid(args.camera)
+    clip = fetch_clip(config, uid, args.start, args.end, args.quality)
+    if args.output:
+        shutil.copyfile(clip["path"], args.output)
+        clip["path"] = args.output
+    if args.play:
+        player = shutil.which("mpv")
+        if not player:
+            raise ProtectError("mpv is not installed: omarchy pkg add mpv")
+        title = (args.title or "UniFi Protect") + " · " + time.strftime(
+            "%H:%M:%S", time.localtime(args.start))
+        os.execv(player, mpv_clip_command(player, title, args.sound == "on") + ["--", clip["path"]])
+    print(json.dumps(clip) if args.json else clip["path"])
 
 
 def cmd_trust_cert(args):
@@ -2057,6 +2591,15 @@ def cmd_doctor(args):
             report(True, "cameras", f"{online}/{len(cameras)} online")
         except ProtectError as error:
             report(False, "API", str(error))
+        if console.get("loginUser"):
+            try:
+                now = time.time()
+                ProtectSession(console, config).events(None, now - 3600, now, limit=1)
+                report(True, "recordings login", console["loginUser"])
+            except (ProtectError, KeyringUnavailable) as error:
+                report(False, "recordings login", str(error))
+        else:
+            print("  --   recordings: no login (optional; `eld-unifi-protect login`)")
     sys.exit(0 if ok else 1)
 
 
@@ -2343,6 +2886,31 @@ def main():
     p = sub.add_parser("events", help="listen for alerts on armed cameras (started by the panel)")
     p.add_argument("--follow-parent", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_events)
+    p = sub.add_parser("login", help="sign in to a console's recordings with a local UniFi account")
+    p.add_argument("console", nargs="?")
+    p.add_argument("--stdin", action="store_true", help="read username and password as two lines")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_login)
+    p = sub.add_parser("logout", help="remove a console's recordings login")
+    p.add_argument("console", nargs="?")
+    p.set_defaults(func=cmd_logout)
+    p = sub.add_parser("recordings", help="list a camera's recent detections")
+    p.add_argument("camera", help="camera uid or name")
+    p.add_argument("--hours", type=float, default=24)
+    p.add_argument("--motion", action="store_true", help="include plain motion events")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_recordings)
+    p = sub.add_parser("clip", help="fetch the recording of an event (see `recordings`)")
+    p.add_argument("camera", help="camera uid or name")
+    p.add_argument("--start", type=float, required=True, help="event start, Unix seconds")
+    p.add_argument("--end", type=float, help="event end; omit for one still in progress")
+    p.add_argument("--quality", choices=QUALITIES, default="medium")
+    p.add_argument("-o", "--output", help="also save a copy here")
+    p.add_argument("--play", action="store_true", help="play it in mpv")
+    p.add_argument("--title")
+    p.add_argument("--sound", choices=("on", "off"), default="on")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_clip)
     p = sub.add_parser("demo", help="made-up cameras for screenshots and trying the plugin")
     p.add_argument("mode", choices=("on", "off", "status"), nargs="?", default="status")
     p.set_defaults(func=cmd_demo)

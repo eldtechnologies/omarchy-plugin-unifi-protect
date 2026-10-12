@@ -4,8 +4,9 @@ Your UniFi Protect cameras in the Omarchy bar: a grid of auto-refreshing
 snapshots, live video right in the panel, a camera wall with every camera
 live at once, and a pop-out player. Works with several consoles at once, such
 as a gateway and a dedicated NVR, and is set up from the panel itself. Arm a
-camera to be alerted when it sees a person, a vehicle or a doorbell ring.
-Video travels encrypted, and API keys stay out of the shell.
+camera to be alerted when it sees a person, a vehicle or a doorbell ring,
+and play back what each camera recorded. Video travels encrypted, and API
+keys stay out of the shell.
 
 In the bar it is a single camera icon. It pulses in your theme's urgent
 colour when an armed camera has seen something, turns that colour when a
@@ -117,8 +118,13 @@ eld-unifi-protect remove nvr
 | Grid / live | `P` | Pop out to mpv |
 | Live | ← / → | Previous / next camera |
 | Live | `M` | Mute / unmute |
+| Live | `R` | Recordings of this camera |
 | Live | Double-click | Pop out |
 | Live | Esc | Back to the grid |
+| Recordings | ↑ / ↓, Enter | Choose a detection, play it |
+| Recordings | Space, ← / → | Pause, seek 5 s |
+| Recordings | `P` | The clip in mpv, seekable |
+| Recordings | Esc | Back to live (or to the alert log) |
 | Grid | `A` | Alert log |
 | Panel footer | Click the version | Release notes for that version |
 
@@ -194,8 +200,8 @@ console's event stream can't be reached, the panel says so.
 
 **Alerts** in the panel header (or `A`) opens the alert log: what was seen,
 on which camera, when and for how long, with a snapshot from that moment,
-newest first. Alerts you hadn't seen yet are marked. Click one to watch that
-camera live; **Clear** empties the log, which otherwise keeps the last 24
+newest first. Alerts you hadn't seen yet are marked. Click one to watch its
+[recording](#recordings) (or that camera live, without a recordings login); **Clear** empties the log, which otherwise keeps the last 24
 hours. When you open the panel because the bar is pulsing, it goes straight
 to the log.
 
@@ -218,12 +224,52 @@ Detection is done by Protect, so a camera needs smart detections enabled in
 Protect for person and vehicle alerts. Alerts are a convenience, not a
 security system: nothing is flagged while your computer is asleep or off.
 
+### Recordings
+
+**Recordings** in the live view header (or `R`) lists what that camera
+detected in the last 24 hours: person, vehicle, animal, package, doorbell,
+each with a thumbnail, the time, how long it lasted and how sure Protect was.
+The newest starts playing right away. ↑/↓ and Enter play another, Space
+pauses, ←/→ seeks 5 seconds, and the bar under the video seeks anywhere. A
+**REC** badge with the time on screen replaces the LIVE one, so a recording
+never passes for live video. `P` opens the clip in mpv at pop-out quality,
+where you can zoom, pan and step through it. Clicking an alert in the alert
+log plays its recording the same way.
+
+Protect hands out recordings only to a signed-in user, never to an API key,
+so this needs a **local UniFi account** on each console that records:
+
+1. Open the console in a browser: **Admins & Users** → **Add**.
+2. Tick **Restrict to local access only** (local accounts have no two-factor
+   prompt), and give it a **view-only** Protect role. It needs nothing else.
+3. Open a camera's recordings in the panel and sign in with it, or run
+   `eld-unifi-protect login <console>`.
+
+The password is kept like the API key: in your keyring, or in a file only you
+can read when there is no keyring. `eld-unifi-protect logout <console>`
+removes it. Clips are exported by Protect as MP4, padded by 3 seconds either
+side and capped at 5 minutes. They are kept in memory (the runtime
+directory), at most 25 clips or 600 MB, and are gone at logout or reboot.
+
+```bash
+eld-unifi-protect login nvr                       # username, password prompt
+eld-unifi-protect recordings "Front Door"         # last 24 h: time, kind, length
+eld-unifi-protect clip "Front Door" --start 1791811452 --end 1791811470 --play
+eld-unifi-protect clip "Front Door" --start 1791811452 --end 1791811470 -o door.mp4
+```
+
+These are the endpoints Protect's own web app uses, not its published API.
+Other tools, such as Home Assistant's UniFi Protect integration, rely on them
+too, but a Protect update could change them; the rest of the plugin does not
+depend on them.
+
 ### Keybindings and scripts
 
 ```bash
 eld-unifi-protect wall                  # toggle the camera wall
 omarchy-shell com.eldtechnologies.unifi-protect toggle
 omarchy-shell com.eldtechnologies.unifi-protect live "Front Door"
+omarchy-shell com.eldtechnologies.unifi-protect recordings "Front Door"
 omarchy-shell com.eldtechnologies.unifi-protect alertStatus   # JSON: alerting, latest alert
 eld-unifi-protect cameras               # list cameras and their ids
 eld-unifi-protect live <camera-id>      # straight to mpv
@@ -288,6 +334,12 @@ streams.
   stdin, never as arguments. `eld-unifi-protect migrate-keys` moves existing
   keys into the keyring (`--to file` moves them back), and `doctor` shows
   where each console's key lives.
+- **Recordings** use a separate sign-in, with a local UniFi account (see
+  [Recordings](#recordings)), against the endpoints Protect's web app uses
+  (`/proxy/protect/api`): one sign-in per console, kept for the session in
+  the runtime directory (`sessions.json`, mode 0600), and never retried after
+  a rejected password, since UniFi OS locks accounts after repeated failures.
+  The password is stored and passed like the API key, on stdin only.
 - **Traffic:** while the panel is closed, one camera-list poll per console per
   minute. Snapshots are fetched only while the panel is open on the grid.
   While a camera is armed, the helper also keeps one connection open to that
