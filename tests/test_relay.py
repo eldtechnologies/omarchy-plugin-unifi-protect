@@ -154,6 +154,20 @@ class RelayEndToEnd(unittest.TestCase):
         self.assertEqual(sum(r.startswith("SETUP") for r in self.console.requests), 1)
         self.assertNotIn(self.relay.token, " ".join(self.console.requests))
 
+    def test_oversized_or_silent_clients_are_dropped_before_the_token(self):
+        # A huge Content-Length is refused without buffering the body.
+        sock, reader = self.connect()
+        sock.sendall(b"OPTIONS x RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 2000000000\r\n\r\n")
+        self.assertIsNone(h.read_rtsp(reader))
+        # So are endless headers.
+        sock, reader = self.connect()
+        sock.sendall(b"OPTIONS x RTSP/1.0\r\n" + b"X: y\r\n" * (h.RTSP_MAX_HEADERS + 1) + b"\r\n")
+        self.assertIsNone(h.read_rtsp(reader))
+        # And media frames before any authenticated request.
+        sock, reader = self.connect()
+        sock.sendall(b"$\x00\x00\x04abcd")
+        self.assertIsNone(h.read_rtsp(reader))
+
     def test_wrong_token_is_refused(self):
         sock, reader = self.connect()
         _, start, _, _ = self.request(sock, reader, "OPTIONS", self.url(token="nope"), 1)

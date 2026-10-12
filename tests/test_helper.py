@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import socket
 import stat
 import unittest
 
@@ -169,6 +170,33 @@ class RelayRewriting(unittest.TestCase):
         self.assertIsNone(s.route("rtsp://127.0.0.1:4000/wrong/nvr/AbC"))
         self.assertIsNone(s.route("rtsp://127.0.0.1:4000/tok/other/AbC"))
 
+
+
+class RelayLiveness(unittest.TestCase):
+    """Only the relay holding the lock counts; a listener on the port does not."""
+
+    def setUp(self):
+        os.makedirs(os.path.dirname(h.RELAY_LOCK), exist_ok=True)
+        self.lock = open(h.RELAY_LOCK, "a")
+        self.addCleanup(self.lock.close)
+
+    def test_the_lock_holder_is_the_relay(self):
+        import fcntl
+        self.assertIsNone(h.relay_lock_holder())
+        fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(fcntl.flock, self.lock, fcntl.LOCK_UN)
+        self.assertEqual(h.relay_lock_holder(), os.getpid())
+        info = {"pid": os.getpid(), "port": 1234, "token": "t"}
+        self.assertTrue(h.relay_alive(info))
+        self.assertFalse(h.relay_alive(dict(info, pid=os.getpid() + 1)))
+
+    def test_a_squatter_on_the_old_port_is_not_the_relay(self):
+        squatter = socket.socket()
+        squatter.bind(("127.0.0.1", 0))
+        squatter.listen(1)
+        self.addCleanup(squatter.close)
+        info = {"pid": os.getpid(), "port": squatter.getsockname()[1], "token": "t"}
+        self.assertFalse(h.relay_alive(info))
 
 if __name__ == "__main__":
     unittest.main()

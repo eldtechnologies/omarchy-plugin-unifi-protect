@@ -363,6 +363,11 @@ def load_stream_cache():
 RELAY_INFO = os.path.join(RUNTIME_DIR, "relay.json")
 RELAY_LOCK = os.path.join(RUNTIME_DIR, "relay.lock")
 RELAY_IDLE_EXIT = 60
+RTSP_MAX_HEADERS = 64
+RTSP_MAX_BODY = 64 * 1024         # a player's request bodies are tiny
+RTSP_MAX_UPSTREAM_BODY = 1 << 20  # SDP and the like from the console
+RELAY_AUTH_TIMEOUT = 10           # seconds for a new connection to show its token
+RELAY_MAX_PENDING = 16            # connections that have not shown it yet
 STREAM_PORT = 7441
 
 
@@ -374,14 +379,32 @@ def read_relay_info():
         return {}
 
 
-def relay_alive(info):
-    if not info.get("port"):
-        return False
+def relay_lock_holder():
+    """The pid holding the relay lock, or None when no relay is running.
+
+    Only this user can open the lock (the runtime directory is 0700), so its
+    holder is this user's relay. Whether something accepts connections on
+    the port is no proof: once a relay exits, any local user can bind it.
+    """
     try:
-        with socket.create_connection(("127.0.0.1", info["port"]), timeout=0.5):
-            return True
-    except OSError:
-        return False
+        st = os.stat(RELAY_LOCK)
+        wanted = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+        with open("/proc/locks") as handle:
+            for line in handle:
+                # "1: FLOCK  ADVISORY  WRITE 1234 00:2a:5678 0 EOF"; lines for
+                # waiting processes have "->" in the second column.
+                parts = line.split()
+                if len(parts) >= 6 and parts[1] == "FLOCK" and parts[5] == wanted:
+                    return int(parts[4])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def relay_alive(info):
+    """True when info describes the relay that holds the lock right now."""
+    return bool(info.get("pid") and info.get("port") and info.get("token")
+                and relay_lock_holder() == info["pid"])
 
 
 RELAY_START_LOCK = threading.Lock()
@@ -395,7 +418,7 @@ def ensure_relay():
 
 def _ensure_relay():
     info = read_relay_info()
-    if info.get("pid") and relay_alive(info):
+    if relay_alive(info):
         return info
     subprocess.Popen(
         [sys.executable, "-I", os.path.realpath(__file__), "relay"],
@@ -408,7 +431,7 @@ def _ensure_relay():
     while time.monotonic() < deadline:
         time.sleep(0.05)
         fresh = read_relay_info()
-        if fresh.get("pid") != info.get("pid") and relay_alive(fresh):
+        if relay_alive(fresh):
             return fresh
     raise ProtectError("the stream relay did not start; run `eld-unifi-protect relay` to see why")
 
@@ -482,8 +505,11 @@ def encode_rtsp(start, headers, body):
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
 
 
-async def read_rtsp_async(reader):
-    """read_rtsp() for an asyncio StreamReader; None at end of stream."""
+async def read_rtsp_async(reader, max_body=RTSP_MAX_BODY):
+    """read_rtsp() for an asyncio StreamReader; None at end of stream.
+
+    Also None for anything oversized: too many headers or too long a body.
+    """
     try:
         first = await reader.readexactly(1)
         if first == b"$":
@@ -498,7 +524,11 @@ async def read_rtsp_async(reader):
                 break
             name, _, value = line.partition(":")
             headers.append((name.strip(), value.strip()))
+            if len(headers) > RTSP_MAX_HEADERS:
+                return None
         length = int(header_value(headers, "content-length") or 0)
+        if length < 0 or length > max_body:
+            return None
         body = await reader.readexactly(length) if length else b""
         return ("text", start, headers, body)
     except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, ValueError):
@@ -525,6 +555,7 @@ class RelaySession:
         self.console = None
         self.local_base = ""
         self.remote_base = ""
+        self.authenticated = False
 
     async def reply(self, code, reason, cseq):
         self.client_writer.write(f"RTSP/1.0 {code} {reason}\r\nCSeq: {cseq}\r\n\r\n".encode())
@@ -573,7 +604,14 @@ class RelaySession:
     async def run(self):
         try:
             while True:
-                message = await read_rtsp_async(self.client_reader)
+                if self.authenticated:
+                    message = await read_rtsp_async(self.client_reader)
+                else:
+                    # Show the token promptly, in a request, or go away.
+                    message = await asyncio.wait_for(
+                        read_rtsp_async(self.client_reader), RELAY_AUTH_TIMEOUT)
+                    if message is not None and message[0] == "frame":
+                        return
                 if message is None:
                     return
                 if message[0] == "frame":
@@ -593,6 +631,9 @@ class RelaySession:
                 if self.console is not None and console is not self.console:
                     await self.reply(400, "Bad Request", cseq)
                     return
+                if not self.authenticated:
+                    self.authenticated = True
+                    self.relay.pending -= 1
                 transport = header_value(headers, "transport")
                 if method == "SETUP" and "/TCP" not in transport.upper():
                     # Refuse UDP: FFmpeg then retries over TCP, which keeps
@@ -609,15 +650,17 @@ class RelaySession:
                 headers = [(n, self.to_upstream(v)) for n, v in headers]
                 self.upstream_writer.write(encode_rtsp(start, headers, body))
                 await self.upstream_writer.drain()
-        except OSError:
+        except (OSError, asyncio.TimeoutError):
             pass
         finally:
+            if not self.authenticated:
+                self.relay.pending -= 1
             self.close()
 
     async def pump_upstream(self):
         try:
             while True:
-                message = await read_rtsp_async(self.upstream_reader)
+                message = await read_rtsp_async(self.upstream_reader, RTSP_MAX_UPSTREAM_BODY)
                 if message is None:
                     return
                 if message[0] == "frame":
@@ -646,19 +689,16 @@ class RelaySession:
 class Relay:
     def __init__(self, config):
         self.consoles = {c["id"]: c for c in config["consoles"]}
-        previous = read_relay_info()
-        # Reuse the last port and token, so URLs handed out before an idle
-        # exit keep working when a player reconnects.
-        self.token = previous.get("token") or secrets.token_urlsafe(18)
+        # A fresh token and port every start: a token seen by anything that
+        # squatted an old port is worthless to the new relay.
+        self.token = secrets.token_urlsafe(18)
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self.server.bind(("127.0.0.1", int(previous.get("port") or 0)))
-        except OSError:
-            self.server.bind(("127.0.0.1", 0))
+        self.server.bind(("127.0.0.1", 0))
         self.port = self.server.getsockname()[1]
         self.server.listen(32)
         self.active = 0
+        self.pending = 0
         self.last_activity = time.monotonic()
 
     def serve(self):
@@ -677,6 +717,10 @@ class Relay:
         sock = writer.get_extra_info("socket")
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if self.pending >= RELAY_MAX_PENDING:
+            writer.close()
+            return
+        self.pending += 1
         self.active += 1
         try:
             await RelaySession(self, reader, writer).run()
@@ -688,6 +732,11 @@ class Relay:
         while True:
             await asyncio.sleep(5)
             if self.active == 0 and time.monotonic() - self.last_activity > RELAY_IDLE_EXIT:
+                # Leave nothing that names a port this relay no longer holds.
+                try:
+                    os.remove(RELAY_INFO)
+                except OSError:
+                    pass
                 os._exit(0)
 
 
@@ -698,11 +747,16 @@ def cmd_relay(args):
     # a write to a closed socket raises, and only that session ends.
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
-    lock = open(RELAY_LOCK, "w")
+    lock = open(RELAY_LOCK, "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return  # another relay is already running
+    # Until this relay writes its own, relay.json names a dead one.
+    try:
+        os.remove(RELAY_INFO)
+    except OSError:
+        pass
     Relay(require_config()).serve()
 
 
