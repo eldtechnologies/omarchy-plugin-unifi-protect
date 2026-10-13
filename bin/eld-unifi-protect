@@ -1380,6 +1380,26 @@ def armed_cameras(config, prefs):
     return {k: v for k, v in armed.items() if k in known}
 
 
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+BOOT_ID = boot_id()
+
+
+def seq_of(record, field):
+    """A monotonic stamp, only if finite and from this boot (the runtime
+    directory should not survive a reboot, but nothing must break if it does)."""
+    value = record.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return value if record.get("boot", BOOT_ID) == BOOT_ID else None
+
+
 def cleared_by(alert, ack):
     """Whether Clear came after this alert opened.
 
@@ -1388,8 +1408,9 @@ def cleared_by(alert, ack):
     can neither hide new alerts nor keep cleared ones; older entries without
     it compare wall-clock times.
     """
-    if isinstance(alert.get("seq"), (int, float)) and isinstance(ack.get("clearedSeq"), (int, float)):
-        return alert["seq"] <= ack["clearedSeq"]
+    alert_seq, cleared_seq = seq_of(alert, "seq"), seq_of(ack, "clearedSeq")
+    if alert_seq is not None and cleared_seq is not None:
+        return alert_seq <= cleared_seq
     return (alert.get("start") or 0) <= (ack.get("clearedAt") or 0)
 
 
@@ -1449,6 +1470,15 @@ def load_alerts():
             continue
         # Order against Clear and "seen" uses each alert's monotonic seq.
         alert = dict(alert, start=start, end=event_time(alert.get("end")))
+        if seq_of(alert, "seq") is None:
+            alert.pop("seq", None)
+            alert.pop("boot", None)
+            # Without seq, wall times decide: none may sit in the future,
+            # where Clear could never reach it.
+            now = time.time()
+            alert["start"] = min(alert["start"], now)
+            if alert["end"] is not None:
+                alert["end"] = min(alert["end"], now)
         if alert.get("image") and not alert_image_path(alert["image"]):
             alert["image"] = None
         kept.append(alert)
@@ -1780,6 +1810,7 @@ class AlertListener:
         self.status = {}
         self.event_cameras = {}      # event id -> camera id, for sparse updates
         self.event_starts = {}       # event id -> its start, likewise
+        self.opened = {}             # event ids that already opened an alert
         self.armed = {}
         self.config = None
         self.prefs_stamp = None
@@ -1849,7 +1880,13 @@ class AlertListener:
         changed = False
         now = time.time()
         kind_is_new = False
-        if kind and existing is None and self.allow_new_alert(camera["uid"], now):
+        # One alert per event, ever: a Clear must not be undone by the same
+        # event's next update.
+        if (kind and existing is None and event_id not in self.opened
+                and self.allow_new_alert(camera["uid"], now)):
+            self.opened[event_id] = True
+            if len(self.opened) > 1000:
+                self.opened.pop(next(iter(self.opened)))
             kind_is_new = True
             # Smart detections often arrive as an empty "add" followed by an
             # "update" naming what was seen, so either can open an alert.
@@ -1860,7 +1897,7 @@ class AlertListener:
                 "start": min(self.event_starts.get(event_id) or now, now), "end": None,
                 # When it was opened, on the boot's monotonic clock: what
                 # Clear and "seen" compare, so a clock step cannot reorder them.
-                "seq": time.monotonic(),
+                "seq": time.monotonic(), "boot": BOOT_ID,
             }
             self.alerts.append(existing)
             changed = True
@@ -2093,7 +2130,7 @@ def cmd_alert(args):
     if args.ack or args.clear:
         with ack_lock():
             ack = read_ack()
-            ack["ackedAt"], ack["ackedSeq"] = time.time(), time.monotonic()
+            ack["ackedAt"], ack["ackedSeq"], ack["boot"] = time.time(), time.monotonic(), BOOT_ID
             if args.clear:
                 ack["clearedAt"], ack["clearedSeq"] = ack["ackedAt"], ack["ackedSeq"]
             write_json(ALERTS_ACK_PATH, ack)

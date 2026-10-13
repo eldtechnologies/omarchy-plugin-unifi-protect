@@ -116,8 +116,11 @@ Panel {
 
   // Whether an alert came after an ack or Clear: on the boot's monotonic
   // clock when both carry it (immune to clock steps), else wall-clock time.
+  property string ackBoot: ""
   function after(alert, seq, at) {
-    return (alert.seq !== undefined && seq !== undefined) ? alert.seq > seq : alert.start > at
+    var sameBoot = alert.boot !== undefined && alert.boot === root.ackBoot
+    return (typeof alert.seq === "number" && typeof seq === "number" && sameBoot)
+           ? alert.seq > seq : alert.start > at
   }
   readonly property var logAlerts: alerts.filter(function(a) { return root.after(a, root.clearedSeq, root.clearedAt) })
                                          .slice().reverse()
@@ -149,6 +152,7 @@ Panel {
 
   function ago(seconds) {
     var age = root.nowSec - seconds
+    if (age < -60) return Qt.formatTime(new Date(seconds * 1000), "HH:mm")   // the clock went back
     if (age < 60) return "just now"
     if (age < 3600) return Math.floor(age / 60) + " min ago"
     return Qt.formatTime(new Date(seconds * 1000), "HH:mm")
@@ -157,7 +161,10 @@ Panel {
   // The newest alert for a camera within the last ten minutes, or null.
   function recentAlert(uid) {
     for (var i = alerts.length - 1; i >= 0; i--) {
-      if (alerts[i].uid === uid) return root.nowSec - alerts[i].start < 600 ? alerts[i] : null
+      if (alerts[i].uid === uid) {
+        var age = root.nowSec - alerts[i].start
+        return age >= -60 && age < 600 ? alerts[i] : null
+      }
     }
     return null
   }
@@ -883,6 +890,7 @@ Panel {
         root.clearedAt = ack.clearedAt || 0
         root.ackedSeq = ack.ackedSeq
         root.clearedSeq = ack.clearedSeq
+        root.ackBoot = ack.boot || ""
       } catch (error) { }
     }
   }

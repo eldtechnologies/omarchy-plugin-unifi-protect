@@ -165,6 +165,15 @@ class ListenerLifecycle(unittest.TestCase):
             lst.handle("nvr", {"item": {"id": f"flood{i}", "type": "ring", "device": "cam1"}})
         self.assertEqual(len(lst.alerts), h.ALERTS_PER_MINUTE)
 
+    def test_a_cleared_alert_does_not_come_back_with_its_events_next_update(self):
+        lst = self.listener()
+        item = {"id": "e7", "modelKey": "event", "type": "smartDetectZone", "device": "cam1",
+                "smartDetectTypes": ["person"]}
+        lst.handle("nvr", {"type": "add", "item": item})
+        lst.alerts = []                      # cleared
+        lst.handle("nvr", {"type": "update", "item": dict(item, smartDetectTypes=["person", "vehicle"])})
+        self.assertEqual(lst.alerts, [])
+
     def test_malformed_messages_are_ignored(self):
         lst = self.listener()
         for message in ([], {"item": []}, {"item": {"id": "e9", "device": ["cam1"], "type": "ring"}},
