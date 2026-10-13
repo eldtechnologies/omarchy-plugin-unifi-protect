@@ -210,8 +210,10 @@ def store_key(config, console, key):
         return "file"
 
 
-def load_config():
+def load_config(keys=True):
     """Return {"consoles": [...], "timeoutSec": n}, or None when unconfigured.
+
+    keys=False leaves every secret out (the relay needs only hosts and pins).
 
     Each UniFi console runs its own Protect with its own API key, so the
     config is a list. The original single-console shape is still read and
@@ -241,6 +243,11 @@ def load_config():
                           if c.get("host") and (c.get("apiKey") or c.get("keyStore") == "keyring")]
     if not config["consoles"]:
         return None
+    if not keys:
+        for console in config["consoles"]:
+            for field in ("apiKey", "loginPassword"):
+                console.pop(field, None)
+        return config
     resolve_keys(config)
     return config
 
@@ -534,6 +541,24 @@ def _ensure_relay():
     raise ProtectError("the stream relay did not start; run `eld-unifi-protect relay` to see why")
 
 
+def forget_streams(console):
+    """Drop a console's cached stream URLs (they hold its aliases) and routes."""
+    with STREAM_CACHE_LOCK:
+        cache = load_stream_cache()
+        kept = {k: v for k, v in cache.items() if not k.startswith(console["host"] + "/")}
+        if kept != cache:
+            write_json(STREAM_CACHE, kept)
+    try:
+        with relay_guard():
+            routes = load_relay_routes()
+            kept = {k: v for k, v in routes.items()
+                    if not (isinstance(v, dict) and v.get("console") == console["id"])}
+            if kept != routes:
+                write_json(RELAY_ROUTES, kept)
+    except ProtectError:
+        pass
+
+
 def load_relay_routes():
     try:
         with open(RELAY_ROUTES) as handle:
@@ -632,6 +657,34 @@ def encode_rtsp(start, headers, body):
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
 
 
+def loopback_peer_uid(peer, local):
+    """The uid that owns the other end of a loopback TCP connection.
+
+    Looked up in /proc/net/tcp by the connection's two endpoints. The relay
+    serves only its own user: a URL that leaked (say, to a journal another
+    account can read) is useless from any other account.
+    """
+    def endpoint(address):
+        host, port = address[:2]
+        return f"{socket.inet_aton(host)[::-1].hex().upper()}:{port:04X}"
+    wanted = (endpoint(peer), endpoint(local))
+    try:
+        with open("/proc/net/tcp") as handle:
+            next(handle)
+            for line in handle:
+                parts = line.split()
+                if (parts[1], parts[2]) == wanted:
+                    return int(parts[7])
+    except (OSError, ValueError, IndexError, StopIteration):
+        pass
+    return None
+
+
+def rtsp_line_ok(line):
+    """No bare CR or NUL: the far side may split lines differently."""
+    return "\r" not in line and "\0" not in line
+
+
 async def read_rtsp_async(reader, max_body=RTSP_MAX_BODY):
     """read_rtsp() for an asyncio StreamReader; None at end of stream.
 
@@ -644,11 +697,15 @@ async def read_rtsp_async(reader, max_body=RTSP_MAX_BODY):
             payload = await reader.readexactly(int.from_bytes(header[1:3], "big"))
             return ("frame", first + header + payload)
         start = (first + await reader.readuntil(b"\n")).decode("latin-1").rstrip("\r\n")
+        if not rtsp_line_ok(start):
+            return None
         headers = []
         while True:
             line = (await reader.readuntil(b"\n")).decode("latin-1").rstrip("\r\n")
             if not line:
                 break
+            if not rtsp_line_ok(line):
+                return None
             name, _, value = line.partition(":")
             headers.append((name.strip(), value.strip()))
             if len(headers) > RTSP_MAX_HEADERS:
@@ -696,8 +753,12 @@ class RelaySession:
         The route id must be one the helper registered for that console,
         and a session keeps the route it started with.
         """
-        parts = urllib.parse.urlsplit(url).path.split("/")
-        if len(parts) < 4 or not hmac.compare_digest(parts[1], self.relay.token):
+        try:
+            parts = urllib.parse.urlsplit(url).path.split("/")
+        except ValueError:
+            return None
+        if len(parts) < 4 or not hmac.compare_digest(parts[1].encode("latin-1", "replace"),
+                                                     self.relay.token.encode()):
             return None
         console = self.relay.consoles.get(parts[2])
         target = self.relay.lookup_route(parts[3])
@@ -733,7 +794,8 @@ class RelaySession:
         # console; they must point back at the relay or the player would
         # bypass it on the next request.
         self.remote_pattern = re.compile(
-            r"rtsps?://(?:" + re.escape(host) + r"|[^/\s;,\"]+)(?::\d+)?(?=/)", re.I)
+            r"(?:rtsp[su]?|satip)://(?:" + re.escape(host) + r"|[^/\s;,\"?#]+)(?::\d+)?"
+            r"(?=[/?#\s;,\"]|$)", re.I)
 
     def to_upstream(self, text):
         text = text.replace(self.local_base, self.remote_base)
@@ -798,7 +860,7 @@ class RelaySession:
                 headers = [(n, self.to_upstream(v)) for n, v in headers]
                 self.upstream_writer.write(encode_rtsp(start, headers, body))
                 await self.upstream_writer.drain()
-        except (OSError, asyncio.TimeoutError):
+        except (OSError, asyncio.TimeoutError, ValueError, UnicodeError):
             pass
         finally:
             self.relay.pending.pop(self, None)
@@ -817,12 +879,29 @@ class RelaySession:
                     headers = [(n, self.to_client(v)) for n, v in headers]
                     if body:
                         body = self.to_client(body.decode("latin-1")).encode("latin-1")
+                    if not self.keeps_player_here(start, headers, body):
+                        # A redirect, or a URL naming anywhere but this relay,
+                        # would take the player out of the TLS tunnel.
+                        cseq = header_value(headers, "cseq")
+                        start, headers, body = "RTSP/1.0 502 Bad Gateway", [("CSeq", cseq)], b""
                     self.client_writer.write(encode_rtsp(start, headers, body))
                 await self.client_writer.drain()
         except OSError:
             pass
         finally:
             self.close()
+
+    # What a player would follow: RTSP in every spelling FFmpeg accepts.
+    URL_ANYWHERE = re.compile(r"(?:rtsp[su]?|satip)://[^\s;,\"']*", re.I)
+
+    def keeps_player_here(self, start, headers, body):
+        """True unless a console response would send the player elsewhere."""
+        parts = start.split(" ", 2)
+        if len(parts) > 1 and parts[1][:1] == "3":
+            return False
+        texts = [v for _, v in headers] + [body.decode("latin-1")]
+        return all(url.startswith(self.local_base)
+                   for text in texts for url in self.URL_ANYWHERE.findall(text))
 
     def close(self):
         """Idempotent: either direction ending closes the whole session."""
@@ -833,9 +912,20 @@ class RelaySession:
                 writer.close()
 
 
+def relay_consoles():
+    """Hosts and pins of the configured consoles; never their keys."""
+    config = load_config(keys=False) or {"consoles": []}
+    return {c["id"]: {k: c.get(k) for k in ("id", "name", "host", "certSha256")}
+            for c in config["consoles"]}
+
+
 class Relay:
-    def __init__(self, config):
-        self.consoles = {c["id"]: c for c in config["consoles"]}
+    def __init__(self, config=None, lock_inode=None):
+        self.consoles = ({c["id"]: c for c in config["consoles"]} if config is not None
+                         else relay_consoles())
+        self.config_stamp = self.config_mtime()
+        self.lock_inode = lock_inode
+        self.sessions = set()
         # A fresh token and port every start: a token seen by anything that
         # squatted an old port is worthless to the new relay.
         self.token = secrets.token_urlsafe(18)
@@ -848,6 +938,29 @@ class Relay:
         self.active = 0
         self.pending = {}        # sessions that have not shown the token yet, oldest first
         self.last_activity = time.monotonic()
+
+    @staticmethod
+    def config_mtime():
+        try:
+            return os.stat(CONFIG_PATH).st_mtime_ns
+        except OSError:
+            return None
+
+    def reload_consoles(self):
+        """Pick up removed consoles and new certificate pins.
+
+        Sessions to a console that is gone, or whose pin changed, end.
+        """
+        stamp = self.config_mtime()
+        if stamp == self.config_stamp:
+            return
+        self.config_stamp = stamp
+        fresh = relay_consoles()
+        for session in list(self.sessions):
+            old = session.console
+            if old is not None and (fresh.get(old["id"]) or {}).get("certSha256") != old.get("certSha256"):
+                session.close()
+        self.consoles = fresh
 
     def lookup_route(self, route):
         if route not in self.routes:
@@ -872,7 +985,14 @@ class Relay:
         sock = writer.get_extra_info("socket")
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # This user's players only, whatever URL the caller has.
+        peer, local = writer.get_extra_info("peername"), writer.get_extra_info("sockname")
+        if not peer or loopback_peer_uid(peer, local) != os.getuid():
+            writer.close()
+            return
+        self.reload_consoles()
         session = RelaySession(self, reader, writer)
+        self.sessions.add(session)
         if len(self.pending) >= RELAY_MAX_PENDING:
             # Make room by dropping the oldest: a real player shows its token
             # within milliseconds, so idle connections can never crowd it out.
@@ -884,14 +1004,25 @@ class Relay:
         try:
             await session.run()
         finally:
+            self.sessions.discard(session)
             self.active -= 1
             self.last_activity = time.monotonic()
 
     async def reap_when_idle(self):
         while True:
             await asyncio.sleep(5)
+            # Uninstalled, or replaced by a newer relay: these files are not
+            # ours any more, so leave them alone and go.
+            try:
+                if self.lock_inode is not None and os.stat(RELAY_LOCK).st_ino != self.lock_inode:
+                    os._exit(0)
+            except OSError:
+                os._exit(0)
             if self.active == 0 and time.monotonic() - self.last_activity > RELAY_IDLE_EXIT:
-                self.exit_if_unwanted()
+                try:
+                    self.exit_if_unwanted()
+                except OSError:
+                    os._exit(0)
 
     def exit_if_unwanted(self):
         """Exit, unless a helper vouched for this relay within the idle time.
@@ -948,7 +1079,9 @@ def cmd_relay(args):
             os.remove(path)
         except OSError:
             pass
-    Relay(require_config()).serve()
+    if load_config(keys=False) is None:
+        raise ProtectError("not set up yet: run `eld-unifi-protect setup`")
+    Relay(lock_inode=os.fstat(lock.fileno()).st_ino).serve()
 
 
 def is_complete_jpeg(data):
@@ -3068,6 +3201,7 @@ def cmd_remove(args):
     config["consoles"].remove(console)
     clear_login(console, config)
     forget_recordings(console["id"])
+    forget_streams(console)
     if console.get("keyStore") == "keyring":
         try:
             keyring_clear(console["id"])

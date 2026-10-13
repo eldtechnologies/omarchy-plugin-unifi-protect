@@ -1,6 +1,7 @@
 """Unit tests for the parts of the helper that can break quietly."""
 
 import io
+import asyncio
 import json
 import os
 import socket
@@ -177,6 +178,38 @@ class RelayRewriting(unittest.TestCase):
         for text in ("a=control:/AbC/trackID=0", "Location: /AbC", "no such stream AbC"):
             self.assertNotIn("AbC", s.to_client(text))
         self.assertEqual(s.to_client("a=control:/AbC/trackID=0"), "a=control:/R1/trackID=0")
+
+    def test_redirects_and_foreign_urls_never_reach_the_player(self):
+        s = self.session()
+        s.route("rtsp://127.0.0.1:4000/tok/nvr/R1")
+        here = "rtsp://127.0.0.1:4000/tok/nvr/R1/"
+        self.assertTrue(s.keeps_player_here("RTSP/1.0 200 OK", [("Content-Base", here)], b"a=control:" + here.encode()))
+        self.assertFalse(s.keeps_player_here("RTSP/1.0 302 Moved", [("Location", here)], b""))
+        for value in ("satip://10.0.0.5:554/x", "rtspu://10.0.0.5/x", "RTSP://evil:554"):
+            self.assertFalse(s.keeps_player_here("RTSP/1.0 200 OK", [("Content-Base", value)], b""), value)
+        # Path-less console URLs are rewritten to the relay too.
+        self.assertEqual(s.to_client("Content-Base: rtsps://192.168.1.240:7441"),
+                         "Content-Base: rtsp://127.0.0.1:4000/tok/nvr")
+
+    def test_bare_carriage_returns_end_the_message(self):
+        async def parse(data):
+            reader = asyncio.StreamReader()
+            reader.feed_data(data)
+            reader.feed_eof()
+            return await h.read_rtsp_async(reader)
+        self.assertIsNone(asyncio.run(parse(b"OPTIONS x RTSP/1.0\r\nCSeq: 1\rX: y\r\n\r\n")))
+        self.assertIsNotNone(asyncio.run(parse(b"OPTIONS x RTSP/1.0\r\nCSeq: 1\r\n\r\n")))
+
+    def test_the_relay_knows_who_is_calling(self):
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        client = socket.create_connection(server.getsockname())
+        accepted, peer = server.accept()
+        for sock in (server, client, accepted):
+            self.addCleanup(sock.close)
+        self.assertEqual(h.loopback_peer_uid(peer, accepted.getsockname()), os.getuid())
+        self.assertIsNone(h.loopback_peer_uid(("127.0.0.1", 1), accepted.getsockname()))
 
     def test_route_requires_the_token_and_a_registered_route(self):
         s = self.session()
