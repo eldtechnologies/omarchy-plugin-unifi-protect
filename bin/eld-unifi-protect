@@ -16,8 +16,10 @@ import fcntl
 import getpass
 import hashlib
 import hmac
+import ipaddress
 import http.client
 import json
+import math
 import os
 import random
 import re
@@ -73,24 +75,41 @@ class ProtectError(Exception):
     pass
 
 
+class LoginRejected(ProtectError):
+    """The console turned the recordings login down; it needs re-entering."""
+
+
 # ---- files ---------------------------------------------------------------
 
 
 def write_atomic(path, data, mode=0o600):
     directory = os.path.dirname(path)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if directory:   # a bare file name is in the current directory
+        os.makedirs(directory, mode=0o700, exist_ok=True)
     # Unique per call, not per process: the wall resolves streams from
     # several threads, and a shared temp name let one thread rename the
     # other's file away.
     tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
-    with open(tmp, "wb") as handle:
-        handle.write(data if isinstance(data, bytes) else data.encode())
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    # Created with its final mode, never through a link: no moment where a
+    # file holding keys is readable by others, whatever the umask.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), mode)    # whatever the umask took off
+            handle.write(data if isinstance(data, bytes) else data.encode())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def write_json(path, value):
-    write_atomic(path, json.dumps(value, indent=2) + "\n")
+    # allow_nan=False: NaN and Infinity are not JSON, and the panel's parser
+    # rejects the whole file over one of them.
+    write_atomic(path, json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
 def slugify(text):
@@ -157,9 +176,21 @@ def keyring_lookup(console_id):
     return _key_cache[console_id]
 
 
+def keyring_still_has(service, console_id):
+    """True if the keyring still holds an item after a clear (a locked
+    collection keeps its items and secret-tool says nothing)."""
+    try:
+        result = _secret_tool(["search", "--all", "service", service, "console", console_id])
+    except KeyringUnavailable:
+        return False
+    return bool(result.stdout.strip())
+
+
 def keyring_clear(console_id):
     _key_cache.pop(console_id, None)
     _secret_tool(["clear", "service", KEYRING_SERVICE, "console", console_id])
+    if keyring_still_has(KEYRING_SERVICE, console_id):
+        raise KeyringUnavailable("the keyring kept the API key (is it locked?)")
 
 
 def resolve_keys(config):
@@ -180,7 +211,9 @@ def resolve_keys(config):
 def store_key(config, console, key):
     """Put a console's key in the keyring if possible, else in the file."""
     try:
-        keyring_store(console["id"], f"UniFi Protect API key ({console['name']}, {console['host']})", key)
+        # secret-tool takes the label as an argument, visible to other users
+        # while it runs: the console id (already the lookup key), no more.
+        keyring_store(console["id"], f"UniFi Protect API key ({console['id']})", key)
         console["keyStore"] = "keyring"
         console["apiKey"] = key
         return "keyring"
@@ -190,14 +223,16 @@ def store_key(config, console, key):
         return "file"
 
 
-def load_config():
+def load_config(keys=True, demo=True):
     """Return {"consoles": [...], "timeoutSec": n}, or None when unconfigured.
+
+    keys=False leaves every secret out (the relay needs only hosts and pins).
 
     Each UniFi console runs its own Protect with its own API key, so the
     config is a list. The original single-console shape is still read and
     converted on the next save.
     """
-    if demo_on():
+    if demo and demo_on():
         return demo_config()
     try:
         with open(CONFIG_PATH) as handle:
@@ -221,6 +256,11 @@ def load_config():
                           if c.get("host") and (c.get("apiKey") or c.get("keyStore") == "keyring")]
     if not config["consoles"]:
         return None
+    if not keys:
+        for console in config["consoles"]:
+            for field in ("apiKey", "loginPassword"):
+                console.pop(field, None)
+        return config
     resolve_keys(config)
     return config
 
@@ -235,8 +275,10 @@ def save_config(config):
         if entry.get("keyStore") == "keyring":
             entry.pop("apiKey", None)
         stored["consoles"].append(entry)
-    write_json(CONFIG_PATH, stored)
+    # Tighten the folder first, in case it was made by hand with looser rights.
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     os.chmod(CONFIG_DIR, 0o700)
+    write_json(CONFIG_PATH, stored)
 
 
 def require_config():
@@ -312,22 +354,52 @@ def fetch_cert_fingerprint(host, timeout=8):
 
 
 class PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, port, pin, timeout):
+    """HTTPS to a console: its pinned certificate, and a deadline.
+
+    The socket timeout bounds each read only, so a console trickling a byte
+    every few seconds could hold a request open for hours; after `deadline`
+    seconds in total the connection is cut instead.
+    """
+
+    def __init__(self, host, port, pin, timeout, deadline=60):
         context = ssl.create_default_context()
         if pin:
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
         super().__init__(host, port, timeout=timeout, context=context)
         self._pin = pin
+        self._raw = None
+        self._timer = threading.Timer(deadline, self._expire)
+        self._timer.daemon = True
+
+    def _expire(self):
+        # The raw socket: http.client hands it to the response and drops
+        # its own reference while the body is still being read.
+        # socket.socket.shutdown, not SSLSocket.shutdown: the latter drops the
+        # TLS layer first, after which reads would take plaintext straight
+        # from TCP. This way the next read fails inside TLS.
+        if self._raw is not None:
+            try:
+                socket.socket.shutdown(self._raw, socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def finish(self):
+        """Done with the request and its response: stop the clock, close."""
+        self._timer.cancel()
+        self.close()
 
     def connect(self):
+        if not self._timer.is_alive() and not self._timer.finished.is_set():
+            self._timer.start()
         super().connect()
+        self._raw = self.sock
         if self._pin:
             der = self.sock.getpeercert(binary_form=True)
             if hashlib.sha256(der).hexdigest() != self._pin:
                 self.sock.close()
                 raise ProtectError(
-                    "console certificate changed; if expected, run `eld-unifi-protect trust-cert`"
+                    "console certificate changed; if you expect that, run `eld-unifi-protect setup` and enter this console's address (it asks for the key again)"
                 )
 
 
@@ -359,10 +431,25 @@ def load_stream_cache():
 # Nothing unencrypted leaves the machine. The relay forces RTSP-over-TCP
 # (interleaved), so media never travels as separate UDP outside the tunnel,
 # and every URL carries a random token so other local users cannot use it.
+#
+# Nor does a loopback URL carry Protect's stream alias, which is all anyone
+# needs to watch a camera: it names a random route id, which only the relay
+# maps back to the alias (relay-routes.json, private). Whatever answers on a
+# relay port that has gone away learns nothing it could use.
 
-RELAY_INFO = os.path.join(RUNTIME_DIR, "relay.json")
-RELAY_LOCK = os.path.join(RUNTIME_DIR, "relay.lock")
+# Versioned names: a relay from before route ids (0.4.1 and older) keeps its
+# own files and serves its last players until it idles out, rather than
+# being killed while they still hold URLs with aliases in them.
+RELAY_INFO = os.path.join(RUNTIME_DIR, "relay2.json")
+RELAY_LOCK = os.path.join(RUNTIME_DIR, "relay2.lock")     # held by the running relay
+RELAY_GUARD = os.path.join(RUNTIME_DIR, "relay2-guard.lock")  # vouching vs. idle exit
+RELAY_ROUTES = os.path.join(RUNTIME_DIR, "relay2-routes.json")
 RELAY_IDLE_EXIT = 60
+RTSP_MAX_HEADERS = 64
+RTSP_MAX_BODY = 64 * 1024         # a player's request bodies are tiny
+RTSP_MAX_UPSTREAM_BODY = 1 << 20  # SDP and the like from the console
+RELAY_AUTH_TIMEOUT = 10           # seconds for a new connection to show its token
+RELAY_MAX_PENDING = 16            # connections that have not shown it yet
 STREAM_PORT = 7441
 
 
@@ -374,28 +461,85 @@ def read_relay_info():
         return {}
 
 
-def relay_alive(info):
-    if not info.get("port"):
+def relay_lock_held():
+    """True when a relay holds the relay lock.
+
+    Only this user can open the lock (the runtime directory is 0700), so its
+    holder is this user's relay. Whether something accepts connections on
+    the port is no proof: once a relay exits, any local user can bind it.
+    """
+    try:
+        fd = os.open(RELAY_LOCK, os.O_RDONLY)
+    except OSError:
         return False
     try:
-        with socket.create_connection(("127.0.0.1", info["port"]), timeout=0.5):
-            return True
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
     except OSError:
+        return False
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def relay_alive(info):
+    """True when info describes the relay that is running right now.
+
+    The relay deletes relay.json when it starts and stops, and records its
+    pid with that process's start time, so a stale file cannot pass even if
+    the pid has been reused.
+    """
+    try:
+        return bool(info.get("port") and info.get("token") and relay_lock_held()
+                    and process_start_time(int(info["pid"])) == info.get("started"))
+    except (OSError, ValueError, TypeError, KeyError):
         return False
 
 
 RELAY_START_LOCK = threading.Lock()
 
 
-def ensure_relay():
-    """Return the running relay's info, starting the relay if needed."""
-    with RELAY_START_LOCK:
-        return _ensure_relay()
+class relay_guard:
+    """Serialises vouching for the relay with the relay's own idle exit.
+
+    Held while a helper checks the relay, renews its lease and registers a
+    route, and by the relay while it decides to exit. So a relay that was
+    just vouched for always lives at least RELAY_IDLE_EXIT more seconds.
+    """
+
+    def __enter__(self):
+        os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+        self.fd = os.open(RELAY_GUARD, os.O_RDWR | os.O_CREAT, 0o600)
+        # Bounded: a helper stopped inside the guard (Ctrl+Z) must not hang
+        # every other one.
+        for _ in range(200):
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                time.sleep(0.05)
+        os.close(self.fd)
+        raise ProtectError("the stream relay is busy; try again")
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+
+
+def renew_relay_lease():
+    """The relay stays up at least RELAY_IDLE_EXIT seconds after this."""
+    try:
+        os.utime(RELAY_INFO)
+    except OSError:
+        pass
 
 
 def _ensure_relay():
     info = read_relay_info()
-    if info.get("pid") and relay_alive(info):
+    if relay_alive(info):
+        renew_relay_lease()
         return info
     subprocess.Popen(
         [sys.executable, "-I", os.path.realpath(__file__), "relay"],
@@ -408,16 +552,123 @@ def _ensure_relay():
     while time.monotonic() < deadline:
         time.sleep(0.05)
         fresh = read_relay_info()
-        if fresh.get("pid") != info.get("pid") and relay_alive(fresh):
+        if relay_alive(fresh):
             return fresh
     raise ProtectError("the stream relay did not start; run `eld-unifi-protect relay` to see why")
 
 
+ENABLED_STREAMS_PATH = os.path.join(STATE_DIR, "enabled-streams.json")
+ENABLED_STREAMS_LOCK = threading.RLock()
+
+
+def record_enabled_streams(console_id, camera_id, qualities):
+    """Remember streams this plugin switched on in Protect, so `doctor` and
+    uninstalling can say which to turn off again."""
+    try:
+        with file_lock(os.path.join(RUNTIME_DIR, "enabled-streams.lock"), ENABLED_STREAMS_LOCK):
+            try:
+                with open(ENABLED_STREAMS_PATH) as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            key = f"{console_id}_{camera_id}"
+            data[key] = sorted(set(data.get(key, [])) | set(qualities))
+            os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+            write_json(ENABLED_STREAMS_PATH, data)
+    except (OSError, ProtectError):
+        pass
+
+
+def cmd_enabled_streams(args):
+    """List the RTSPS streams this plugin switched on in Protect."""
+    try:
+        with open(ENABLED_STREAMS_PATH) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = {}
+    names = {c.get("uid"): f"{c.get('name')} ({c.get('consoleName')})"
+             for c in previous_state().get("cameras", [])}
+    if not data:
+        print("No streams are recorded as switched on by the plugin (it records them since\n"
+              "0.4.2; check camera → Settings → Advanced in Protect for older ones).")
+        return
+    print("Streams this plugin switched on in Protect (camera → Settings → Advanced to turn off):")
+    for uid, qualities in sorted(data.items()):
+        print(f"  {names.get(uid, uid)}: {', '.join(qualities)}")
+
+
+def forget_alerts(console_id):
+    """Drop a console's alerts and their pictures; the listener, if running,
+    does the same on its next save (within a minute)."""
+    with open(EVENTS_LOCK, "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        alerts = [a for a in load_alerts() if not str(a.get("uid", "")).startswith(console_id + "_")]
+        write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": alerts, "consoles": {}})
+        prune_alert_images({a.get("image") for a in alerts})
+
+
+def forget_streams(console):
+    """Drop a console's cached stream URLs (they hold its aliases) and routes."""
+    with STREAM_CACHE_LOCK:
+        cache = load_stream_cache()
+        kept = {k: v for k, v in cache.items() if not k.startswith(console["host"] + "/")}
+        if kept != cache:
+            write_json(STREAM_CACHE, kept)
+    try:
+        with relay_guard():
+            routes = load_relay_routes()
+            kept = {k: v for k, v in routes.items()
+                    if not (isinstance(v, dict) and v.get("console") == console["id"])}
+            if kept != routes:
+                write_json(RELAY_ROUTES, kept)
+    except ProtectError:
+        pass
+
+
+def load_relay_routes():
+    try:
+        with open(RELAY_ROUTES) as handle:
+            routes = json.load(handle)
+        return routes if isinstance(routes, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def register_relay_route(console_id, path):
+    """A route id for one console stream path; call under relay_guard()."""
+    routes = load_relay_routes()
+    for route, target in routes.items():
+        if target == {"console": console_id, "path": path}:
+            return route
+    route = secrets.token_urlsafe(12)
+    routes[route] = {"console": console_id, "path": path}
+    write_json(RELAY_ROUTES, routes)
+    return route
+
+
+def stream_path(rtsps_url):
+    """The path of one of Protect's RTSPS URLs, or None if it is not one."""
+    try:
+        path = urllib.parse.urlsplit(rtsps_url).path
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return path if re.fullmatch(r"(/[A-Za-z0-9_.~-]+)+", path or "") else None
+
+
 def relay_url(console_id, rtsps_url):
     """The loopback URL a player opens for one of Protect's RTSPS URLs."""
-    info = ensure_relay()
-    path = urllib.parse.urlsplit(rtsps_url).path
-    return f"rtsp://127.0.0.1:{info['port']}/{info['token']}/{console_id}{path}"
+    path = stream_path(rtsps_url)
+    if path is None:
+        raise ProtectError("console sent an unexpected stream URL")
+    with RELAY_START_LOCK, relay_guard():
+        info = _ensure_relay()
+        route = register_relay_route(console_id, path)
+    return f"rtsp://127.0.0.1:{info['port']}/{info['token']}/{console_id}/{route}"
 
 
 def read_exact(reader, count):
@@ -455,10 +706,14 @@ def read_rtsp(reader):
             break
         name, _, value = line.partition(":")
         headers.append((name.strip(), value.strip()))
+        if len(headers) > RTSP_MAX_HEADERS:
+            return None
     length = 0
     for name, value in headers:
         if name.lower() == "content-length":
             length = int(value or 0)
+    if length < 0 or length > RTSP_MAX_UPSTREAM_BODY:
+        return None
     body = read_exact(reader, length) if length else b""
     if body is None:
         return None
@@ -482,8 +737,39 @@ def encode_rtsp(start, headers, body):
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
 
 
-async def read_rtsp_async(reader):
-    """read_rtsp() for an asyncio StreamReader; None at end of stream."""
+def loopback_peer_uid(peer, local):
+    """The uid that owns the other end of a loopback TCP connection.
+
+    Looked up in /proc/net/tcp by the connection's two endpoints. The relay
+    serves only its own user: a URL that leaked (say, to a journal another
+    account can read) is useless from any other account.
+    """
+    def endpoint(address):
+        host, port = address[:2]
+        return f"{socket.inet_aton(host)[::-1].hex().upper()}:{port:04X}"
+    wanted = f" {endpoint(peer)} {endpoint(local)} "
+    try:
+        with open("/proc/net/tcp") as handle:
+            table = handle.read()
+        at = table.find(wanted)
+        if at >= 0:
+            line = table[table.rfind("\n", 0, at) + 1:table.find("\n", at)]
+            return int(line.split()[7])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def rtsp_line_ok(line):
+    """No bare CR or NUL: the far side may split lines differently."""
+    return "\r" not in line and "\0" not in line
+
+
+async def read_rtsp_async(reader, max_body=RTSP_MAX_BODY):
+    """read_rtsp() for an asyncio StreamReader; None at end of stream.
+
+    Also None for anything oversized: too many headers or too long a body.
+    """
     try:
         first = await reader.readexactly(1)
         if first == b"$":
@@ -491,14 +777,22 @@ async def read_rtsp_async(reader):
             payload = await reader.readexactly(int.from_bytes(header[1:3], "big"))
             return ("frame", first + header + payload)
         start = (first + await reader.readuntil(b"\n")).decode("latin-1").rstrip("\r\n")
+        if not rtsp_line_ok(start):
+            return None
         headers = []
         while True:
             line = (await reader.readuntil(b"\n")).decode("latin-1").rstrip("\r\n")
             if not line:
                 break
+            if not rtsp_line_ok(line):
+                return None
             name, _, value = line.partition(":")
             headers.append((name.strip(), value.strip()))
+            if len(headers) > RTSP_MAX_HEADERS:
+                return None
         length = int(header_value(headers, "content-length") or 0)
+        if length < 0 or length > max_body:
+            return None
         body = await reader.readexactly(length) if length else b""
         return ("text", start, headers, body)
     except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError, ValueError):
@@ -525,17 +819,35 @@ class RelaySession:
         self.console = None
         self.local_base = ""
         self.remote_base = ""
+        self.authenticated = False
+        self.route_path = ""     # "/<route id>", what the player sees
+        self.alias_path = ""     # "/<Protect alias>", what the console sees
 
     async def reply(self, code, reason, cseq):
         self.client_writer.write(f"RTSP/1.0 {code} {reason}\r\nCSeq: {cseq}\r\n\r\n".encode())
         await self.client_writer.drain()
 
     def route(self, url):
-        """Check the token and find the console a request URL names."""
-        parts = urllib.parse.urlsplit(url).path.split("/")
-        if len(parts) < 3 or not hmac.compare_digest(parts[1], self.relay.token):
+        """Check the token and route; return the console the URL names.
+
+        The route id must be one the helper registered for that console,
+        and a session keeps the route it started with.
+        """
+        try:
+            parts = urllib.parse.urlsplit(url).path.split("/")
+        except ValueError:
             return None
-        return self.relay.consoles.get(parts[2])
+        if len(parts) < 4 or not hmac.compare_digest(parts[1].encode("latin-1", "replace"),
+                                                     self.relay.token.encode()):
+            return None
+        console = self.relay.consoles.get(parts[2])
+        target = self.relay.lookup_route(parts[3])
+        if console is None or target is None or target.get("console") != console["id"]:
+            return None
+        if self.route_path and self.route_path != "/" + parts[3]:
+            return None
+        self.route_path, self.alias_path = "/" + parts[3], target["path"]
+        return console
 
     async def connect(self, console):
         name, _ = split_host(console["host"])
@@ -562,18 +874,34 @@ class RelaySession:
         # console; they must point back at the relay or the player would
         # bypass it on the next request.
         self.remote_pattern = re.compile(
-            r"rtsps?://(?:" + re.escape(host) + r"|[^/\s;,\"]+)(?::\d+)?(?=/)", re.I)
+            r"(?:rtsp[su]?|satip)://(?:" + re.escape(host) + r"|[^/\s;,\"?#]+)(?::\d+)?"
+            r"(?=[/?#\s;,\"]|$)", re.I)
 
     def to_upstream(self, text):
-        return text.replace(self.local_base, self.remote_base)
+        text = text.replace(self.local_base, self.remote_base)
+        return text.replace(self.route_path, self.alias_path) if self.route_path else text
 
     def to_client(self, text):
-        return self.remote_pattern.sub(self.local_base, text)
+        # The alias stays between the relay and the console: responses name
+        # the route id instead, wherever the alias appears (absolute URLs,
+        # path-only control URLs, error bodies). Both are random strings.
+        text = self.remote_pattern.sub(self.local_base, text)
+        if not self.alias_path:
+            return text
+        text = text.replace(self.alias_path, self.route_path)
+        return text.replace(self.alias_path.rsplit("/", 1)[-1], self.route_path.rsplit("/", 1)[-1])
 
     async def run(self):
         try:
             while True:
-                message = await read_rtsp_async(self.client_reader)
+                if self.authenticated:
+                    message = await read_rtsp_async(self.client_reader)
+                else:
+                    # Show the token promptly, in a request, or go away.
+                    message = await asyncio.wait_for(
+                        read_rtsp_async(self.client_reader), RELAY_AUTH_TIMEOUT)
+                    if message is not None and message[0] == "frame":
+                        return
                 if message is None:
                     return
                 if message[0] == "frame":
@@ -590,9 +918,12 @@ class RelaySession:
                 if console is None:
                     await self.reply(404, "Not Found", cseq)
                     return
-                if self.console is not None and console is not self.console:
+                if self.console is not None and console["id"] != self.console["id"]:
                     await self.reply(400, "Bad Request", cseq)
                     return
+                if not self.authenticated:
+                    self.authenticated = True
+                    self.relay.pending.pop(self, None)
                 transport = header_value(headers, "transport")
                 if method == "SETUP" and "/TCP" not in transport.upper():
                     # Refuse UDP: FFmpeg then retries over TCP, which keeps
@@ -609,30 +940,59 @@ class RelaySession:
                 headers = [(n, self.to_upstream(v)) for n, v in headers]
                 self.upstream_writer.write(encode_rtsp(start, headers, body))
                 await self.upstream_writer.drain()
-        except OSError:
+        except (OSError, asyncio.TimeoutError, ValueError, UnicodeError):
             pass
         finally:
+            self.relay.pending.pop(self, None)
             self.close()
 
     async def pump_upstream(self):
         try:
             while True:
-                message = await read_rtsp_async(self.upstream_reader)
+                message = await read_rtsp_async(self.upstream_reader, RTSP_MAX_UPSTREAM_BODY)
                 if message is None:
                     return
                 if message[0] == "frame":
                     self.client_writer.write(message[1])
                 else:
                     _, start, headers, body = message
-                    headers = [(n, self.to_client(v)) for n, v in headers]
+                    headers = [(n, self.to_client(v)) for n, v in headers
+                               if n.strip().lower() not in self.DROPPED_HEADERS]
                     if body:
                         body = self.to_client(body.decode("latin-1")).encode("latin-1")
+                    if not self.keeps_player_here(start, headers, body):
+                        # A redirect, or a URL naming anywhere but this relay,
+                        # would take the player out of the TLS tunnel.
+                        cseq = header_value(headers, "cseq")
+                        start, headers, body = "RTSP/1.0 502 Bad Gateway", [("CSeq", cseq)], b""
                     self.client_writer.write(encode_rtsp(start, headers, body))
                 await self.client_writer.drain()
         except OSError:
             pass
         finally:
             self.close()
+
+    # A response must look exactly like this, or the player gets a 502: no
+    # odd spacing, signs or leading zeros FFmpeg would still read as 3xx.
+    STATUS_LINE = re.compile(r"RTSP/1\.0 ([1-9][0-9][0-9]) [\x20-\x7e]*")
+    # Any RTSP-ish scheme as FFmpeg would read it ("rtsp:host" too).
+    SCHEME = re.compile(r"(?:rtsp[hsu]?|satip)\s*:", re.I)
+    DROPPED_HEADERS = {"location", "content-location"}
+
+    def keeps_player_here(self, start, headers, body):
+        """True unless a console response could send the player elsewhere.
+
+        Only well-formed, non-redirect responses pass, and every RTSP URL
+        in them must already point at this relay.
+        """
+        status = self.STATUS_LINE.fullmatch(start)
+        if not status or status.group(1)[0] == "3":
+            return False
+        for text in [v for _, v in headers] + [body.decode("latin-1")]:
+            for match in self.SCHEME.finditer(text):
+                if not text.startswith(self.local_base, match.start()):
+                    return False
+        return True
 
     def close(self):
         """Idempotent: either direction ending closes the whole session."""
@@ -643,30 +1003,73 @@ class RelaySession:
                 writer.close()
 
 
+def relay_consoles():
+    """Hosts and pins of the configured consoles; never their keys."""
+    config = load_config(keys=False) or {"consoles": []}
+    return {c["id"]: {k: c.get(k) for k in ("id", "name", "host", "certSha256")}
+            for c in config["consoles"]}
+
+
 class Relay:
-    def __init__(self, config):
-        self.consoles = {c["id"]: c for c in config["consoles"]}
-        previous = read_relay_info()
-        # Reuse the last port and token, so URLs handed out before an idle
-        # exit keep working when a player reconnects.
-        self.token = previous.get("token") or secrets.token_urlsafe(18)
+    def __init__(self, config=None, lock_inode=None):
+        self.consoles = ({c["id"]: c for c in config["consoles"]} if config is not None
+                         else relay_consoles())
+        self.peer_checks = asyncio.Semaphore(4)
+        self.config_stamp = self.config_mtime()
+        self.lock_inode = lock_inode
+        self.sessions = set()
+        # A fresh token and port every start: a token seen by anything that
+        # squatted an old port is worthless to the new relay.
+        self.token = secrets.token_urlsafe(18)
+        self.routes = {}
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self.server.bind(("127.0.0.1", int(previous.get("port") or 0)))
-        except OSError:
-            self.server.bind(("127.0.0.1", 0))
+        self.server.bind(("127.0.0.1", 0))
         self.port = self.server.getsockname()[1]
         self.server.listen(32)
         self.active = 0
+        self.pending = {}        # sessions that have not shown the token yet, oldest first
         self.last_activity = time.monotonic()
+
+    @staticmethod
+    def config_mtime():
+        try:
+            return os.stat(CONFIG_PATH).st_mtime_ns
+        except OSError:
+            return None
+
+    def reload_consoles(self):
+        """Pick up removed consoles and new certificate pins.
+
+        Sessions to a console that is gone, or whose pin changed, end.
+        """
+        stamp = self.config_mtime()
+        if stamp == self.config_stamp:
+            return
+        self.config_stamp = stamp
+        fresh = relay_consoles()
+        for session in list(self.sessions):
+            old = session.console
+            new = fresh.get(old["id"]) if old is not None else None
+            if old is not None and (new is None or new.get("certSha256") != old.get("certSha256")
+                                    or new.get("host") != old.get("host")):
+                session.close()
+        self.consoles = fresh
+        self.routes = {}       # re-read: a removed console's routes are gone
+
+    def lookup_route(self, route):
+        if route not in self.routes:
+            self.routes = load_relay_routes()
+        target = self.routes.get(route)
+        return target if isinstance(target, dict) and isinstance(target.get("path"), str) else None
 
     def serve(self):
         """Run the relay's event loop; blocks until the relay exits."""
         asyncio.run(self._serve())
 
     async def _serve(self):
-        write_json(RELAY_INFO, {"pid": os.getpid(), "port": self.port, "token": self.token})
+        write_json(RELAY_INFO, {"pid": os.getpid(), "started": process_start_time(os.getpid()),
+                                "port": self.port, "token": self.token})
         server = await asyncio.start_server(self.handle, sock=self.server)
         reaper = asyncio.create_task(self.reap_when_idle())
         async with server:
@@ -677,18 +1080,81 @@ class Relay:
         sock = writer.get_extra_info("socket")
         if sock is not None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # This user's players only, whatever URL the caller has.
+        peer, local = writer.get_extra_info("peername"), writer.get_extra_info("sockname")
+        # Off the event loop, a few at a time: a long /proc/net/tcp must not
+        # stall the streams already playing.
+        async with self.peer_checks:
+            uid = await asyncio.to_thread(loopback_peer_uid, peer, local) if peer else None
+        if uid != os.getuid():
+            writer.close()
+            return
+        self.reload_consoles()
+        session = RelaySession(self, reader, writer)
+        self.sessions.add(session)
+        if len(self.pending) >= RELAY_MAX_PENDING:
+            # Make room by dropping the oldest: a real player shows its token
+            # within milliseconds, so idle connections can never crowd it out.
+            oldest = next(iter(self.pending))
+            del self.pending[oldest]
+            oldest.client_writer.close()
+        self.pending[session] = None
         self.active += 1
         try:
-            await RelaySession(self, reader, writer).run()
+            await session.run()
         finally:
+            self.sessions.discard(session)
             self.active -= 1
             self.last_activity = time.monotonic()
 
     async def reap_when_idle(self):
         while True:
             await asyncio.sleep(5)
-            if self.active == 0 and time.monotonic() - self.last_activity > RELAY_IDLE_EXIT:
+            # Removed consoles and new certificates take effect within 5 s,
+            # for streams already playing too.
+            try:
+                self.reload_consoles()
+            except ProtectError:
+                pass
+            # Uninstalled, or replaced by a newer relay: these files are not
+            # ours any more, so leave them alone and go.
+            try:
+                if self.lock_inode is not None and os.stat(RELAY_LOCK).st_ino != self.lock_inode:
+                    os._exit(0)
+            except OSError:
                 os._exit(0)
+            if self.active == 0 and time.monotonic() - self.last_activity > RELAY_IDLE_EXIT:
+                try:
+                    self.exit_if_unwanted()
+                except OSError:
+                    os._exit(0)
+
+    def exit_if_unwanted(self):
+        """Exit, unless a helper vouched for this relay within the idle time.
+
+        Decided under the guard lock, which helpers hold while they vouch,
+        so a relay never exits between being vouched for and being used.
+        """
+        fd = os.open(RELAY_GUARD, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return  # a helper is busy with the relay; ask again next time
+        try:
+            if time.time() - os.stat(RELAY_INFO).st_mtime < RELAY_IDLE_EXIT:
+                os.close(fd)
+                return
+        except OSError:
+            pass
+        # Leave nothing that names a port or route this relay no longer
+        # serves; the locks go with the process.
+        for path in (RELAY_INFO, RELAY_ROUTES):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        os._exit(0)
 
 
 def cmd_relay(args):
@@ -698,12 +1164,29 @@ def cmd_relay(args):
     # a write to a closed socket raises, and only that session ends.
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
-    lock = open(RELAY_LOCK, "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return  # another relay is already running
-    Relay(require_config()).serve()
+    lock = open(RELAY_LOCK, "a")
+    # A helper checking for a relay holds a shared lock for an instant;
+    # only a relay holds it for long.
+    for _ in range(40):
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if relay_alive(read_relay_info()):
+                return  # another relay is already running
+            time.sleep(0.05)
+    else:
+        return
+    # Until this relay writes its own, relay.json and the routes belong to a
+    # dead one.
+    for path in (RELAY_INFO, RELAY_ROUTES):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if load_config(keys=False) is None:
+        raise ProtectError("not set up yet: run `eld-unifi-protect setup`")
+    Relay(lock_inode=os.fstat(lock.fileno()).st_ino).serve()
 
 
 def is_complete_jpeg(data):
@@ -740,7 +1223,15 @@ NOTIFY_EVERY = 60   # seconds; at most one notification per camera per minute
 CAPTURE_EVERY = 5   # seconds; at most one alert snapshot per camera
 PLUGIN_ID = "com.eldtechnologies.unifi-protect"
 ALERTS_MAX_AGE = 24 * 3600
+ALERTS_PER_MINUTE = 10      # new alerts per camera
+ALERT_SKEW = 300            # seconds a console's clock may run ahead
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def smart_types(event):
+    """An event's smartDetectTypes, only if it really is a list of strings."""
+    seen = event.get("smartDetectTypes")
+    return [t for t in seen if isinstance(t, str)] if isinstance(seen, list) else []
 
 
 def alert_kind(event, triggers):
@@ -751,19 +1242,28 @@ def alert_kind(event, triggers):
     if kind == "motion":
         return "motion" if "motion" in triggers else None
     if kind in SMART_EVENT_TYPES:
-        for detected in event.get("smartDetectTypes") or []:
+        for detected in smart_types(event):
             if detected in triggers:
                 return detected
     return None
 
 
 def event_time(value):
-    """Protect timestamps are epoch milliseconds; return epoch seconds."""
+    """Protect timestamps are epoch milliseconds; return epoch seconds.
+
+    None for anything that is not a plausible time (NaN, Infinity, or outside
+    2000-2100): a console's numbers end up in alerts.json and in strftime.
+    """
+    if isinstance(value, bool):
+        return None
     try:
         value = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    return value / 1000 if value > 1e11 else value
+    if not math.isfinite(value):
+        return None
+    value = value / 1000 if value > 1e11 else value
+    return value if 946684800 <= value <= 4102444800 else None
 
 
 def ws_frame(opcode, payload=b""):
@@ -792,7 +1292,7 @@ async def ws_open(console, path, timeout=10):
     der = writer.get_extra_info("ssl_object").getpeercert(binary_form=True)
     if hashlib.sha256(der).hexdigest() != console.get("certSha256"):
         writer.close()
-        raise ProtectError("console certificate changed; if expected, run `eld-unifi-protect trust-cert`")
+        raise ProtectError("console certificate changed; if you expect that, run `eld-unifi-protect setup` and enter this console's address (it asks for the key again)")
     key = base64.b64encode(os.urandom(16)).decode()
     writer.write((f"GET {path} HTTP/1.1\r\nHost: {name}\r\nUpgrade: websocket\r\n"
                   f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
@@ -805,7 +1305,7 @@ async def ws_open(console, path, timeout=10):
         writer.close()
         if len(status) > 1 and status[1] in ("401", "403"):
             raise ProtectError("console rejected the API key for events")
-        raise ProtectError(f"event stream refused: {lines[0]}")
+        raise ProtectError(f"event stream refused: {clean_text(lines[0], '', 120)}")
     expected = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
     accept = next((l.split(":", 1)[1].strip() for l in lines[1:]
                    if l.lower().startswith("sec-websocket-accept:")), "")
@@ -836,16 +1336,23 @@ async def ws_messages(reader, writer, idle=60):
         pinged = False
         fin, opcode = head[0] & 0x80, head[0] & 0x0F
         masked, length = head[1] & 0x80, head[1] & 0x7F
+        # Once a frame has begun, the rest must follow promptly: a console
+        # that stalls mid-frame would otherwise freeze alerts unnoticed.
         if length == 126:
-            length = int.from_bytes(await reader.readexactly(2), "big")
+            length = int.from_bytes(await asyncio.wait_for(reader.readexactly(2), idle), "big")
         elif length == 127:
-            length = int.from_bytes(await reader.readexactly(8), "big")
+            length = int.from_bytes(await asyncio.wait_for(reader.readexactly(8), idle), "big")
         if length > 1 << 20:
             raise ProtectError("event message too large")
-        mask = await reader.readexactly(4) if masked else None
-        payload = await reader.readexactly(length)
-        if mask:
-            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        if opcode & 0x8 and length > 125:
+            raise ProtectError("event stream sent an oversized control frame")
+        if opcode in (0x0, 0x1) and len(fragments) + length > 1 << 20:
+            # Fragments add up: cap the whole message, not just each frame.
+            raise ProtectError("event message too large")
+        if masked:
+            # Servers never mask (RFC 6455); unmasking in Python is slow.
+            raise ProtectError("event stream sent a masked frame")
+        payload = await asyncio.wait_for(reader.readexactly(length), idle)
         if opcode == 0x9:
             writer.write(ws_frame(0xA, payload))
             await writer.drain()
@@ -873,12 +1380,57 @@ def armed_cameras(config, prefs):
     return {k: v for k, v in armed.items() if k in known}
 
 
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+BOOT_ID = boot_id()
+
+
+def seq_of(record, field):
+    """A monotonic stamp, only if finite and from this boot (the runtime
+    directory should not survive a reboot, but nothing must break if it does)."""
+    value = record.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return value if record.get("boot", BOOT_ID) == BOOT_ID else None
+
+
+def cleared_by(alert, ack):
+    """Whether Clear came after this alert opened.
+
+    Compared on the boot's monotonic clock when both carry it (the runtime
+    directory, like that clock, starts afresh at boot), so a wall-clock step
+    can neither hide new alerts nor keep cleared ones; older entries without
+    it compare wall-clock times.
+    """
+    alert_seq, cleared_seq = seq_of(alert, "seq"), seq_of(ack, "clearedSeq")
+    if alert_seq is not None and cleared_seq is not None:
+        return alert_seq <= cleared_seq
+    return (alert.get("start") or 0) <= (ack.get("clearedAt") or 0)
+
+
+ACK_THREAD_LOCK = threading.RLock()
+
+
+def ack_lock():
+    """Shared by everything that rewrites alerts-ack.json."""
+    return file_lock(os.path.join(RUNTIME_DIR, "alerts-ack.lock"), ACK_THREAD_LOCK)
+
+
 def read_ack():
+    """When alerts were last seen and cleared (wall clock, plus the monotonic
+    clock for ordering: see cleared_by)."""
     try:
         with open(ALERTS_ACK_PATH) as handle:
-            return json.load(handle)
+            ack = json.load(handle)
     except (OSError, ValueError):
         return {}
+    return ack if isinstance(ack, dict) else {}
 
 
 def alert_image_path(name):
@@ -907,12 +1459,29 @@ def load_alerts():
     except (OSError, ValueError, AttributeError):
         return []
     # Only alerts with a valid event ID, and an image only if its name is safe.
+    # Times are checked again too: an older version could save NaN or
+    # Infinity, which no JSON writer or strftime takes.
     kept = []
     for alert in alerts if isinstance(alerts, list) else []:
-        if isinstance(alert, dict) and EVENT_ID.fullmatch(str(alert.get("id") or "")):
-            if alert.get("image") and not alert_image_path(alert["image"]):
-                alert = dict(alert, image=None)
-            kept.append(alert)
+        if not isinstance(alert, dict) or not EVENT_ID.fullmatch(str(alert.get("id") or "")):
+            continue
+        start = event_time(alert.get("start"))
+        if start is None:
+            continue
+        # Order against Clear and "seen" uses each alert's monotonic seq.
+        alert = dict(alert, start=start, end=event_time(alert.get("end")))
+        if seq_of(alert, "seq") is None:
+            alert.pop("seq", None)
+            alert.pop("boot", None)
+            # Without seq, wall times decide: none may sit in the future,
+            # where Clear could never reach it.
+            now = time.time()
+            alert["start"] = min(alert["start"], now)
+            if alert["end"] is not None:
+                alert["end"] = min(alert["end"], now)
+        if alert.get("image") and not alert_image_path(alert["image"]):
+            alert["image"] = None
+        kept.append(alert)
     return kept
 
 
@@ -987,8 +1556,8 @@ class DBusWriter:
 
     def variant(self, code, value):
         self.signature(code)
-        {"s": self.string, "o": self.string, "u": self.uint32,
-         "y": self.byte, "g": self.signature}[code](value)
+        {"s": self.string, "o": self.string, "u": self.uint32, "y": self.byte,
+         "g": self.signature, "b": lambda v: self.uint32(1 if v else 0)}[code](value)
 
 
 def dbus_message(kind, serial, fields, signature="", body=b""):
@@ -1110,13 +1679,16 @@ async def dbus_connect(path, timeout=5):
     """Open and authenticate a session bus connection (EXTERNAL, as this uid)."""
     # A leading NUL is an abstract socket; asyncio takes those as they are.
     reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(path), timeout)
-    writer.write(b"\0AUTH EXTERNAL " + str(os.getuid()).encode().hex().encode() + b"\r\n")
-    await writer.drain()
-    answer = await asyncio.wait_for(reader.readline(), timeout)
-    if not answer.startswith(b"OK "):
+    try:
+        writer.write(b"\0AUTH EXTERNAL " + str(os.getuid()).encode().hex().encode() + b"\r\n")
+        await writer.drain()
+        answer = await asyncio.wait_for(reader.readline(), timeout)
+        if not answer.startswith(b"OK "):
+            raise ProtectError("the session bus refused the connection")
+        writer.write(b"BEGIN\r\n")
+    except BaseException:
         writer.close()
-        raise ProtectError("the session bus refused the connection")
-    writer.write(b"BEGIN\r\n")
+        raise
     return reader, writer
 
 
@@ -1124,17 +1696,26 @@ class DBusConnection:
     def __init__(self, reader, writer):
         self.reader, self.writer, self.serial = reader, writer, 0
         self.signals = []
+        self.reply_sender = None
 
-    async def call(self, destination, path, interface, member, signature="", body=b"", timeout=10):
+    async def call(self, destination, path, interface, member, signature="", body=b"", timeout=10,
+                   sender=None):
+        """Call a method; replies from anyone but the expected sender (the bus
+        itself for its own methods) are ignored."""
+        if sender is None and destination == "org.freedesktop.DBus":
+            sender = "org.freedesktop.DBus"
         self.serial += 1
         serial = self.serial
         self.writer.write(dbus_call(serial, destination, path, interface, member, signature, body))
         await self.writer.drain()
         while True:
             kind, fields, values, _ = await asyncio.wait_for(dbus_read(self.reader), timeout)
+            if kind in (2, 3) and fields.get(5) == serial and sender not in (None, fields.get(7)):
+                continue    # a reply someone else sent in the service's place
             if kind in (2, 3) and fields.get(5) == serial:
                 if kind == 3:
                     raise ProtectError(f"D-Bus error: {fields.get(4)}")
+                self.reply_sender = fields.get(7)
                 return values
             if kind == 4:
                 self.signals.append((fields, values))
@@ -1166,7 +1747,8 @@ def notify_body(summary, body, image, actions, timeout_ms=-1):
     out.array(4, write_actions)
 
     def write_hints():
-        hints = [("urgency", "y", 1)]
+        # transient: "show it, don't keep it" (what a history may honour).
+        hints = [("urgency", "y", 1), ("transient", "b", True)]
         if image:
             hints.append(("image-path", "s", "file://" + image))
         for key, code, value in hints:
@@ -1190,8 +1772,17 @@ async def send_desktop_notification(summary, body, image="", actions=(), wait=36
         match.string(f"type='signal',sender='{NOTIFY_NAME}',interface='{NOTIFY_NAME}',path='{NOTIFY_PATH}'")
         await bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
                        "AddMatch", "s", bytes(match.buf))
+        # Who owns the notification service, as the bus itself says: only
+        # that connection may answer Notify or report a chosen action.
+        name = DBusWriter()
+        name.string(NOTIFY_NAME)
+        owner = await bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                               "GetNameOwner", "s", bytes(name.buf), sender="org.freedesktop.DBus")
+        if not owner:
+            raise ProtectError("no notification service on the bus")
+        server = owner[0]
         values = await bus.call(NOTIFY_NAME, NOTIFY_PATH, NOTIFY_NAME, "Notify", "susssasa{sv}i",
-                                notify_body(summary, body, image, list(actions)))
+                                notify_body(summary, body, image, list(actions)), sender=server)
         notification = values[0] if values else None
         if not actions:
             return None
@@ -1199,7 +1790,9 @@ async def send_desktop_notification(summary, body, image="", actions=(), wait=36
         async def chosen():
             while True:
                 fields, values = await bus.signal()
-                if not values or values[0] != notification:
+                # Only the service that showed it speaks for the notification.
+                if (fields.get(7) != server or fields.get(2) != NOTIFY_NAME
+                        or fields.get(1) != NOTIFY_PATH or not values or values[0] != notification):
                     continue
                 if fields.get(3) == "ActionInvoked" and len(values) > 1:
                     return values[1]
@@ -1216,6 +1809,8 @@ class AlertListener:
         self.alerts = load_alerts()
         self.status = {}
         self.event_cameras = {}      # event id -> camera id, for sparse updates
+        self.event_starts = {}       # event id -> its start, likewise
+        self.opened = {}             # event ids that already opened an alert
         self.armed = {}
         self.config = None
         self.prefs_stamp = None
@@ -1223,6 +1818,11 @@ class AlertListener:
         self.notify_enabled = True
         self.last_notified = {}      # camera uid -> time of its last notification
         self.last_captured = {}      # camera uid -> time of its last alert snapshot
+        self.recent = {}             # camera uid -> times of its latest new alerts
+        self.dirty = False           # alerts changed since the last save
+        self.last_save = 0.0
+
+        self.ack_stamp = None
 
     def refresh(self):
         """Re-read config and arming when cameras.json or config.json change."""
@@ -1241,47 +1841,89 @@ class AlertListener:
         self.notify_enabled = prefs["notify"]
 
     def save(self):
-        # Older than a day, or before the user last cleared the log: drop.
-        cutoff = max(time.time() - ALERTS_MAX_AGE, read_ack().get("clearedAt", 0))
-        self.alerts = [a for a in self.alerts if (a.get("start") or 0) > cutoff][-ALERTS_KEEP:]
+        if plugin_gone():
+            return      # uninstalled: write nothing, not even a runtime dir
+        now = time.time()
+        ack = read_ack()
+        # A console that was removed takes its alerts (and pictures) along.
+        known = {c["id"] for c in (self.config or {}).get("consoles", [])} if self.config else None
+        self.alerts = [a for a in self.alerts
+                       if (a.get("start") or 0) > now - ALERTS_MAX_AGE and not cleared_by(a, ack)
+                       and (known is None or str(a.get("uid", "")).split("_")[0] in known)][-ALERTS_KEEP:]
+        self.dirty, self.last_save = False, time.monotonic()
         write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": self.alerts,
                                  "consoles": self.status})
         prune_alert_images({a.get("image") for a in self.alerts})
 
     def handle(self, console_id, message):
-        item = message.get("item") or {}
-        if item.get("modelKey", "event") != "event" or not item.get("id"):
+        item = message.get("item") if isinstance(message, dict) else None
+        if not isinstance(item, dict) or item.get("modelKey", "event") != "event" or not item.get("id"):
             return
         event_id = str(item["id"])
         if not EVENT_ID.fullmatch(event_id):
             return  # not a Protect ID; it would name the snapshot file
         camera_id = item.get("device") or self.event_cameras.get(event_id)
-        if not camera_id:
+        if not isinstance(camera_id, str) or not CAMERA_ID.fullmatch(camera_id):
             return
         self.event_cameras[event_id] = camera_id
+        if event_time(item.get("start")) is not None:
+            # Updates may omit the start, like the device: remember it.
+            self.event_starts[event_id] = event_time(item.get("start"))
         if len(self.event_cameras) > 1000:
-            self.event_cameras.pop(next(iter(self.event_cameras)))
+            gone = next(iter(self.event_cameras))
+            self.event_cameras.pop(gone)
+            self.event_starts.pop(gone, None)
         self.refresh()
         camera = self.armed.get(console_id, {}).get(camera_id)
         existing = next((a for a in self.alerts if a["id"] == event_id), None)
         kind = alert_kind(item, camera["alerts"]) if camera else None
         changed = False
-        if kind and existing is None:
+        now = time.time()
+        kind_is_new = False
+        # One alert per event, ever: a Clear must not be undone by the same
+        # event's next update.
+        if (kind and existing is None and event_id not in self.opened
+                and self.allow_new_alert(camera["uid"], now)):
+            self.opened[event_id] = True
+            if len(self.opened) > 1000:
+                self.opened.pop(next(iter(self.opened)))
+            kind_is_new = True
             # Smart detections often arrive as an empty "add" followed by an
             # "update" naming what was seen, so either can open an alert.
+            # The console's clock decides the time, but never the future.
             existing = {
                 "id": event_id, "uid": camera["uid"], "camera": camera["name"],
                 "consoleName": camera["consoleName"], "kind": kind,
-                "start": event_time(item.get("start")) or time.time(), "end": None,
+                "start": min(self.event_starts.get(event_id) or now, now), "end": None,
+                # When it was opened, on the boot's monotonic clock: what
+                # Clear and "seen" compare, so a clock step cannot reorder them.
+                "seq": time.monotonic(), "boot": BOOT_ID,
             }
             self.alerts.append(existing)
             changed = True
             self.on_new_alert(console_id, camera, existing)
         if existing is not None and item.get("end") and not existing.get("end"):
-            existing["end"] = event_time(item["end"])
-            changed = True
+            end = event_time(item["end"])
+            if end is not None and end <= now + ALERT_SKEW:
+                existing["end"] = max(existing["start"], min(end, now))
+                changed = True
         if changed:
-            self.save()
+            # A new alert is written at once (they are capped per camera);
+            # other changes at most once a second, run() flushing the rest.
+            if kind_is_new or time.monotonic() - self.last_save >= 1:
+                self.save()
+            else:
+                self.dirty = True
+
+    def allow_new_alert(self, uid, now):
+        """At most ALERTS_PER_MINUTE new alerts per camera: no console flood."""
+        now = time.monotonic()      # a wall-clock step must not stall alerts
+        recent = [t for t in self.recent.get(uid, []) if now - t < 60]
+        if len(recent) >= ALERTS_PER_MINUTE:
+            self.recent[uid] = recent
+            return False
+        self.recent[uid] = recent + [now]
+        return True
 
     def on_new_alert(self, console_id, camera, alert):
         """Snapshot the moment for the alert log, then notify."""
@@ -1291,13 +1933,18 @@ class AlertListener:
             pass  # no event loop (called outside the listener)
 
     async def capture(self, console_id, camera, alert):
-        now = time.time()
+        if plugin_gone():
+            return
+        now = time.monotonic()     # throttles: a wall-clock step must not silence them
         console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
-        if console is not None and now - self.last_captured.get(camera["uid"], 0) >= CAPTURE_EVERY:
+        last = self.last_captured.get(camera["uid"])
+        if console is not None and (last is None or now - last >= CAPTURE_EVERY):
             self.last_captured[camera["uid"]] = now
             try:
                 data = await asyncio.to_thread(
                     lambda: Protect(console, self.config).snapshot(camera["id"]))
+                if plugin_gone():
+                    return
                 name = f"{alert['id']}.jpg"
                 path = alert_image_path(name)
                 if not path:
@@ -1314,8 +1961,9 @@ class AlertListener:
         """Desktop notification for a new alert, at most once a minute per camera."""
         if not self.notify_enabled or not session_bus_path():
             return
-        now = time.time()
-        if now - self.last_notified.get(camera["uid"], 0) < NOTIFY_EVERY:
+        now = time.monotonic()
+        last = self.last_notified.get(camera["uid"])
+        if last is not None and now - last < NOTIFY_EVERY:
             return
         self.last_notified[camera["uid"]] = now
         console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
@@ -1357,8 +2005,8 @@ class AlertListener:
                     async for text in ws_messages(reader, writer):
                         try:
                             self.handle(console_id, json.loads(text))
-                        except ValueError:
-                            continue
+                        except (ValueError, TypeError, AttributeError, KeyError, RecursionError):
+                            continue   # a malformed message is skipped, never fatal
                 finally:
                     writer.close()
                 error = "event stream closed"
@@ -1376,6 +2024,8 @@ class AlertListener:
                 return  # the shell that started us is gone
             if demo_on():
                 return  # demo data must never be mixed with real events
+            if plugin_gone():
+                return  # the plugin was uninstalled
             self.refresh()
             if not self.armed:
                 self.status = {}
@@ -1388,16 +2038,87 @@ class AlertListener:
                 if console_id not in self.armed:
                     self.tasks.pop(console_id).cancel()
                     self.status.pop(console_id, None)
+            # Flush throttled changes, apply `alert --clear` right away, and
+            # let the age limit act even when nothing happens.
+            try:
+                ack = os.stat(ALERTS_ACK_PATH).st_mtime_ns
+            except OSError:
+                ack = None
+            if self.dirty or ack != self.ack_stamp or time.monotonic() - self.last_save > 60:
+                self.ack_stamp = ack
+                self.save()
             await asyncio.sleep(5)
+
+
+def plugin_gone():
+    """The plugin was uninstalled under a still-running helper."""
+    return not os.path.exists(os.path.realpath(__file__))
+
+
+def stop_process(pid, started, script_arg):
+    """SIGTERM pid only if it is still the process we started (same start time
+    and this helper's command); True if signalled."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as handle:
+            argv = handle.read().split(b"\0")[:-1]
+        if process_start_time(int(pid)) != int(started) or script_arg not in argv:
+            return False
+        os.kill(int(pid), signal.SIGTERM)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def cmd_stop(args):
+    """Stop what runs in the background: the wall, the stream relay and the
+    alert listener. --sign-out also ends every recordings session on its
+    console. For uninstalling; the panel starts what it needs again."""
+    stopped = []
+    pid = running_wall()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped.append("camera wall")
+        except ProcessLookupError:
+            pass
+    info = read_relay_info()
+    if relay_alive(info) and stop_process(info["pid"], info["started"], b"relay"):
+        stopped.append("stream relay")
+    try:
+        with open(EVENTS_LOCK) as handle:
+            pid, started = handle.read().split()
+        if stop_process(pid, started, b"events"):
+            stopped.append("alert listener")
+    except (OSError, ValueError):
+        pass
+    failed = []
+    if args.sign_out:
+        # Your real consoles, even while demo mode shows made-up ones.
+        config = load_config(keys=False, demo=False) or {"consoles": []}
+        for console in config["consoles"]:
+            if console.get("loginUser"):
+                # The login stays: so does a record that its password was rejected.
+                if end_session(console, config, clear_rejected=False):
+                    stopped.append(f"recordings session on {console['name']}")
+                else:
+                    failed.append(console["name"])
+    print("stopped: " + (", ".join(stopped) if stopped else "nothing was running"))
+    for name in failed:
+        print(f"could not sign out of {name}'s recordings session; delete its local account "
+              "on the console to be sure it ends", file=sys.stderr)
 
 
 def cmd_events(args):
     """Listen for alerts on armed cameras until none are armed."""
-    lock = open(EVENTS_LOCK, "w")
+    lock = open(EVENTS_LOCK, "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return  # another listener is already running
+    # Who holds it, for `stop`: pid and start time, as for the wall.
+    lock.truncate(0)
+    lock.write(f"{os.getpid()} {process_start_time(os.getpid())}\n")
+    lock.flush()
     try:
         asyncio.run(AlertListener(follow_parent=args.follow_parent).run())
     except KeyboardInterrupt:
@@ -1407,15 +2128,16 @@ def cmd_events(args):
 def cmd_alert(args):
     prefs = load_prefs()
     if args.ack or args.clear:
-        ack = read_ack()
-        ack["ackedAt"] = time.time()
-        if args.clear:
-            ack["clearedAt"] = ack["ackedAt"]
-        write_json(ALERTS_ACK_PATH, ack)
+        with ack_lock():
+            ack = read_ack()
+            ack["ackedAt"], ack["ackedSeq"], ack["boot"] = time.time(), time.monotonic(), BOOT_ID
+            if args.clear:
+                ack["clearedAt"], ack["clearedSeq"] = ack["ackedAt"], ack["ackedSeq"]
+            write_json(ALERTS_ACK_PATH, ack)
         if args.clear:
             # The listener drops cleared alerts on its next save. If it isn't
             # running, nothing else writes the log, so empty it here.
-            lock = open(EVENTS_LOCK, "w")
+            lock = open(EVENTS_LOCK, "a")
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -1424,8 +2146,9 @@ def cmd_alert(args):
             prune_alert_images(set())
         return
     if args.notify:
+        refuse_in_demo()
         prefs["notify"] = args.notify == "on"
-        save_prefs(prefs)
+        update_prefs(lambda p: p.update(notify=prefs["notify"]))
         poll_cameras()   # the panel reads the setting from the state file
         print("alert notifications " + ("on" if prefs["notify"] else "off"))
         return
@@ -1440,23 +2163,22 @@ def cmd_alert(args):
             when = time.strftime("%H:%M:%S", time.localtime(alert["start"]))
             print(f"  {when}  {alert['kind']:8} {alert['camera']}")
         return
-    state = poll_cameras(require_config())
-    matches = find_cameras(state["cameras"], args.camera)
+    refuse_in_demo()
+    matches = find_known_cameras(args.camera)
     if len(matches) != 1:
         raise ProtectError(f"{args.camera!r} matches {len(matches)} cameras; use its id "
                            "from `eld-unifi-protect cameras`")
     camera = matches[0]
     if args.off:
-        prefs["alerts"].pop(camera_key(camera), None)
+        update_prefs(lambda p: p["alerts"].pop(camera_key(camera), None))
         print(f"alerts off: {camera['name']}")
     else:
         triggers = [t.strip() for t in (args.on or ",".join(DEFAULT_TRIGGERS)).split(",") if t.strip()]
         unknown = [t for t in triggers if t not in ALERT_TRIGGERS]
         if unknown:
             raise ProtectError(f"unknown trigger {unknown[0]!r}; choose from {', '.join(ALERT_TRIGGERS)}")
-        prefs["alerts"][camera_key(camera)] = triggers
+        update_prefs(lambda p: p["alerts"].__setitem__(camera_key(camera), triggers))
         print(f"alerts on: {camera['name']} ({', '.join(triggers)})")
-    save_prefs(prefs)
     poll_cameras()
 
 
@@ -1577,11 +2299,19 @@ def build_demo_camera(slug, name):
     return camera_id
 
 
+# What `demo on` moves aside and `demo off` puts back (in RUNTIME_DIR).
+DEMO_SET_ASIDE = ("alerts.json", "alerts-ack.json", "alerts", "snapshots", "recordings", "clips")
+DEMO_ASIDE = os.path.join(RUNTIME_DIR, "before-demo")
+
+
 def cmd_demo(args):
     if args.mode == "status":
         print("demo mode " + ("on" if demo_on() else "off"))
         return
     if args.mode == "off":
+        if not demo_on() and not os.path.isdir(DEMO_ASIDE):
+            print("demo mode is already off")
+            return
         for path in (DEMO_FLAG, ALERTS_PATH, ALERTS_ACK_PATH, SNAP_INDEX):
             try:
                 os.remove(path)
@@ -1589,14 +2319,31 @@ def cmd_demo(args):
                 pass
         for folder in (DEMO_DIR, ALERT_IMAGES_DIR, SNAP_DIR, RECORDINGS_DIR, CLIPS_DIR):
             shutil.rmtree(folder, ignore_errors=True)
+        # Your own alert log and pictures, set aside by `demo on`, come back.
+        for name in DEMO_SET_ASIDE:
+            kept = os.path.join(DEMO_ASIDE, name)
+            if os.path.exists(kept):
+                os.replace(kept, os.path.join(RUNTIME_DIR, name))
+        shutil.rmtree(DEMO_ASIDE, ignore_errors=True)
         poll_cameras()
         print("demo mode off; your consoles are back")
         return
+    if not demo_on() and os.path.isdir(DEMO_ASIDE) and os.listdir(DEMO_ASIDE):
+        raise ProtectError(f"{DEMO_ASIDE} still holds your data from an earlier demo; "
+                           "run `eld-unifi-protect demo off` to put it back first")
     os.makedirs(DEMO_DIR, mode=0o700, exist_ok=True)
     print("rendering demo cameras…")
     with ThreadPoolExecutor(max_workers=3) as pool:
         ids = dict(zip([n for _, _, n, _ in DEMO_CAMERAS],
                        pool.map(lambda c: build_demo_camera(c[1], c[2]), DEMO_CAMERAS)))
+    # Rendered: only now set your own alert log, snapshots and recordings
+    # aside, untouched, so a failed render leaves them where they were.
+    if not demo_on():
+        os.makedirs(DEMO_ASIDE, mode=0o700, exist_ok=True)
+        for name in DEMO_SET_ASIDE:
+            path = os.path.join(RUNTIME_DIR, name)
+            if os.path.exists(path):
+                os.replace(path, os.path.join(DEMO_ASIDE, name))
     missing = [slug for _, slug, _, _ in DEMO_CAMERAS if not demo_source_image(slug)]
     write_json(DEMO_FLAG, {"since": time.time()})
     # A believable alert log, with snapshots, ending in an unseen alert.
@@ -1617,6 +2364,28 @@ def cmd_demo(args):
     print("demo mode on: 2 consoles, 6 cameras, an alert log. `eld-unifi-protect demo off` ends it.")
     if missing:
         print(f"no image yet for: {', '.join(missing)} (placeholders used; add them to {DEMO_SOURCE})")
+
+
+API_MAX_BYTES = 16 * 1024 * 1024   # a 4K snapshot is a few MB
+def read_body(response, limit):
+    """A whole response body of at most limit bytes.
+
+    Time is bounded by the connection's deadline (PinnedHTTPSConnection).
+    """
+    data = bytearray()
+    try:
+        while len(data) <= limit:
+            chunk = response.read1(min(65536, limit + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+    except (OSError, http.client.HTTPException):
+        raise ProtectError("the console stopped answering partway")
+    if len(data) > limit:
+        raise ProtectError("console sent too large a response")
+    if response.length:   # Content-Length promised more than arrived
+        raise ProtectError("console closed the connection mid-answer")
+    return bytes(data)
 
 
 class Protect:
@@ -1648,7 +2417,9 @@ class Protect:
                 delay = float(headers.get("Retry-After") or 0)
             except ValueError:
                 delay = 0
-            time.sleep(min(10.0, delay or 0.5 * 2 ** attempt))
+            if not math.isfinite(delay) or delay <= 0:
+                delay = 0.5 * 2 ** attempt
+            time.sleep(min(10.0, delay))
         if status in (401, 403):
             raise ProtectError("console rejected the API key (HTTP %d)" % status)
         if status == 404:
@@ -1656,11 +2427,14 @@ class Protect:
         if status == 429:
             raise ProtectError("console is rate limiting requests; try again in a moment")
         if status >= 400:
-            detail = data[:200].decode(errors="replace").strip()
+            detail = clean_text(data[:200].decode(errors="replace"), "", 200)
             raise ProtectError(f"HTTP {status} from console: {detail}")
         if raw:
             return data
-        return json.loads(data) if data else None
+        try:
+            return json.loads(data) if data else None
+        except (ValueError, RecursionError):
+            raise ProtectError("console sent something that is not JSON")
 
     def _send(self, method, path, body, params):
         url = API_BASE + path
@@ -1675,19 +2449,25 @@ class Protect:
         try:
             conn.request(method, url, body=payload, headers=headers)
             response = conn.getresponse()
-            return response.status, response.headers, response.read()
+            # A console could stream forever; nothing here is near this size.
+            return response.status, response.headers, read_body(response, API_MAX_BYTES)
         except ProtectError:
             raise
         except (OSError, http.client.HTTPException) as error:
-            raise ProtectError(f"cannot reach {self.host}: {error}")
+            # Exception text can quote the console (a bad status line).
+            raise ProtectError(f"cannot reach {self.host}: {clean_text(str(error), 'no answer', 200)}")
         finally:
-            conn.close()
+            conn.finish()
 
     def info(self):
-        return self.request("GET", "/meta/info")
+        data = self.request("GET", "/meta/info")
+        return data if isinstance(data, dict) else {}
 
     def cameras(self):
-        return self.request("GET", "/cameras") or []
+        data = self.request("GET", "/cameras") or []
+        if not isinstance(data, list):
+            raise ProtectError("console sent an unexpected camera list")
+        return [camera for camera in data if isinstance(camera, dict)][:MAX_CAMERAS]
 
     def snapshot(self, camera_id, high_quality=False):
         data = self.request(
@@ -1696,6 +2476,8 @@ class Protect:
             params={"highQuality": "true" if high_quality else "false"},
             raw=True,
         )
+        if len(data) > SNAPSHOT_MAX_BYTES:
+            raise ProtectError("console sent an implausibly large snapshot")
         if not is_complete_jpeg(data):
             # A cut-off transfer or an error page: keep the previous frame
             # on screen rather than a half-drawn one.
@@ -1713,10 +2495,12 @@ class Protect:
         cache = load_stream_cache()
         cache_key = f"{self.host}/{camera_id}"
         known = cache.get(cache_key, {})
-        if all(known.get(q) for q in qualities):
+        if all(known.get(q) and stream_path(known[q]) for q in qualities):
             return {q: relay_url(self.console["id"], known[q]) for q in qualities}
 
         streams = self.request("GET", f"/cameras/{camera_id}/rtsps-stream") or {}
+        if not isinstance(streams, dict):
+            streams = {}
         missing = [q for q in qualities if not streams.get(q)]
         if missing and load_prefs()["readOnly"]:
             # Read-only: never switch streams on. Fall back to whichever
@@ -1735,12 +2519,15 @@ class Protect:
             created = self.request(
                 "POST", f"/cameras/{camera_id}/rtsps-stream", body={"qualities": missing}
             ) or {}
-            streams.update({k: v for k, v in created.items() if v})
+            if isinstance(created, dict):
+                streams.update({k: v for k, v in created.items() if v})
+                record_enabled_streams(self.console["id"], camera_id, missing)
         urls = {}
         for quality in qualities:
             url = streams.get(quality)
-            if not url:
-                raise ProtectError(f"console did not return a {quality} stream for this camera")
+            if not url or not isinstance(url, str) or stream_path(url) is None:
+                # Never cached: a bad URL must not stick around.
+                raise ProtectError(f"console did not return a usable {quality} stream for this camera")
             urls[quality] = url
         with STREAM_CACHE_LOCK:
             # Re-read under the lock so concurrent lookups add to the cache
@@ -1756,7 +2543,12 @@ class Protect:
 
 # Text and IDs from a console are untrusted input. Names are printed to
 # terminals and shown in the panel; IDs become file names and URL paths.
-CAMERA_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# No "_": uids are "<console>_<camera>", and a camera id with "_" in it
+# could pose as another console's camera.
+CAMERA_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
+MAX_CAMERAS = 256           # per console; more is not a real Protect setup
+SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024   # a 4K high-quality JPEG is a few MB
+SNAPSHOT_BUDGET = 128 * 1024 * 1024    # all snapshots together (they live in RAM)
 
 
 def clean_text(value, fallback="", limit=80):
@@ -1772,7 +2564,8 @@ def summarize_camera(camera, console):
     camera_id = str(camera.get("id") or "")
     if not CAMERA_ID.fullmatch(camera_id):
         return None  # not a Protect ID; never let it near a path or URL
-    flags = camera.get("featureFlags") or {}
+    flags = camera.get("featureFlags")
+    flags = flags if isinstance(flags, dict) else {}
     state = clean_text(camera.get("state"), "UNKNOWN", 32)
     model = clean_text(camera.get("type") or camera.get("modelKey"))
     return {
@@ -1780,7 +2573,7 @@ def summarize_camera(camera, console):
         "id": camera_id,
         "console": console["id"],
         "consoleName": console["name"],
-        "mac": re.sub(r"[^0-9a-f]", "", str(camera.get("mac") or "").lower()),
+        "mac": re.sub(r"[^0-9a-f]", "", str(camera.get("mac") or "").lower())[:12],
         "name": clean_text(camera.get("name"), model or "Camera"),
         "model": model,
         "state": state,
@@ -1805,7 +2598,35 @@ def summarize_camera(camera, console):
 LOGIN_SERVICE = KEYRING_SERVICE + "-login"
 PRIVATE_API = "/proxy/protect/api"
 SESSIONS_PATH = os.path.join(RUNTIME_DIR, "sessions.json")
-SESSIONS_LOCK = threading.Lock()
+# Rejected recordings logins, kept across reboots until `login` replaces them.
+REJECTED_PATH = os.path.join(STATE_DIR, "login-rejected.json")
+
+
+def load_rejected():
+    try:
+        with open(REJECTED_PATH) as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def set_rejected(console_id, entry):
+    """Record (or with None, clear) a rejected login; call under sessions_lock."""
+    data = load_rejected()
+    if entry is None:
+        if data.pop(console_id, None) is None:
+            return
+    else:
+        data[console_id] = entry
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    write_json(REJECTED_PATH, data)
+SESSIONS_THREAD_LOCK = threading.RLock()
+
+
+def sessions_lock():
+    return file_lock(os.path.join(RUNTIME_DIR, "sessions.lock"), SESSIONS_THREAD_LOCK)
+LOGIN_RETRY_AFTER = 600   # seconds before helpers try a rejected login again
 RECORDINGS_DIR = os.path.join(RUNTIME_DIR, "recordings")
 CLIPS_DIR = os.path.join(RUNTIME_DIR, "clips")
 CLIP_PAD = 3                # seconds of context either side of an event
@@ -1813,6 +2634,10 @@ CLIP_MAX_SECONDS = 300      # longer events are cut to their first five minutes
 CLIP_ONGOING_SECONDS = 60   # an event still in progress: its first minute so far
 CLIPS_MAX_BYTES = 600 * 1024 * 1024   # clips live in RAM (the runtime dir)
 CLIPS_KEEP = 25
+THUMBNAIL_MAX_BYTES = 256 * 1024
+THUMBNAILS_BUDGET = 16 * 1024 * 1024   # per camera listing
+RECORDINGS_KEEP_CAMERAS = 8   # cameras whose thumbnails stay in memory
+CLIP_DEADLINE = 900        # seconds for a whole export, even a slow 600 MB one
 CLIP_CHANNELS = {"high": 0, "medium": 1, "low": 2}
 RECORDING_KINDS = ("person", "vehicle", "animal", "package", "face", "licensePlate")
 
@@ -1839,7 +2664,7 @@ def store_login(console, user, password):
     """Keyring if possible, else the config file (mode 0600)."""
     console["loginUser"] = user
     try:
-        result = _secret_tool(["store", f"--label=UniFi Protect login ({console['name']}, {console['host']})",
+        result = _secret_tool(["store", f"--label=UniFi Protect login ({console['id']})",
                                "service", LOGIN_SERVICE, "console", console["id"]], secret=password)
         if result.returncode != 0:
             raise KeyringUnavailable("the keyring refused to store the password")
@@ -1859,16 +2684,65 @@ def store_login(console, user, password):
         return "file"
 
 
-def clear_login(console):
+def restore_session(console_id, entry):
+    """Put a console's sessions.json entry back as it was (or remove it)."""
+    with sessions_lock():
+        sessions = load_sessions()
+        if entry is None:
+            sessions.pop(console_id, None)
+        else:
+            sessions[console_id] = entry
+        write_json(SESSIONS_PATH, sessions)
+
+
+def logout_session(console, session, config=None):
+    """Sign one session out on the console; True if the console confirmed."""
+    try:
+        client = ProtectSession(console, config, fresh=True)
+        client.session = session
+        return client.logout()
+    except ProtectError:
+        return False
+
+
+def end_session(console, config=None, clear_rejected=True):
+    """Take a console's saved session away and sign it out on the console.
+
+    Taken under the sessions lock, so a helper signing in at the same moment
+    either has its session taken here or sees the login gone and signs
+    itself out. Callers save the config (without the login) first. Returns
+    True if there was no session, or the console confirmed the sign-out.
+    """
+    with sessions_lock():
+        sessions = load_sessions()
+        entry = sessions.pop(console["id"], None)
+        if entry is not None:
+            write_json(SESSIONS_PATH, sessions)
+        if clear_rejected:
+            set_rejected(console["id"], None)
+    if not (isinstance(entry, dict) and entry.get("token")):
+        return True
+    return logout_session(console, entry, config) if has_login(console) else False
+
+
+def clear_login(console, config=None):
+    """Remove a console's login from it and the keyring; return what it was.
+
+    The session is not touched: save the config, then end_session() the
+    returned copy, so no helper can sign in again in between.
+    """
+    before = dict(console)
     if console.get("loginStore") == "keyring":
         _key_cache.pop((LOGIN_SERVICE, console["id"]), None)
         try:
             _secret_tool(["clear", "service", LOGIN_SERVICE, "console", console["id"]])
+            if keyring_still_has(LOGIN_SERVICE, console["id"]):
+                raise KeyringUnavailable("the keyring kept it (is it locked?)")
         except KeyringUnavailable as error:
             print(f"Could not remove the password from the keyring: {error}", file=sys.stderr)
     for field in ("loginUser", "loginStore", "loginPassword"):
         console.pop(field, None)
-    forget_session(console["id"])
+    return before
 
 
 def load_sessions():
@@ -1881,7 +2755,7 @@ def load_sessions():
 
 
 def forget_session(console_id):
-    with SESSIONS_LOCK:
+    with sessions_lock():
         sessions = load_sessions()
         if sessions.pop(console_id, None) is not None:
             write_json(SESSIONS_PATH, sessions)
@@ -1894,21 +2768,27 @@ def token_expiry(token):
     is off from the console's neither expires sessions early nor keeps dead
     ones. Without iat, exp itself; without either, an hour from now.
     """
+    now = time.time()
     try:
         payload = token.split(".")[1]
         claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
         if "iat" in claims:
-            return time.time() + float(claims["exp"]) - float(claims["iat"])
-        return float(claims["exp"])
-    except (IndexError, KeyError, TypeError, ValueError):
-        return time.time() + 3600
+            expires = now + float(claims["exp"]) - float(claims["iat"])
+        else:
+            expires = float(claims["exp"])
+    except (IndexError, KeyError, TypeError, ValueError, OverflowError, RecursionError):
+        return now + 3600
+    # A console's numbers: nothing infinite, nothing beyond a week.
+    if not math.isfinite(expires):
+        return now + 3600
+    return min(expires, now + 7 * 24 * 3600)
 
 
 def event_kind(event):
     """What a Protect event saw, as one word for the timeline."""
     kind = event.get("type")
     if kind in SMART_EVENT_TYPES:
-        seen = [t for t in event.get("smartDetectTypes") or [] if t in RECORDING_KINDS]
+        seen = [t for t in smart_types(event) if t in RECORDING_KINDS]
         return seen[0] if seen else "motion"
     if kind == "ring":
         return "ring"
@@ -1964,12 +2844,12 @@ def prune_clips(keep_path=None):
 class ProtectSession:
     """Signed-in access to the recordings endpoints of one console."""
 
-    def __new__(cls, console, config=None):
+    def __new__(cls, console, config=None, fresh=False):
         if console.get("demo"):
             return DemoSession(console)
         return super().__new__(cls)
 
-    def __init__(self, console, config=None):
+    def __init__(self, console, config=None, fresh=False):
         if not has_login(console):
             raise ProtectError("no login for recordings on this console; "
                                f"run `eld-unifi-protect login {console['id']}`")
@@ -1978,27 +2858,63 @@ class ProtectSession:
         self.name, self.port = split_host(self.host)
         self.pin = console.get("certSha256")
         self.timeout = float((config or {}).get("timeoutSec", 8))
-        self.session = load_sessions().get(console["id"])
+        # A trial of new credentials (`login`) starts clean (no saved session,
+        # no remembered failure) and writes nothing until `login` keeps it.
+        self.persist = not fresh
+        saved = None if fresh else load_sessions().get(console["id"])
         # Thumbnails are fetched four at a time through one session.
         self.lock = threading.Lock()
+        # Once a sign-in fails, every later call fails with it, in this
+        # process and, for LOGIN_RETRY_AFTER, in every other: UniFi OS
+        # locks accounts out after a burst of failures. `login` clears it.
+        self.login_error, self.login_rejected, self.session = None, False, None
+        self.dead_tokens = set()     # sessions the console turned down
+        rejected = None if fresh else load_rejected().get(console["id"])
+        if isinstance(rejected, dict) and rejected.get("user") == console.get("loginUser"):
+            # A rejected password stays rejected, across reboots, until
+            # `login` replaces it.
+            self.login_error = str(rejected.get("error") or "the console rejected the login")
+            self.login_rejected = True
+        elif isinstance(saved, dict) and isinstance(saved.get("failed"), (int, float)):
+            # Rate limiting and the like are retried after a while.
+            if 0 <= time.time() - saved["failed"] < LOGIN_RETRY_AFTER:
+                self.login_error = str(saved.get("error") or "sign-in failed")
+        elif isinstance(saved, dict) and saved.get("token"):
+            self.session = saved
 
-    def _send(self, method, path, body=None, params=None, headers=None, timeout=None):
+    def fail_login(self, message, rejected):
+        """Remember a failed sign-in for every helper process, then raise."""
+        if not self.persist:
+            raise (LoginRejected if rejected else ProtectError)(message)
+        if rejected:
+            with sessions_lock():
+                set_rejected(self.console["id"], {"user": self.console.get("loginUser"),
+                                                  "error": message, "at": time.time()})
+            raise LoginRejected(message)
+        with sessions_lock():
+            sessions = load_sessions()
+            sessions[self.console["id"]] = {"failed": time.time(), "error": message, "rejected": rejected}
+            write_json(SESSIONS_PATH, sessions)
+        raise (LoginRejected if rejected else ProtectError)(message)
+
+    def _send(self, method, path, body=None, params=None, headers=None, timeout=None, deadline=60):
         url = path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
         headers = dict(headers or {})
         payload = None
         if body is not None:
             payload = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
-        conn = PinnedHTTPSConnection(self.name, self.port, self.pin, timeout or self.timeout)
+        conn = PinnedHTTPSConnection(self.name, self.port, self.pin, timeout or self.timeout, deadline)
         try:
             conn.request(method, url, body=payload, headers=headers)
             return conn, conn.getresponse()
         except ProtectError:
-            conn.close()
+            conn.finish()
             raise
         except (OSError, http.client.HTTPException) as error:
-            conn.close()
-            raise ProtectError(f"cannot reach {self.host}: {error}")
+            conn.finish()
+            # Exception text can quote the console (a bad status line).
+            raise ProtectError(f"cannot reach {self.host}: {clean_text(str(error), 'no answer', 200)}")
 
     def login(self):
         password = login_password(self.console)
@@ -2008,17 +2924,18 @@ class ProtectSession:
             "username": self.console["loginUser"], "password": password,
             "rememberMe": False, "token": ""})
         try:
-            data = response.read(4096)
+            data = read_body(response, 64 * 1024)
             cookies = response.headers.get_all("Set-Cookie") or []
         finally:
-            conn.close()
+            conn.finish()
         if response.status == 429:
-            raise ProtectError("the console is limiting sign-ins after failed attempts; wait a few minutes")
+            self.fail_login("the console is limiting sign-ins after failed attempts; wait a few minutes",
+                            rejected=False)
         if response.status in (401, 403):
             if b"MFA" in data or b"2fa" in data.lower():
-                raise ProtectError("this account signs in with two-factor authentication; "
-                                   "use a local account (Restrict to local access only)")
-            raise ProtectError("the console rejected the username or password")
+                self.fail_login("this account signs in with two-factor authentication; "
+                                "use a local account (Restrict to local access only)", rejected=True)
+            self.fail_login("the console rejected the username or password", rejected=True)
         if response.status != 200:
             raise ProtectError(f"sign-in failed: HTTP {response.status}")
         token = next((c.split(";", 1)[0].split("=", 1)[1] for c in cookies
@@ -2026,14 +2943,50 @@ class ProtectSession:
         if not token:
             raise ProtectError("the console signed in but sent no session cookie")
         self.session = {"token": token, "expires": token_expiry(token),
+                        "user": self.console.get("loginUser"),
                         "csrf": response.headers.get("X-Updated-CSRF-Token")
                                 or response.headers.get("X-CSRF-Token") or ""}
-        with SESSIONS_LOCK:
-            sessions = load_sessions()
-            sessions[self.console["id"]] = self.session
-            write_json(SESSIONS_PATH, sessions)
+        if self.persist:
+            # Still this console's login? `logout` may have run meanwhile; a
+            # session it can no longer see must not outlive it.
+            with sessions_lock():
+                current = next((c for c in (load_config(keys=False) or {"consoles": []})["consoles"]
+                                if c["id"] == self.console["id"]), None)
+                kept = bool(current) and current.get("loginUser") == self.console.get("loginUser")
+                saved = load_sessions().get(self.console["id"]) if kept else None
+                # Another helper signed in meanwhile: keep its session (one
+                # session per console), and sign this one out.
+                theirs = (isinstance(saved, dict) and saved.get("token")
+                          and saved.get("user") == self.console.get("loginUser")
+                          and saved.get("token") not in self.dead_tokens
+                          and saved.get("expires", 0) > time.time() + 60)
+                if kept and not theirs:
+                    restore_session(self.console["id"], self.session)
+            if not kept:
+                self.logout()
+                self.session = None
+                raise ProtectError("the recordings login was removed meanwhile")
+            if theirs:
+                self.logout()
+                self.session = saved
 
-    def open(self, path, params=None, timeout=None):
+    def logout(self):
+        """End the saved session on the console too; best effort."""
+        """End the session on the console; True if the console confirmed it."""
+        session = self.session
+        if not session or not session.get("token"):
+            return False
+        headers = {"Cookie": f"TOKEN={session['token']}"}
+        if session.get("csrf"):
+            headers["X-CSRF-Token"] = session["csrf"]
+        try:
+            conn, response = self._send("POST", "/api/auth/logout", body={}, headers=headers)
+            conn.finish()
+            return 200 <= response.status < 300
+        except ProtectError:
+            return False
+
+    def open(self, path, params=None, timeout=None, deadline=60):
         """GET a recordings endpoint; returns (conn, response) with status 200.
 
         Signs in when there is no session or it has run out, and once more if
@@ -2042,16 +2995,24 @@ class ProtectSession:
         """
         for attempt in range(2):
             with self.lock:
+                if self.login_error:
+                    raise (LoginRejected if self.login_rejected else ProtectError)(self.login_error)
                 if not self.session or self.session.get("expires", 0) < time.time() + 60:
-                    self.login()
+                    try:
+                        self.login()
+                    except ProtectError as error:
+                        self.login_error = str(error)
+                        self.login_rejected = isinstance(error, LoginRejected)
+                        raise
                 session = self.session
             headers = {"Cookie": f"TOKEN={session['token']}", "Accept": "*/*"}
             if session.get("csrf"):
                 headers["X-CSRF-Token"] = session["csrf"]
             conn, response = self._send("GET", PRIVATE_API + path, params=params,
-                                        headers=headers, timeout=timeout)
+                                        headers=headers, timeout=timeout, deadline=deadline)
             if response.status == 401 and attempt == 0:
-                conn.close()
+                conn.finish()
+                self.dead_tokens.add(session.get("token"))   # never "theirs" again
                 with self.lock:
                     # Another thread may have signed in again already.
                     if self.session is session:
@@ -2059,8 +3020,11 @@ class ProtectSession:
                 continue
             if response.status == 200:
                 return conn, response
-            detail = response.read(200).decode(errors="replace").strip()
-            conn.close()
+            try:
+                detail = clean_text(read_body(response, 64 * 1024)[:200].decode(errors="replace"), "", 200)
+            except (ProtectError, OSError, http.client.HTTPException):
+                detail = ""
+            conn.finish()
             if response.status in (401, 403):
                 raise ProtectError("this account may not view recordings; give it a Protect role "
                                    "that can (View Only or higher)")
@@ -2073,9 +3037,9 @@ class ProtectSession:
     def get(self, path, params=None, limit=8 * 1024 * 1024):
         conn, response = self.open(path, params)
         try:
-            return response.read(limit)
+            return read_body(response, limit)
         finally:
-            conn.close()
+            conn.finish()
 
     def events(self, camera_id, since, until, motion=False, limit=100):
         """Events newest first; camera_id None lists every camera's."""
@@ -2086,9 +3050,14 @@ class ProtectSession:
                   "orderDirection": "DESC", "withoutDescriptions": "true", "types": types}
         if camera_id:
             params["cameras"] = camera_id
-        raw = json.loads(self.get("/events", params=params))
+        try:
+            raw = json.loads(self.get("/events", params=params))
+        except (ValueError, RecursionError):
+            raise ProtectError("console sent an unreadable event list")
         events = []
         for event in raw if isinstance(raw, list) else []:
+            if not isinstance(event, dict):
+                continue
             event_id = str(event.get("id") or "")
             start = event_time(event.get("start"))
             # The filter is applied here too: the console's own may change.
@@ -2099,10 +3068,11 @@ class ProtectSession:
             events.append({"id": event_id, "kind": event_kind(event), "start": start,
                            "end": event_time(event.get("end")),
                            "score": event.get("score") if isinstance(event.get("score"), int) else None})
-        return sorted(events, key=lambda e: e["start"], reverse=True)
+        return sorted(events, key=lambda e: e["start"], reverse=True)[:limit]
 
     def thumbnail(self, event_id):
-        data = self.get(f"/events/{event_id}/thumbnail", params={"w": 320})
+        # A w=320 JPEG is tens of KB; nothing bigger is kept in memory.
+        data = self.get(f"/events/{event_id}/thumbnail", params={"w": 320}, limit=THUMBNAIL_MAX_BYTES)
         if not is_complete_jpeg(data):
             raise ProtectError("console sent no thumbnail")
         return data
@@ -2111,7 +3081,7 @@ class ProtectSession:
         """Write the recording between two times (seconds) to path as MP4."""
         conn, response = self.open("/video/export", params={
             "camera": camera_id, "start": int(start * 1000), "end": int(end * 1000),
-            "channel": CLIP_CHANNELS[quality]}, timeout=120)
+            "channel": CLIP_CHANNELS[quality]}, timeout=120, deadline=CLIP_DEADLINE)
         partial = f"{path}.{os.getpid()}.part"
         written = 0
         try:
@@ -2126,15 +3096,21 @@ class ProtectSession:
                     out.write(chunk)
             with open(partial, "rb") as handle:
                 head = handle.read(12)
+            if response.length:
+                raise ProtectError("the console stopped sending the clip partway; try again")
             # An MP4 starts with an "ftyp" box; anything else is an error page.
             if written < 1024 or head[4:8] != b"ftyp":
                 raise ProtectError("the console sent no video for that time; "
                                    "is the camera recording it?")
             os.replace(partial, path)
+        except http.client.HTTPException:
+            raise ProtectError("the console stopped sending the clip partway; try again")
         except OSError as error:
+            if error.filename is None:   # the connection, not a file
+                raise ProtectError("the console stopped sending the clip partway; try again")
             raise ProtectError(f"cannot save the clip: {error}")
         finally:
-            conn.close()
+            conn.finish()
             if os.path.exists(partial):
                 os.remove(partial)
 
@@ -2144,6 +3120,9 @@ class DemoSession:
 
     def __init__(self, console):
         self.console = console
+
+    def logout(self):
+        return True
 
     def events(self, camera_id, since, until, motion=False, limit=100):
         slug = next((s for _, s, _, _ in DEMO_CAMERAS if demo_camera_id(s) == camera_id), "")
@@ -2198,27 +3177,61 @@ def recordings_for(config, uid, hours=24, motion=False):
         return dict(result, needsLogin=True, events=[])
     session = ProtectSession(client_console, config)
     now = time.time()
-    events = session.events(camera_id, now - hours * 3600, now, motion=motion)
+    try:
+        events = session.events(camera_id, now - hours * 3600, now, motion=motion)
+    except LoginRejected as error:
+        # The password changed, say: ask for it again rather than retry.
+        return dict(result, needsLogin=True, loginError=str(error), events=[])
     folder = os.path.join(RECORDINGS_DIR, uid)
     os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.utime(folder)
+    # Only the most recently viewed cameras keep thumbnails (memory is RAM);
+    # pruned before as well as after, so stopped listings cannot pile up.
+    prune_recordings(keep=folder)
+    # Thumbnails no listed event needs go first, so listings that were
+    # stopped midway cannot pile up in the folder.
+    wanted = {e["id"] + ".jpg" for e in events}
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        try:
+            # Another listing's file in flight stays, unless it is long dead.
+            if name not in wanted and (".tmp." not in name or os.stat(path).st_mtime < time.time() - 300):
+                os.remove(path)
+        except FileNotFoundError:
+            pass
+    budget = {"left": THUMBNAILS_BUDGET}
+    budget_lock = threading.Lock()
 
     def thumb(event):
         path = os.path.join(folder, event["id"] + ".jpg")
         if not os.path.exists(path):
             try:
-                write_atomic(path, session.thumbnail(event["id"]))
-            except ProtectError:
+                data = session.thumbnail(event["id"])
+                with budget_lock:
+                    if len(data) > budget["left"]:
+                        return dict(event, thumb="")
+                    budget["left"] -= len(data)
+                write_atomic(path, data)
+            except (ProtectError, OSError):
                 return dict(event, thumb="")
         return dict(event, thumb=path)
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         events = list(pool.map(thumb, events))
-    # Thumbnails of events that dropped out of the window go too.
-    wanted = {e["id"] + ".jpg" for e in events}
-    for name in os.listdir(folder):
-        if name not in wanted:
-            os.remove(os.path.join(folder, name))
+    prune_recordings(keep=folder)
     return dict(result, events=events)
+
+
+def prune_recordings(keep):
+    """Keep thumbnails for RECORDINGS_KEEP_CAMERAS cameras, keep always among them."""
+    try:
+        folders = [os.path.join(RECORDINGS_DIR, n) for n in os.listdir(RECORDINGS_DIR)]
+        folders = sorted((f for f in folders if f != keep),
+                         key=lambda f: os.stat(f).st_mtime, reverse=True)
+        for old in folders[RECORDINGS_KEEP_CAMERAS - 1:]:
+            shutil.rmtree(old, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def fetch_clip(config, uid, start, end, quality):
@@ -2247,7 +3260,7 @@ def mpv_clip_command(player, sound=True):
         player,
         "--no-terminal",
         f"--input-conf={os.path.join(PLUGIN_DIR, 'mpv', 'input.conf')}",
-        "--title=${media-title}",
+        "--title=${playlist/0/title}",
         "--force-window=immediate",
         "--hwdec=auto-safe",
         f"--mute={'no' if sound else 'yes'}",
@@ -2283,8 +3296,91 @@ def load_prefs():
             "notify": bool(prefs.get("notify", True))}
 
 
+class file_lock:
+    """An exclusive flock across helper processes, plus a thread lock.
+
+    Every read-modify-write of a shared file (cameras.json, sessions.json)
+    runs under one, so two quick clicks or two helpers never lose a change.
+    Re-entrant within a thread, like its thread lock.
+    """
+
+    held = {}    # path -> [fd, depth]; only touched while holding the thread lock
+
+    def __init__(self, path, thread_lock):
+        self.path, self.thread_lock = path, thread_lock
+
+    def __enter__(self):
+        self.thread_lock.acquire()
+        try:
+            if self.path in self.held:
+                self.held[self.path][1] += 1
+                return self
+            os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+            for _ in range(600):           # at most 30 s
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.held[self.path] = [fd, 1]
+                    return self
+                except BlockingIOError:
+                    time.sleep(0.05)
+            os.close(fd)
+            raise ProtectError("another eld-unifi-protect command is busy; try again")
+        except BaseException:
+            self.thread_lock.release()
+            raise
+
+    def __exit__(self, *exc):
+        entry = self.held[self.path]
+        entry[1] -= 1
+        if entry[1] == 0:
+            del self.held[self.path]
+            os.close(entry[0])
+        self.thread_lock.release()
+
+
+PREFS_LOCK = threading.RLock()
+
+
+def prefs_lock():
+    return file_lock(os.path.join(RUNTIME_DIR, "prefs.lock"), PREFS_LOCK)
+
+
+def refuse_in_demo():
+    """cameras.json is the real one: demo mode must not change it."""
+    if demo_on():
+        raise ProtectError("demo mode is on; camera settings can't be changed")
+
+
+def find_known_cameras(wanted):
+    """Cameras matching wanted, from the last camera list when it has them.
+
+    Settings commands apply their change straight away and refresh after:
+    quick clicks then take effect in the order they were made, not in the
+    order slow consoles answer a poll.
+    """
+    found = find_cameras(previous_state().get("cameras", []), wanted)
+    return found or find_cameras(poll_cameras(require_config())["cameras"], wanted)
+
+
+def update_prefs(change):
+    """Apply one command's own change to cameras.json as it is right now.
+
+    Under the lock only for that moment (commands that poll consoles for
+    seconds do not hold it), and as an operation, not a diff: a second click
+    that undoes the first wins, and no change from another helper is lost.
+    Returns what change returns.
+    """
+    with prefs_lock():
+        prefs = load_prefs()
+        result = change(prefs)
+        save_prefs(prefs)
+        return result
+
+
 def save_prefs(prefs):
-    write_atomic(PREFS_PATH, json.dumps(prefs, indent=2) + "\n", mode=0o644)
+    refuse_in_demo()
+    write_atomic(PREFS_PATH, json.dumps(prefs, indent=2) + "\n")
 
 
 def camera_key(camera):
@@ -2314,12 +3410,17 @@ def apply_prefs(cameras, prefs):
 
 def find_cameras(cameras, wanted):
     """Match by uid, camera id, MAC, or name (case-insensitive)."""
+    # Most specific first: a uid names exactly one camera, whatever other
+    # consoles call theirs.
     wanted_l = wanted.lower()
-    exact = [c for c in cameras if wanted in (c.get("uid"), c.get("id"))
-             or wanted_l.replace(":", "") == c.get("mac")]
-    if exact:
-        return exact
-    return [c for c in cameras if c.get("name", "").lower() == wanted_l]
+    for match in (lambda c: c.get("uid") == wanted,
+                  lambda c: c.get("id") == wanted,
+                  lambda c: wanted_l.replace(":", "") == c.get("mac"),
+                  lambda c: c.get("name", "").lower() == wanted_l):
+        found = [c for c in cameras if match(c)]
+        if found:
+            return found
+    return []
 
 
 def merge_cameras(cameras):
@@ -2327,17 +3428,32 @@ def merge_cameras(cameras):
 
     A camera moved from a gateway to an NVR stays listed on the gateway as
     DISCONNECTED. Keep one entry per MAC, preferring a connected one, so the
-    ghost never hides the live copy.
+    ghost never hides the live copy. Only an offline copy ever gives way:
+    when two consoles both report the same MAC online, both are kept, so a
+    console cannot make another's camera vanish (and take over its name,
+    favourite and alerts) by claiming its MAC.
     """
     best = {}
     order = []
+    seen = set()
     for camera in cameras:
+        if camera["uid"] in seen:
+            continue      # a console listing one camera twice
+        seen.add(camera["uid"])
         key = camera["mac"] or camera["uid"]
         if key not in best:
             best[key] = camera
             order.append(key)
         elif camera["online"] and not best[key]["online"]:
             best[key] = camera
+        elif camera["online"] and best[key]["online"] and camera["uid"] not in best:
+            # Two consoles claim one MAC online: keep both, and key their
+            # settings by uid, so neither can hide, disarm or impersonate the
+            # other through a MAC-keyed setting.
+            for copy in (best[key], camera):
+                copy["mac"], copy["macConflict"] = "", True
+            best[camera["uid"]] = camera
+            order.append(camera["uid"])
     return sorted((best[k] for k in order), key=lambda c: (c["consoleName"].lower(), c["name"].lower()))
 
 
@@ -2359,6 +3475,9 @@ def fetch_console(console, config):
         return {"cameras": cameras, "error": None}
     except ProtectError as error:
         return {"cameras": None, "error": str(error)}
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        # One console sending nonsense must not stop the others' polling.
+        return {"cameras": None, "error": "console sent unexpected data"}
 
 
 def poll_cameras(config=None):
@@ -2439,19 +3558,38 @@ def load_index():
 
 
 def refresh_snapshots(config, cameras, index):
+    if plugin_gone():
+        return
     clients = {c["id"]: Protect(c, config) for c in config["consoles"]}
+    started = time.time()
+    budget = {"left": SNAPSHOT_BUDGET}
+    budget_lock = threading.Lock()
 
     def grab(camera):
         client = clients.get(camera.get("console"))
-        if client is None or not camera.get("online"):
+        if client is None or not camera.get("online") or plugin_gone():
             return None
         try:
             data = client.snapshot(camera["id"])
-        except ProtectError:
-            return None
-        if data:
+            with budget_lock:
+                # One console cannot fill memory: past the budget, the camera
+                # has no snapshot this round (an older one would still count).
+                over = not data or len(data) > budget["left"]
+                if not over:
+                    budget["left"] -= len(data)
+            if over:
+                if data:
+                    try:
+                        os.remove(snapshot_path(camera["uid"]))
+                    except FileNotFoundError:
+                        pass
+                return None
+            if plugin_gone():
+                return None
             write_atomic(snapshot_path(camera["uid"]), data)
             return camera["uid"]
+        except (ProtectError, OSError):
+            pass    # a camera that fails, or a full disk, skips this round
         return None
 
     # A handful of workers: enough that one slow camera does not stretch
@@ -2460,7 +3598,34 @@ def refresh_snapshots(config, cameras, index):
         for uid in pool.map(grab, cameras):
             if uid:
                 index[uid] = time.time()
-    write_json(SNAP_INDEX, index)
+    # Snapshots of cameras no longer listed go: nothing a console once
+    # listed stays in memory for good.
+    listed = {c["uid"] for c in cameras}
+    # And everything kept counts: older snapshots of cameras not refreshed
+    # this round go, oldest first, until the budget holds.
+    try:
+        kept = sorted((os.path.join(SNAP_DIR, n) for n in os.listdir(SNAP_DIR) if n.endswith(".jpg")),
+                      key=lambda f: os.stat(f).st_mtime)
+        total = sum(os.path.getsize(f) for f in kept)
+        fresh = {snapshot_path(u) for u, t in index.items() if t >= started}
+        for path in kept:
+            if total <= SNAPSHOT_BUDGET:
+                break
+            if path not in fresh:
+                total -= os.path.getsize(path)
+                os.remove(path)
+    except OSError:
+        pass
+    for uid in [u for u in index if u not in listed]:
+        index.pop(uid)
+    try:
+        for name in os.listdir(SNAP_DIR):
+            if name.endswith(".jpg") and name[:-4] not in listed:
+                os.remove(os.path.join(SNAP_DIR, name))
+    except OSError:
+        pass
+    if not plugin_gone():
+        write_json(SNAP_INDEX, index)
 
 
 # ---- commands ------------------------------------------------------------
@@ -2489,29 +3654,108 @@ def save_console(config, existing, host, pin, key, name):
     while console_id in taken:
         console_id, n = f"{base}-{n}", n + 1
     entry = {"id": console_id, "name": name, "host": host, "certSha256": pin}
-    if existing and existing.get("id") == console_id:
-        # A new key or certificate keeps the recordings login.
+    if existing and existing.get("id") == console_id and existing.get("certSha256") == pin:
+        # A new key keeps the recordings login; a new certificate does not.
         entry.update({k: existing[k] for k in ("loginUser", "loginStore", "loginPassword") if k in existing})
-    elif existing:
-        clear_login(existing)
+    dropped = None
+    if existing and not ("loginUser" in entry):
+        dropped = clear_login(existing, config) if existing.get("loginUser") else None
     if existing and existing.get("keyStore") == "keyring" and existing.get("id") != console_id:
-        keyring_clear(existing["id"])
+        try:
+            keyring_clear(existing["id"])
+        except KeyringUnavailable as error:
+            print(f"Could not remove the old key from the keyring: {error}", file=sys.stderr)
     where = store_key(config, entry, key)
     if existing:
         consoles[consoles.index(existing)] = entry
     else:
         consoles.append(entry)
     save_config(config)
+    if dropped:
+        end_session(dropped, config)     # after the config no longer has it
     return entry, where
 
 
+HOST_LABEL = re.compile(r"[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?")
+
+
+def looks_like_key(label):
+    """A pasted API key: a long run of letters and digits with no hyphen, or
+    a shorter one mixing upper case, lower case and digits (real host names
+    of that length nearly always have a hyphen)."""
+    if "-" in label:
+        return False
+    mixed = (any(c.isupper() for c in label) and any(c.islower() for c in label)
+             and any(c.isdigit() for c in label))
+    return len(label) >= 30 or (len(label) >= 16 and mixed)
+
+
+def typed_host(raw, config):
+    """The address typed in setup: a saved console's address exactly as saved
+    (older versions saved some the stricter check now refuses), else checked."""
+    text = raw.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+    def loose(host):
+        host = host.lower()
+        # ":443" is a port only on a name, an IPv4 address or "[v6]".
+        if host.endswith(":443") and (host.count(":") == 1 or host.endswith("]:443")):
+            host = host[:-4]
+        return host
+    for console in (config or {}).get("consoles", []):
+        if loose(str(console.get("host", ""))) == loose(text):
+            return console["host"]
+    return normalize_host(raw)
+
+
+def same_host(stored, host):
+    """Whether a saved console address is the one typed; saved addresses from
+    older versions may not pass normalize_host's checks, and must not break
+    setup for every console."""
+    try:
+        return normalize_host(stored) == host
+    except ProtectError:
+        return stored.strip().lower() == host.lower()
+
+
 def normalize_host(host):
-    return host.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+    """A console address as typed, cleaned up and checked.
+
+    Only an IP address or a host name: anything else (a pasted API key, say)
+    must never reach DNS or a command line.
+    """
+    host = host.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+    if not host:
+        return ""
+    name, port = host, None
+    if host.startswith("["):
+        name, _, rest = host[1:].partition("]")
+        port = rest.removeprefix(":") or None
+    elif host.count(":") == 1:
+        name, port = host.split(":")
+    if port is not None and not (port.isdigit() and 0 < int(port) < 65536):
+        raise ProtectError("that does not look like a console address")
+    try:
+        ipaddress.ip_address(name)
+        valid = True
+    except ValueError:
+        labels = name.removesuffix(".").split(".")
+        valid = (len(name) <= 253 and all(HOST_LABEL.fullmatch(l) for l in labels)
+                 # A single long word is far more likely a key than a host,
+                 and not (len(labels) == 1 and len(name) > 24)
+                 # as is any long label without a hyphen,
+                 and not any(looks_like_key(l) for l in labels)
+                 # and anything that starts like an IP address must be one:
+                 # a key pasted after "192.168.1.1" is not a host name.
+                 and not labels[0].isdigit())
+    if not valid:
+        raise ProtectError("that does not look like a console address (an IP address or host name)")
+    if port == "443":
+        host = f"[{name}]" if ":" in name else name
+    return host
 
 
 def cmd_setup_probe(args):
     """Panel setup, step 1: reach the console and report its certificate."""
-    host = normalize_host(args.host)
+    host = typed_host(args.host, load_config(keys=False))
     if not host:
         raise ProtectError("enter the console's address")
     try:
@@ -2519,7 +3763,7 @@ def cmd_setup_probe(args):
     except OSError as error:
         raise ProtectError(f"cannot reach {host}: {error.strerror or error}")
     config = load_config() or {"consoles": []}
-    existing = next((c for c in config["consoles"] if c["host"] == host), {})
+    existing = next((c for c in config["consoles"] if same_host(c["host"], host)), {})
     print(json.dumps({
         "host": host,
         "fingerprint": pin,
@@ -2537,17 +3781,22 @@ def cmd_setup_save(args):
     key (to rename it or re-pin its certificate).
     """
     key = sys.stdin.readline().strip()
-    host = normalize_host(args.host)
+    # The panel sends the name on the next line, off the command line.
+    name = sys.stdin.readline().strip() or args.name or ""
+    host = typed_host(args.host, load_config(keys=False))
+    if demo_on():
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = load_config() or {"consoles": [], "timeoutSec": 8}
-    existing = next((c for c in config["consoles"] if c["host"] == host), {})
-    if not key:
+    existing = next((c for c in config["consoles"] if same_host(c["host"], host)), {})
+    repinned = bool(existing.get("certSha256")) and existing["certSha256"] != args.pin
+    if not key and not repinned:
         key = existing.get("apiKey", "")
     if not key:
-        raise ProtectError("paste the API key")
+        raise ProtectError("paste the API key" + (" again: the console's certificate changed" if repinned else ""))
     # The pin was shown to the user in step 1; refuse if the console now
     # presents anything else.
     _, cameras = verify_console(config, host, args.pin, key)
-    entry, where = save_console(config, existing, host, args.pin, key, args.name or "")
+    entry, where = save_console(config, existing, host, args.pin, key, name)
     poll_cameras(config)
     print(json.dumps({
         "name": entry["name"],
@@ -2558,6 +3807,9 @@ def cmd_setup_save(args):
 
 
 def cmd_setup(args):
+    if demo_on():
+        # Checked first: a key verified now could not be saved.
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = load_config() or {"consoles": [], "timeoutSec": 8}
     consoles = config["consoles"]
     print("UniFi Protect setup\n")
@@ -2570,19 +3822,26 @@ def cmd_setup(args):
     default_host = "" if consoles else "192.168.1.1"
     prompt = f"Console address [{default_host}]: " if default_host else "Console address: "
     host = input(prompt).strip() or default_host
-    host = host.removeprefix("https://").removeprefix("http://").rstrip("/")
+    host = typed_host(host, config)
     if not host:
         raise ProtectError("no address given")
-    existing = next((c for c in consoles if c["host"] == host), {})
+    existing = next((c for c in consoles if same_host(c["host"], host)), {})
 
     try:
         pin = fetch_cert_fingerprint(host)
     except OSError as error:
         raise ProtectError(f"cannot reach {host}: {error}")
     print(f"\nConsole certificate SHA-256:\n  {pin}")
-    if existing.get("certSha256") and existing["certSha256"] != pin:
-        print("  (this differs from the certificate pinned previously)")
-    if input("Trust this certificate? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+    repinned = bool(existing.get("certSha256")) and existing["certSha256"] != pin
+    if repinned:
+        # Not the certificate we know: make the user say yes, and never
+        # hand the stored key or login to it.
+        print("  (this differs from the certificate pinned previously; check it on the\n"
+              "   console before trusting it, and the stored key will not be reused)")
+        trusted = input("Trust this certificate? [y/N] ").strip().lower() in ("y", "yes")
+    else:
+        trusted = input("Trust this certificate? [Y/n] ").strip().lower() in ("", "y", "yes")
+    if not trusted:
         raise ProtectError("setup cancelled")
 
     print(
@@ -2595,7 +3854,7 @@ def cmd_setup(args):
         "If a key made in Site Manager (unifi.ui.com) is rejected, use one made here.\n"
     )
     key = getpass.getpass("API key (input hidden, paste with Super+V): ").strip()
-    if not key and existing.get("apiKey"):
+    if not key and existing.get("apiKey") and not repinned:
         key = existing["apiKey"]
         print("  keeping the existing key")
     if not key:
@@ -2604,7 +3863,7 @@ def cmd_setup(args):
     info, cameras = verify_console(config, host, pin, key)
     online = sum(1 for c in cameras if c.get("state") == "CONNECTED")
     print(
-        f"\nConnected to UniFi Protect {info.get('applicationVersion', '')}".rstrip()
+        f"\nConnected to UniFi Protect {clean_text(info.get('applicationVersion'), '', 40)}".rstrip()
         + f" · {online}/{len(cameras)} camera(s) online"
     )
 
@@ -2633,13 +3892,17 @@ def cmd_consoles(args):
 
 
 def cmd_remove(args):
+    if demo_on():
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = require_config()
     console = find_console(config, args.console)
     if not args.yes and input(f"Remove {console['name']} ({console['host']})? [y/N] ").strip().lower() not in ("y", "yes"):
         raise ProtectError("not changed")
     config["consoles"].remove(console)
-    clear_login(console)
+    dropped = clear_login(console, config)
     forget_recordings(console["id"])
+    forget_streams(console)
+    forget_alerts(console["id"])
     if console.get("keyStore") == "keyring":
         try:
             keyring_clear(console["id"])
@@ -2649,6 +3912,9 @@ def cmd_remove(args):
         save_config(config)
     else:
         os.remove(CONFIG_PATH)
+    if dropped.get("loginUser") and not end_session(dropped, config):
+        print(f"Could not sign {console['name']}'s recordings session out on the console; "
+              "delete its local account to be sure it ends.", file=sys.stderr)
     # Drop its cameras from the panel now rather than on the next poll.
     state = previous_state()
     state["cameras"] = [c for c in state.get("cameras", []) if c.get("console") != console["id"]]
@@ -2665,19 +3931,34 @@ def cmd_migrate_keys(args):
             raise ProtectError(f"{console['name']}: {console['keyError']}")
     if args.to == "keyring" and not keyring_available():
         raise ProtectError("no keyring available (Secret Service via secret-tool)")
-    moved = 0
+    moved, left = 0, []
+    to_clear = []
     for console in config["consoles"]:
         in_keyring = console.get("keyStore") == "keyring"
         if args.to == "keyring" and not in_keyring:
-            store_key(config, console, console["apiKey"])
-            moved += 1
+            # store_key falls back to the file when the keyring says no.
+            if store_key(config, console, console["apiKey"]) == "keyring":
+                moved += 1
+            else:
+                left.append(console["name"])
         elif args.to == "file" and in_keyring:
-            keyring_clear(console["id"])
             console.pop("keyStore", None)
+            to_clear.append(console["id"])
             moved += 1
+    # Write the file before clearing the keyring, so a failed save never
+    # loses a key.
     save_config(config)
+    for console_id in to_clear:
+        try:
+            keyring_clear(console_id)
+        except KeyringUnavailable as error:
+            print(f"Could not remove a key from the keyring: {error}", file=sys.stderr)
+    if left:
+        raise ProtectError(f"{moved} key(s) moved, but the keyring refused the key for "
+                           f"{', '.join(left)}; it is still in {CONFIG_PATH}")
     where = "your keyring" if args.to == "keyring" else CONFIG_PATH
-    print(f"{moved} key(s) moved; all keys are now in {where}")
+    print(f"{moved} key(s) moved; all API keys are now in {where} "
+          "(recordings logins stay where `login` put them)")
 
 
 def camera_uid(wanted):
@@ -2697,6 +3978,8 @@ def cmd_login(args):
     Interactive by default. --stdin (used by the panel) reads the username
     and the password as two lines, so the password is never an argument.
     """
+    if demo_on():
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = require_config()
     console = find_console(config, args.console)
     if console.get("demo"):
@@ -2713,23 +3996,55 @@ def cmd_login(args):
     if not user or not password:
         raise ProtectError("enter the username and the password")
     previous = {k: console[k] for k in ("loginUser", "loginStore", "loginPassword") if k in console}
+    old_session = load_sessions().get(console["id"])
     console.pop("loginStore", None)
     console.update(loginUser=user, loginPassword=password)
-    forget_session(console["id"])
+    # Stopped by the panel (SIGTERM)? Leave through the finally below.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    trial = ProtectSession(console, config, fresh=True)
+    proven = False
     try:
-        # Prove it before saving: sign in and list one event.
+        # Prove it before keeping anything: sign in and list one event. The
+        # trial lives in memory only, so the saved login is untouched unless
+        # this works.
         now = time.time()
-        ProtectSession(console, config).events(None, now - 3600, now, limit=1)
-    except ProtectError:
-        for field in ("loginUser", "loginPassword"):
-            console.pop(field, None)
-        console.update(previous)
-        # The trial sign-in may have saved a session for the rejected account.
-        forget_session(console["id"])
-        raise
-    where = store_login(console, user, password)
-    save_config(config)
+        trial.events(None, now - 3600, now, limit=1)
+        proven = True
+    finally:
+        if not proven:
+            for field in ("loginUser", "loginPassword"):
+                console.pop(field, None)
+            console.update(previous)
+            trial.logout()     # signed in but not allowed to list: sign out
+    # It works: keep it, as one step a stop signal cannot cut in half. The
+    # config and password first, then the session, then the old session
+    # signed out on the console.
+    handlers = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        try:
+            where = store_login(console, user, password)
+            save_config(config)
+        except BaseException:
+            trial.logout()
+            raise
+        with sessions_lock():
+            # Whatever is saved now (another helper may have signed the old
+            # account in again meanwhile) is replaced, and signed out below.
+            replaced = load_sessions().get(console["id"])
+            set_rejected(console["id"], None)
+            restore_session(console["id"], trial.session)
+        old = [s for s in (old_session, replaced) if isinstance(s, dict) and s.get("token")
+               and s.get("token") != (trial.session or {}).get("token")
+               and s.get("expires", 0) > time.time()]      # an expired one is over already
+        unconfirmed = [s for s in {s["token"]: s for s in old}.values()
+                       if not logout_session(dict(console, loginUser=previous.get("loginUser") or user), s, config)]
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
     poll_cameras(config)
+    if unconfirmed:
+        print("The console did not confirm signing out the previous session; it may last until it "
+              "expires.", file=sys.stderr)
     if args.json:
         print(json.dumps({"console": console["id"], "name": console["name"], "store": where}))
     else:
@@ -2746,16 +4061,22 @@ def forget_recordings(console_id):
 
 
 def cmd_logout(args):
+    if demo_on():
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = require_config()
     console = find_console(config, args.console)
     if not console.get("loginUser"):
         print(f"No recordings login stored for {console['name']}.")
         return
-    clear_login(console)
-    save_config(config)
+    dropped = clear_login(console, config)
+    save_config(config)              # first: no helper may sign in again now
+    signed_out = end_session(dropped, config)
     forget_recordings(console["id"])
     poll_cameras(config)
     print(f"Signed out of {console['name']}; its login and fetched recordings are removed.")
+    if not signed_out:
+        print("The console did not confirm the sign-out; its session may last until it expires.",
+              file=sys.stderr)
 
 
 def cmd_recordings(args):
@@ -2766,7 +4087,9 @@ def cmd_recordings(args):
         print(json.dumps(result))
         return
     if result.get("needsLogin"):
-        raise ProtectError(f"no login for recordings on {result['consoleName']}; "
+        why = (f"the console turned the saved login down ({result['loginError']})"
+               if result.get("loginError") else "no login for recordings")
+        raise ProtectError(f"{why} on {result['consoleName']}; "
                            f"run `eld-unifi-protect login {result['console']}`")
     for event in result["events"]:
         length = f"{round(event['end'] - event['start'])} s" if event["end"] else "ongoing"
@@ -2781,9 +4104,27 @@ def cmd_clip(args):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     config = require_config()
     uid = camera_uid(args.camera)
+    if args.start is None:
+        # The panel passes event times in the environment (private to this
+        # user), not on the command line.
+        try:
+            event = json.loads(os.environ.get("ELD_UNIFI_PROTECT_EVENT") or "")
+            args.start = float(event["start"])
+            args.end = float(event["end"]) if event.get("end") else None
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+            raise ProtectError("give --start (and --end) for the event")
+    if not math.isfinite(args.start) or (args.end is not None and not math.isfinite(args.end)):
+        raise ProtectError("event times must be numbers")
     clip = fetch_clip(config, uid, args.start, args.end, args.quality)
     if args.output:
-        shutil.copyfile(clip["path"], args.output)
+        # A new private file put in place: never written through a planted
+        # link, and an existing file's looser mode or other links are not kept.
+        with open(clip["path"], "rb") as source:
+            data = source.read()
+        try:
+            write_atomic(os.path.abspath(args.output), data)
+        except OSError as error:
+            raise ProtectError(f"cannot write {args.output}: {error.strerror or error}")
         clip["path"] = args.output
     if args.play:
         player = shutil.which("mpv")
@@ -2805,7 +4146,18 @@ def cmd_trust_cert(args):
         if pin == console.get("certSha256"):
             print("  already trusted")
             continue
-        if args.yes or input("  Trust the current certificate? [y/N] ").strip().lower() in ("y", "yes"):
+        # The stored API key (and recordings login) will go to whoever holds
+        # this certificate: only for a fingerprint checked on the console
+        # itself, never one merely seen over the same network.
+        if args.pin:
+            trusted = args.pin.lower().replace(":", "") == pin
+            if not trusted:
+                print("  not the fingerprint you gave; left as it was")
+        else:
+            print("  Check this fingerprint on the console itself first. If you trust it, the\n"
+                  "  stored API key and recordings login will be sent to it.")
+            trusted = input("  Trust the current certificate? [y/N] ").strip().lower() in ("y", "yes")
+        if trusted:
             console["certSha256"] = pin
             changed = True
     if changed:
@@ -2823,11 +4175,17 @@ def cmd_cameras(args):
     state = poll_cameras(require_config())
     for console in state.get("consoles", []):
         if console.get("error"):
-            print(f"! {console['name']}: {console['error']}", file=sys.stderr)
+            print(f"! {console['name']}: {clean_text(console['error'], 'error', 300)}", file=sys.stderr)
     for camera in state["cameras"]:
         status = "online " if camera["online"] else "OFFLINE"
         status += " hidden" if camera.get("hidden") else "       "
         print(f"{status}  {camera['uid']:<40} {camera['consoleName']:<12} {camera['name']}  ({camera['model']})")
+    conflicts = [c for c in state["cameras"] if c.get("macConflict")]
+    if conflicts:
+        # Two consoles report one camera online: one of them may be lying.
+        print("! these cameras share a MAC address across consoles, so their settings are kept\n"
+              "  per console and earlier ones no longer apply; check which console is right: "
+              + ", ".join(f"{c['name']} ({c['consoleName']})" for c in conflicts), file=sys.stderr)
 
 
 def cmd_snapshot(args):
@@ -2849,7 +4207,7 @@ def cmd_watch(args):
     index = load_index()
     last_poll = 0.0
     cameras = previous_state().get("cameras", [])
-    while os.getppid() == parent:
+    while os.getppid() == parent and not plugin_gone():
         started = time.monotonic()
         try:
             config = load_config()
@@ -2861,8 +4219,8 @@ def cmd_watch(args):
                 cameras = poll_cameras(config).get("cameras", [])
                 last_poll = started
             refresh_snapshots(config, cameras, index)
-        except ProtectError:
-            pass
+        except (ProtectError, OSError):
+            pass    # a full disk or a bad round must not end the loop
         time.sleep(max(0.2, interval - (time.monotonic() - started)))
 
 
@@ -2883,7 +4241,7 @@ def mpv_command(player, sound=True):
         # A camera stream that drops (Wi-Fi, firmware update, console
         # restart) ends the "file"; looping it reconnects instead of closing.
         "--loop-file=inf",
-        "--title=${media-title}",
+        "--title=${playlist/0/title}",
         "--force-window=immediate",
         "--profile=low-latency",
         "--untimed",
@@ -2913,8 +4271,8 @@ def camera_name(uid):
 
 
 def mpv_playlist(title, target):
-    """A one-entry M3U playlist: the title (mpv's media-title), then target."""
-    title = " ".join(str(title).split()) or "UniFi Protect"
+    """A one-entry M3U playlist: the window title, then target."""
+    title = clean_text(title, "UniFi Protect", 200)
     if "\n" in target or "\r" in target or target.startswith("#"):
         raise ProtectError("unexpected media location")
     return f"#EXTM3U\n#EXTINF:-1,{title}\n{target}\n".encode()
@@ -2923,8 +4281,9 @@ def mpv_playlist(title, target):
 def exec_mpv(player, command, title, target):
     """Replace this process with mpv, playing target under title.
 
-    Both travel as a playlist on stdin, where no other user can read them;
-    mpv's window title is ${media-title}, which the playlist sets.
+    Both travel as a playlist on stdin, where no other user can read them.
+    mpv's window title is that entry's title (${playlist/0/title}); not
+    ${media-title}, which a stream's own metadata overrides.
     """
     playlist = mpv_playlist(title, target)
     read_fd, write_fd = os.pipe()
@@ -2962,6 +4321,8 @@ def cmd_doctor(args):
     def report(good, label, detail=""):
         nonlocal ok
         ok = ok and good
+        # Details can quote the console: printable text only.
+        detail = clean_text(detail, "", 300)
         print(("  ok   " if good else "  FAIL ") + label + (f" — {detail}" if detail else ""))
 
     config = load_config()
@@ -2999,26 +4360,23 @@ def cmd_doctor(args):
 
 
 def cmd_hide(args, hide=True):
-    state = poll_cameras(require_config())
-    prefs = load_prefs()
-    hidden = set(prefs["hidden"])
+    refuse_in_demo()
+    keys = set()
     for wanted in args.cameras:
-        matches = find_cameras(state["cameras"], wanted)
+        matches = find_known_cameras(wanted)
         if not matches:
             raise ProtectError(f"no camera {wanted!r}; see `eld-unifi-protect cameras`")
         for camera in matches:
-            (hidden.add if hide else hidden.discard)(camera_key(camera))
+            keys.add(camera_key(camera))
             print(("hidden   " if hide else "visible  ") + camera["name"] + "  ·  " + camera["consoleName"])
-    prefs["hidden"] = sorted(hidden)
-    save_prefs(prefs)
+    update_prefs(lambda p: p.update(hidden=sorted(set(p["hidden"]) | keys if hide
+                                                  else set(p["hidden"]) - keys)))
     poll_cameras()
 
 
 def cmd_unhide(args):
     if args.all:
-        prefs = load_prefs()
-        prefs["hidden"] = []
-        save_prefs(prefs)
+        update_prefs(lambda p: p.update(hidden=[]))
         poll_cameras()
         print("all cameras visible")
         return
@@ -3031,7 +4389,7 @@ def cmd_read_only(args):
     prefs = load_prefs()
     if args.mode != "status":
         prefs["readOnly"] = args.mode == "on"
-        save_prefs(prefs)
+        update_prefs(lambda p: p.update(readOnly=prefs["readOnly"]))
         # Cached URLs may include fallbacks chosen under the other setting.
         try:
             os.remove(STREAM_CACHE)
@@ -3044,33 +4402,29 @@ def cmd_read_only(args):
 
 
 def cmd_favorite(args):
-    prefs = load_prefs()
+    refuse_in_demo()
     if args.clear or not args.camera:
-        prefs["favorite"] = ""
-        save_prefs(prefs)
+        update_prefs(lambda p: p.update(favorite=""))
         poll_cameras()
         print("no favourite camera")
         return
-    state = poll_cameras(require_config())
-    matches = find_cameras(state["cameras"], args.camera)
+    matches = find_known_cameras(args.camera)
     if len(matches) != 1:
         raise ProtectError(f"{args.camera!r} matches {len(matches)} cameras; use its id "
                            "from `eld-unifi-protect cameras`")
-    prefs["favorite"] = camera_key(matches[0])
-    save_prefs(prefs)
+    update_prefs(lambda p: p.update(favorite=camera_key(matches[0])))
     poll_cameras()
     print(f"favourite: {matches[0]['name']}  ·  {matches[0]['consoleName']}")
 
 
 def cmd_hide_offline(args):
-    prefs = load_prefs()
-    if args.mode == "toggle":
-        prefs["hideOffline"] = not prefs["hideOffline"]
-    else:
-        prefs["hideOffline"] = args.mode == "on"
-    save_prefs(prefs)
+    refuse_in_demo()
+    def change(p):
+        p["hideOffline"] = (not p["hideOffline"]) if args.mode == "toggle" else args.mode == "on"
+        return p["hideOffline"]
+    hidden = update_prefs(change)
     poll_cameras()
-    print("offline cameras " + ("hidden" if prefs["hideOffline"] else "shown"))
+    print("offline cameras " + ("hidden" if hidden else "shown"))
 
 
 WALL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "wall")
@@ -3078,14 +4432,32 @@ WALL_CONFIG = os.path.join(RUNTIME_DIR, "wall.json")
 WALL_PID = os.path.join(RUNTIME_DIR, "wall.pid")
 
 
+def process_start_time(pid):
+    """A process's start time in clock ticks since boot (stat field 22)."""
+    with open(f"/proc/{pid}/stat") as handle:
+        # The command name (field 2) may hold spaces and parentheses.
+        return int(handle.read().rsplit(")", 1)[1].split()[19])
+
+
 def running_wall():
+    """The wall's pid, only if that process is still exactly our wall.
+
+    wall.pid outlives the wall, and pids get reused: a stale one must never
+    make the toggle kill some other process (such as the Omarchy shell).
+    """
     try:
         with open(WALL_PID) as handle:
-            pid = int(handle.read().strip())
+            values = [int(v) for v in handle.read().split()]
+        # "pid started"; a bare pid is from before 0.4.2, still checked by
+        # its exact command line.
+        pid, started = values if len(values) == 2 else (values[0], None)
         with open(f"/proc/{pid}/cmdline", "rb") as handle:
-            if b"quickshell" in handle.read():
-                return pid
-    except (OSError, ValueError):
+            argv = handle.read().split(b"\0")[:-1]
+        if (argv[1:] == [b"--no-duplicate", b"--path", WALL_DIR.encode()]
+                and os.path.basename(argv[0]) in (b"quickshell", b"qs")
+                and started in (None, process_start_time(pid))):
+            return pid
+    except (OSError, ValueError, IndexError):
         pass
     return None
 
@@ -3125,10 +4497,20 @@ def cmd_wall(args):
     Running it again while it is up closes it, so one keybinding toggles it.
     """
     pid = running_wall()
+    if args.close:
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        return
     if pid:
         if args.no_toggle:
             return
-        os.kill(pid, signal.SIGTERM)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # closed on its own just now
         return
 
     config = require_config()
@@ -3143,8 +4525,10 @@ def cmd_wall(args):
         try:
             urls = clients[camera["console"]].stream_urls(camera["id"], qualities)
             return dict(camera, grid=urls[args.quality], focus=urls[args.focus_quality])
-        except (ProtectError, KeyError) as error:
+        except ProtectError as error:
             return dict(camera, error=str(error))
+        except Exception:      # one console's nonsense must not stop the wall
+            return dict(camera, error="console sent something unexpected")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         tiles = list(pool.map(resolve, cameras))
@@ -3156,6 +4540,10 @@ def cmd_wall(args):
         "multiConsole": len(config["consoles"]) > 1,
         # Sound for an enlarged camera; grid tiles never play any.
         "sound": args.sound == "on",
+        # For fresh URLs when a stream keeps failing (say, a relay restart).
+        "cli": os.path.realpath(__file__),
+        "gridQuality": args.quality,
+        "focusQuality": args.focus_quality,
     })
     quickshell = shutil.which("quickshell") or shutil.which("qs")
     if not quickshell:
@@ -3172,7 +4560,7 @@ def cmd_wall(args):
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    write_atomic(WALL_PID, str(process.pid))
+    write_atomic(WALL_PID, f"{process.pid} {process_start_time(process.pid)}")
 
 
 def private_dir_problem(path):
@@ -3233,9 +4621,9 @@ def main():
     p = sub.add_parser("migrate-keys", help="move API keys to the keyring, or back to the config file")
     p.add_argument("--to", choices=("keyring", "file"), default="keyring")
     p.set_defaults(func=cmd_migrate_keys)
-    p = sub.add_parser("trust-cert", help="re-pin console certificates")
+    p = sub.add_parser("trust-cert", help="re-pin a console certificate you have checked")
     p.add_argument("console", nargs="?")
-    p.add_argument("--yes", action="store_true")
+    p.add_argument("--pin", help="re-pin only if the console now presents this SHA-256 fingerprint")
     p.set_defaults(func=cmd_trust_cert)
     p = sub.add_parser("poll", help="refresh the state file")
     p.add_argument("--print", action="store_true")
@@ -3286,6 +4674,11 @@ def main():
     p.add_argument("--stdin", action="store_true", help="read username and password as two lines")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_login)
+    p = sub.add_parser("enabled-streams", help="list the streams the plugin switched on in Protect")
+    p.set_defaults(func=cmd_enabled_streams)
+    p = sub.add_parser("stop", help="stop the wall, the stream relay and the alert listener")
+    p.add_argument("--sign-out", action="store_true", help="also end every recordings session")
+    p.set_defaults(func=cmd_stop)
     p = sub.add_parser("logout", help="remove a console's recordings login")
     p.add_argument("console", nargs="?")
     p.set_defaults(func=cmd_logout)
@@ -3297,7 +4690,8 @@ def main():
     p.set_defaults(func=cmd_recordings)
     p = sub.add_parser("clip", help="fetch the recording of an event (see `recordings`)")
     p.add_argument("camera", help="camera uid or name")
-    p.add_argument("--start", type=float, required=True, help="event start, Unix seconds")
+    p.add_argument("--start", type=float, help="event start, Unix seconds "
+                   "(or ELD_UNIFI_PROTECT_EVENT='{\"start\": …, \"end\": …}')")
     p.add_argument("--end", type=float, help="event end; omit for one still in progress")
     p.add_argument("--quality", choices=QUALITIES, default="medium")
     p.add_argument("-o", "--output", help="also save a copy here")
@@ -3321,6 +4715,7 @@ def main():
     p.add_argument("--quality", choices=QUALITIES, default="medium", help="stream for grid tiles")
     p.add_argument("--focus-quality", choices=QUALITIES, default="high", help="stream for an enlarged camera")
     p.add_argument("--no-toggle", action="store_true", help="do nothing if already open")
+    p.add_argument("--close", action="store_true", help="close it if open; never open it")
     p.add_argument("--mode", choices=("window", "overlay"), default="window",
                    help="window: maximized, keeps workspaces and the bar (default); "
                         "overlay: covers everything")
@@ -3337,7 +4732,9 @@ def main():
         check_runtime_dir()
         args.func(args)
     except ProtectError as error:
-        print(f"eld-unifi-protect: {error}", file=sys.stderr)
+        # Messages can quote the console; never let it reach the terminal raw
+        # (escape sequences can retitle it or write to the clipboard).
+        print(f"eld-unifi-protect: {clean_text(str(error), 'error', 1000)}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)

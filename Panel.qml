@@ -110,11 +110,23 @@ Panel {
   // The alert log: everything since the last Clear, newest first.
   property bool alertsView: false
   property real seenBefore: 0      // alerts newer than this are marked new
-  readonly property var logAlerts: alerts.filter(function(a) { return a.start > root.clearedAt })
+  property var seenBeforeSeq: undefined
+  property var ackedSeq: undefined
+  property var clearedSeq: undefined
+
+  // Whether an alert came after an ack or Clear: on the boot's monotonic
+  // clock when both carry it (immune to clock steps), else wall-clock time.
+  property string ackBoot: ""
+  function after(alert, seq, at) {
+    var sameBoot = alert.boot !== undefined && alert.boot === root.ackBoot
+    return (typeof alert.seq === "number" && typeof seq === "number" && sameBoot)
+           ? alert.seq > seq : alert.start > at
+  }
+  readonly property var logAlerts: alerts.filter(function(a) { return root.after(a, root.clearedSeq, root.clearedAt) })
                                          .slice().reverse()
   property real nowSec: Date.now() / 1000
   readonly property var alerts: alertsData && alertsData.alerts ? alertsData.alerts : []
-  readonly property var unackedAlerts: alerts.filter(function(a) { return a.start > root.ackedAt })
+  readonly property var unackedAlerts: alerts.filter(function(a) { return root.after(a, root.ackedSeq, root.ackedAt) })
   readonly property bool alerting: configured && unackedAlerts.length > 0
   readonly property var latestAlert: unackedAlerts.length ? unackedAlerts[unackedAlerts.length - 1] : null
   readonly property int armedCount: allCameras.filter(function(c) {
@@ -140,6 +152,7 @@ Panel {
 
   function ago(seconds) {
     var age = root.nowSec - seconds
+    if (age < -60) return Qt.formatTime(new Date(seconds * 1000), "HH:mm")   // the clock went back
     if (age < 60) return "just now"
     if (age < 3600) return Math.floor(age / 60) + " min ago"
     return Qt.formatTime(new Date(seconds * 1000), "HH:mm")
@@ -148,7 +161,10 @@ Panel {
   // The newest alert for a camera within the last ten minutes, or null.
   function recentAlert(uid) {
     for (var i = alerts.length - 1; i >= 0; i--) {
-      if (alerts[i].uid === uid) return root.nowSec - alerts[i].start < 600 ? alerts[i] : null
+      if (alerts[i].uid === uid) {
+        var age = root.nowSec - alerts[i].start
+        return age >= -60 && age < 600 ? alerts[i] : null
+      }
     }
     return null
   }
@@ -250,28 +266,30 @@ Panel {
     streamProcess.running = true
   }
 
+  // Most specific match first: a uid names exactly one camera, whatever a
+  // console calls its other cameras. Hidden cameras count too.
+  function findCamera(name) {
+    var wanted = String(name || "")
+    var lower = wanted.toLowerCase()
+    var tests = [function(c) { return c.uid === wanted },
+                 function(c) { return c.id === wanted },
+                 function(c) { return String(c.name || "").toLowerCase() === lower }]
+    for (var t = 0; t < tests.length; t++)
+      for (var i = 0; i < allCameras.length; i++)
+        if (tests[t](allCameras[i])) return allCameras[i]
+    return null
+  }
+
   function openLiveByName(name) {
-    var wanted = String(name || "").toLowerCase()
-    for (var i = 0; i < cameras.length; i++) {
-      if (cameras[i].name.toLowerCase() === wanted || cameras[i].uid === name || cameras[i].id === name) {
-        root.open()
-        root.openLive(cameras[i])
-        return
-      }
-    }
+    var camera = root.findCamera(name)
     root.open()
+    if (camera) root.openLive(camera)
   }
 
   function openRecordingsByName(name) {
-    var wanted = String(name || "").toLowerCase()
-    for (var i = 0; i < allCameras.length; i++) {
-      if (allCameras[i].name.toLowerCase() === wanted || allCameras[i].uid === name || allCameras[i].id === name) {
-        root.open()
-        root.openRecordings(allCameras[i], null, "live")
-        return
-      }
-    }
+    var camera = root.findCamera(name)
     root.open()
+    if (camera) root.openRecordings(camera, null, "live")
   }
 
   function stepLive(delta) {
@@ -443,14 +461,14 @@ Panel {
     player.source = ""
     root.clipError = ""
     root.playingClip = null
-    var args = [root.cli, "clip", root.liveCamera.uid, "--start", String(start),
-                "--quality", root.liveQuality, "--json"]
-    if (end) args.push("--end", String(end))
     root.stopProcess(clipProcess)
     clipProcess.key = root.liveCamera.uid + ":" + start
     clipProcess.eventStart = start
     clipProcess.eventEnd = end
-    clipProcess.command = args
+    // Event times go in the environment, which only this user can read;
+    // command lines are visible to everyone.
+    clipProcess.environment = root.eventEnvironment(start, end)
+    clipProcess.command = [root.cli, "clip", root.liveCamera.uid, "--quality", root.liveQuality, "--json"]
     clipProcess.running = true
   }
 
@@ -473,15 +491,19 @@ Panel {
     recordingsList.positionViewAtIndex(root.recordingIndex, ListView.Contain)
   }
 
+  function eventEnvironment(start, end) {
+    return { ELD_UNIFI_PROTECT_EVENT: JSON.stringify({ start: start, end: end || null }) }
+  }
+
   // The clip in mpv at the pop-out quality: a separate export, then seekable.
   function popOutClip() {
     if (!root.playingClip) return
     var clip = root.playingClip
-    var args = [root.cli, "clip", root.liveCamera.uid, "--start", String(clip.eventStart),
-                "--quality", root.popoutQuality, "--play",
-                "--sound", root.muted ? "off" : "on"]
-    if (clip.eventEnd) args.push("--end", String(clip.eventEnd))
-    Quickshell.execDetached(args)
+    Quickshell.execDetached({
+      command: [root.cli, "clip", root.liveCamera.uid, "--quality", root.popoutQuality, "--play",
+                "--sound", root.muted ? "off" : "on"],
+      environment: root.eventEnvironment(clip.eventStart, clip.eventEnd)
+    })
     root.closeLive()
     root.close()
   }
@@ -518,6 +540,8 @@ Panel {
       try {
         var result = JSON.parse(recordingsOut.text)
         root.recordingsNeedLogin = result.needsLogin === true
+        // Asked again because the console turned the saved login down.
+        if (result.loginError) root.loginError = result.loginError
         root.recordingsConsole = result.console || ""
         root.recordingsConsoleName = result.consoleName || ""
         root.recordings = result.events || []
@@ -702,9 +726,40 @@ Panel {
     root.close()
   }
 
+  // An IP address or host name only: whatever is typed here reaches a
+  // command line and DNS, so a mis-pasted API key must stop here.
+  function plausibleHost(host) {
+    var bare = host.replace(/^https?:\/\//, "")
+    var port = (bare.split(":").length === 2 || /^\[/.test(bare)) ? bare.match(/:(\d+)\/*$/) : null
+    if (port && (Number(port[1]) < 1 || Number(port[1]) > 65535)) return false
+    var name = host.replace(/^https?:\/\//, "").replace(/\/+$/, "").replace(/:\d{1,5}$/, "")
+    if (/^\[[0-9A-Fa-f:.]+\]$/.test(name) || /^[0-9A-Fa-f:.]+$/.test(name) && name.indexOf(":") >= 0)
+      return true
+    if (/^[0-9.]+$/.test(name))
+      return /^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$/.test(name)
+    var labels = name.replace(/\.$/, "").split(".")
+    if (name.length > 253 || (labels.length === 1 && name.length > 24)) return false
+    // Starts like an IP address but is not one: a key pasted after the IP.
+    if (/^\d+$/.test(labels[0])) return false
+    for (var i = 0; i < labels.length; i++) {
+      var label = labels[i]
+      if (!/^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$/.test(label)) return false
+      // A long run of letters and digits with no hyphen, or a shorter one
+      // mixing cases and digits: a pasted key, not a host name.
+      if (label.indexOf("-") < 0 && (label.length >= 30 ||
+          (label.length >= 16 && /[A-Z]/.test(label) && /[a-z]/.test(label) && /\d/.test(label))))
+        return false
+    }
+    return true
+  }
+
   function probeConsole() {
     var host = addressField.text.trim()
     if (host === "" || setupProbe.running) return
+    if (!root.plausibleHost(host)) {
+      root.setupError = "That does not look like a console address: use its IP address or host name"
+      return
+    }
     root.setupError = ""
     root.setupBusy = "Reaching " + host + "…"
     setupProbe.command = [root.cli, "setup-probe", host]
@@ -719,10 +774,10 @@ Panel {
     }
     root.setupError = ""
     root.setupBusy = "Checking the key with " + root.setupHost + "…"
-    setupSave.secret = keyField.text.trim()
+    // Key, then name, on stdin: nothing typed here lands on a command line.
+    setupSave.secret = keyField.text.trim() + "\n" + nameField.text.trim().replace(/[\r\n]/g, " ")
     keyField.text = ""
-    setupSave.command = [root.cli, "setup-save", "--host", root.setupHost,
-                         "--pin", root.setupPin, "--name", nameField.text.trim()]
+    setupSave.command = [root.cli, "setup-save", "--host", root.setupHost, "--pin", root.setupPin]
     setupSave.running = true
   }
 
@@ -833,6 +888,9 @@ Panel {
         var ack = JSON.parse(text())
         root.ackedAt = ack.ackedAt || 0
         root.clearedAt = ack.clearedAt || 0
+        root.ackedSeq = ack.ackedSeq
+        root.clearedSeq = ack.clearedSeq
+        root.ackBoot = ack.boot || ""
       } catch (error) { }
     }
   }
@@ -885,6 +943,7 @@ Panel {
       var newest = root.latestAlert
       // Remember what was unseen, to mark it in the log, before acknowledging.
       root.seenBefore = root.ackedAt
+      root.seenBeforeSeq = root.ackedSeq
       if (newest) {
         Quickshell.execDetached([root.cli, "alert", "--ack"])
         root.alertsView = true
@@ -1755,7 +1814,7 @@ Panel {
               Rectangle {
                 id: alertRow
                 required property var modelData
-                readonly property bool isNew: modelData.start > root.seenBefore
+                readonly property bool isNew: root.after(modelData, root.seenBeforeSeq, root.seenBefore)
                 width: alertsColumn.width
                 height: Style.space(64)
                 radius: Style.cornerRadius
@@ -1775,7 +1834,8 @@ Panel {
 
                     Image {
                       anchors.fill: parent
-                      source: alertRow.modelData.image
+                      // Only a plain "<id>.jpg" inside the alert folder, as the helper writes.
+                      source: /^[A-Za-z0-9_-]{1,64}\.jpg$/.test(alertRow.modelData.image || "")
                               ? "file://" + root.runtimeDir + "/alerts/" + alertRow.modelData.image : ""
                       fillMode: Image.PreserveAspectCrop
                       asynchronous: true

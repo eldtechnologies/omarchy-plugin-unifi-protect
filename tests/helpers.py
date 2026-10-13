@@ -5,14 +5,17 @@ throwaway directory before loading: tests never see or touch real config,
 state, API keys or the running relay.
 """
 
+import atexit
 import importlib.machinery
 import importlib.util
 import os
 import pathlib
+import shutil
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SANDBOX = tempfile.mkdtemp(prefix="eld-unifi-protect-test-")
+atexit.register(shutil.rmtree, SANDBOX, ignore_errors=True)
 os.chmod(SANDBOX, 0o700)
 for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
     path = os.path.join(SANDBOX, name.lower())

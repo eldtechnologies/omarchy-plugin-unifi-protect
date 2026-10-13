@@ -55,6 +55,9 @@ class FakeConsole(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         FakeConsole.log.append(("POST", self.path))
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/api/auth/logout":
+            FakeConsole.valid.discard((self.headers.get("Cookie") or "").removeprefix("TOKEN="))
+            return self.reply(200, b"{}")
         if self.path != "/api/auth/login":
             return self.reply(404)
         FakeConsole.logins += 1
@@ -69,6 +72,26 @@ class FakeConsole(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
         FakeConsole.log.append(("GET", url.path))
+        if url.path == "/slow":
+            # Headers, then a byte now and then: only a total deadline ends it.
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            for _ in range(40):
+                try:
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.1)
+            return
+        if url.path == "/short":
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            self.wfile.write(b"x" * 500)
+            self.close_connection = True
+            return
         token = (self.headers.get("Cookie") or "").removeprefix("TOKEN=")
         if token in FakeConsole.no_role:
             return self.reply(403)
@@ -124,13 +147,15 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         FakeConsole.valid.clear()
         FakeConsole.no_role.clear()
         FakeConsole.password = "right"
-        for path in (h.SESSIONS_PATH,):
+        for path in (h.SESSIONS_PATH, h.REJECTED_PATH, h.CONFIG_PATH):
             if os.path.exists(path):
                 os.remove(path)
         shutil.rmtree(h.CLIPS_DIR, ignore_errors=True)
         self.console = {"id": "nvr", "name": "NVR", "host": f"127.0.0.1:{self.server.server_port}",
                         "certSha256": self.pin, "apiKey": "k", "loginUser": "viewer", "loginPassword": "right"}
         self.config = {"consoles": [self.console]}
+        # Sign-ins check the saved config before they keep a session.
+        h.save_config(self.config)
 
     def test_events_are_filtered_and_classified(self):
         result = h.recordings_for(self.config, f"nvr_{CAMERA}")
@@ -155,11 +180,114 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         h.recordings_for(self.config, f"nvr_{CAMERA}")
         self.assertEqual(FakeConsole.logins, 2)
 
-    def test_wrong_password_is_tried_once(self):
+    def test_wrong_password_is_tried_once_and_asks_again(self):
         FakeConsole.password = "changed"
-        with self.assertRaisesRegex(h.ProtectError, "rejected the username or password"):
-            h.recordings_for(self.config, f"nvr_{CAMERA}")
+        result = h.recordings_for(self.config, f"nvr_{CAMERA}")
+        self.assertTrue(result["needsLogin"])
+        self.assertIn("rejected the username or password", result["loginError"])
+        # Other helper processes don't try again either, for a while.
+        h.recordings_for(self.config, f"nvr_{CAMERA}")
+        with self.assertRaises(h.LoginRejected):
+            h.fetch_clip(self.config, f"nvr_{CAMERA}", time.time() - 60, time.time() - 50, "low")
         self.assertEqual(FakeConsole.logins, 1)
+        # Signing in again (the `login` command) clears it.
+        FakeConsole.password = "right"
+        h.save_config(self.config)
+        with mock.patch.object(h.sys, "stdin", io.StringIO("viewer\nright\n")), \
+                mock.patch.object(h, "poll_cameras"), mock.patch.object(h, "store_login", return_value="file"), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_login(argparse.Namespace(console="nvr", stdin=True, json=True))
+        self.assertEqual(len(h.recordings_for(self.config, f"nvr_{CAMERA}")["events"]), 2)
+        os.remove(h.CONFIG_PATH)
+
+    def test_a_failed_sign_in_is_never_retried_by_other_requests(self):
+        FakeConsole.password = "changed"
+        session = h.ProtectSession(self.console, self.config)
+        for _ in range(3):
+            with self.assertRaises(h.ProtectError):
+                session.thumbnail("ev1")
+        self.assertEqual(FakeConsole.logins, 1)
+
+    def test_logout_ends_the_session_on_the_console(self):
+        h.recordings_for(self.config, f"nvr_{CAMERA}")
+        self.assertEqual(len(FakeConsole.valid), 1)
+        h.save_config(self.config)
+        with mock.patch.object(h, "poll_cameras"), mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_logout(argparse.Namespace(console="nvr"))
+        self.assertIn(("POST", "/api/auth/logout"), FakeConsole.log)
+        self.assertEqual(FakeConsole.valid, set())
+        self.assertNotIn("nvr", h.load_sessions())
+        os.remove(h.CONFIG_PATH)
+
+    def test_a_mistyped_new_login_keeps_the_saved_logins_failure(self):
+        FakeConsole.password = "changed"
+        h.recordings_for(self.config, f"nvr_{CAMERA}")       # saved login rejected: 1
+        h.save_config(self.config)
+        with mock.patch.object(h.sys, "stdin", io.StringIO("viewer\ntypo\n")):
+            with self.assertRaises(h.LoginRejected):
+                h.cmd_login(argparse.Namespace(console="nvr", stdin=True, json=True))   # 2
+        # The saved (rejected) login is still not retried behind the user's back.
+        result = h.recordings_for(h.load_config(), f"nvr_{CAMERA}")
+        self.assertTrue(result["needsLogin"])
+        self.assertEqual(FakeConsole.logins, 2)
+        os.remove(h.CONFIG_PATH)
+
+    def test_a_failure_from_the_future_does_not_block(self):
+        h.write_json(h.SESSIONS_PATH, {"nvr": {"failed": time.time() + 3600, "error": "x", "rejected": False}})
+        self.assertEqual(len(h.recordings_for(self.config, f"nvr_{CAMERA}")["events"]), 2)
+
+    def test_reads_are_bounded_in_time_and_must_be_whole(self):
+        session = h.ProtectSession(self.console, self.config)
+        started = time.monotonic()
+        conn, response = session._send("GET", "/slow", deadline=1)
+        with self.assertRaises(h.ProtectError):
+            h.read_body(response, 1 << 20)
+        conn.finish()
+        self.assertLess(time.monotonic() - started, 3)
+        conn, response = session._send("GET", "/short")
+        with self.assertRaisesRegex(h.ProtectError, "partway|mid-answer"):
+            h.read_body(response, 1 << 20)
+        conn.finish()
+
+    def test_clip_output_is_private_and_never_follows_a_link(self):
+        start = time.time() - 60
+        h.save_config(self.config)
+        target = os.path.join(tempfile.mkdtemp(), "door.mp4")
+        args = argparse.Namespace(camera=f"nvr_{CAMERA}", start=start, end=start + 12, quality="low",
+                                  output=target, play=False, title=None, sound="on", json=False)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_clip(args)
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o600)
+        victim = target + ".victim"
+        open(victim, "w").close()
+        link = target + ".link"
+        os.symlink(victim, link)
+        args.output = link
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_clip(args)
+        # The link is replaced by a new private file; what it pointed at is untouched.
+        self.assertEqual(os.path.getsize(victim), 0)
+        self.assertFalse(os.path.islink(link))
+        self.assertEqual(os.stat(link).st_mode & 0o777, 0o600)
+        # An existing looser file, or another link to it, keeps nothing.
+        os.chmod(target, 0o666)
+        other = target + ".hardlink"
+        os.link(target, other)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_clip(argparse.Namespace(**dict(vars(args), output=target)))
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o600)
+        self.assertNotEqual(os.stat(target).st_ino, os.stat(other).st_ino)
+        os.remove(h.CONFIG_PATH)
+
+    def test_a_helper_running_during_logout_leaves_no_session_behind(self):
+        h.recordings_for(self.config, f"nvr_{CAMERA}")
+        straggler = h.ProtectSession(dict(self.console), self.config)   # started before logout
+        with mock.patch.object(h, "poll_cameras"), mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_logout(argparse.Namespace(console="nvr"))
+        with self.assertRaises(h.ProtectError):
+            straggler.events(CAMERA, time.time() - 3600, time.time())   # re-signs in, then sees the logout
+        self.assertNotIn("nvr", h.load_sessions())
+        self.assertEqual(FakeConsole.valid, set())      # every token signed out on the console
 
     def test_no_login_asks_for_one(self):
         del self.console["loginUser"]
@@ -169,13 +297,14 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
 
     def test_a_rejected_login_keeps_the_working_one(self):
         h.recordings_for(self.config, f"nvr_{CAMERA}")
+        session_before = h.load_sessions()["nvr"]
         h.save_config(self.config)
         args = argparse.Namespace(console="nvr", stdin=True, json=True)
         with mock.patch.object(h.sys, "stdin", io.StringIO("norole\nright\n")):
             with self.assertRaisesRegex(h.ProtectError, "may not view recordings"):
                 h.cmd_login(args)
-        # The trial session is gone, so the old account signs in afresh.
-        self.assertNotIn("nvr", h.load_sessions())
+        # The working account keeps its session: no new sign-in needed.
+        self.assertEqual(h.load_sessions()["nvr"], session_before)
         config = h.load_config()
         self.assertEqual(config["consoles"][0]["loginUser"], "viewer")
         self.assertEqual(len(h.recordings_for(config, f"nvr_{CAMERA}")["events"]), 2)
@@ -193,6 +322,24 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         exports = sum(1 for _, p in FakeConsole.log if p.endswith("/export"))
         h.fetch_clip(self.config, f"nvr_{CAMERA}", start, start + 12, "medium")
         self.assertEqual(sum(1 for _, p in FakeConsole.log if p.endswith("/export")), exports)
+
+    def test_clip_times_can_come_from_the_environment(self):
+        # The panel keeps event times off the command line.
+        start = time.time() - 60
+        h.save_config(self.config)
+        args = argparse.Namespace(camera=f"nvr_{CAMERA}", start=None, end=None, quality="low",
+                                  output=None, play=False, title=None, sound="on", json=True)
+        event = json.dumps({"start": start, "end": start + 12})
+        with mock.patch.dict(os.environ, {"ELD_UNIFI_PROTECT_EVENT": event}), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            h.cmd_clip(args)
+        self.assertEqual(json.loads(out.getvalue())["start"], start - h.CLIP_PAD)
+        self.assertEqual(int(self.server.last_export["start"][0]), int((start - h.CLIP_PAD) * 1000))
+        args.start = None
+        with mock.patch.dict(os.environ, {"ELD_UNIFI_PROTECT_EVENT": "nonsense"}):
+            with self.assertRaisesRegex(h.ProtectError, "--start"):
+                h.cmd_clip(args)
+        os.remove(h.CONFIG_PATH)
 
     def test_an_error_page_is_not_saved_as_a_clip(self):
         start = time.time() - 60

@@ -24,17 +24,34 @@ the source before installing. In short, this plugin:
 
 - talks only to the UniFi consoles you configure, over HTTPS with a pinned
   certificate;
-- keeps API keys, and the optional recordings login, out of the shell
-  process, in your keyring (or a file only you can read when no keyring is
-  available);
+- keeps API keys, and the optional recordings login, in your keyring (or a
+  file only you can read when no keyring is available). When you type one
+  into the panel, the shell only passes it to the helper on stdin and clears
+  the field; it never stores, logs or puts it on a command line;
 - keeps fetched recordings in memory only (the runtime directory, mode
   0700), deleted at logout, when the console is removed, and at reboot;
   only `clip -o` writes one to disk, where you asked;
-- carries video over TLS through a local relay that listens on 127.0.0.1 only
-  and requires a per-session token;
-- keeps camera and console names, stream URLs and secrets out of command
-  lines, which other local users can read: mpv gets them on stdin, and
-  notifications go to the notification service over D-Bus;
-- installs no service, runs no code at install time, and never uses `sudo`.
+- carries video over TLS through a local relay that listens on 127.0.0.1
+  only, serves only your own user, requires a per-session token, never
+  hands players the console's stream alias, and refuses to redirect them
+  anywhere else;
+- treats everything a console sends as untrusted: sizes, times and shapes
+  are checked, text is shown as plain text and stripped of terminal escape
+  sequences. The panel's live view decodes the console's video inside the
+  shell process (the camera wall runs in its own process);
+- keeps camera and console names, event times, stream URLs and secrets out
+  of command lines, which other local users can read: they travel on stdin,
+  in the environment (private to you), or to the notification service over
+  D-Bus. Command lines carry only ids: a console's short id (made from its
+  name when it was added) with Protect's camera id, and a console's address
+  during setup or when opening Protect in the browser;
+- installs no service, runs no code at install time, and never uses `sudo`;
+  `uninstall.sh` stops what it started and, with `--purge`, signs out its
+  recordings sessions (and says when a console did not confirm it).
+
+Outside its own files: desktop notifications are marked transient, but a
+notification history (Omarchy's included) may keep a copy of the latest
+ones with their picture; and RTSPS streams the plugin switched on in Protect
+stay on until you turn them off there.
 
 See "How it works" in the [README](README.md) for the details.

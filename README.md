@@ -6,7 +6,8 @@ camera live at once, and a pop-out player. Works with several consoles at
 once, such as a gateway and a dedicated NVR, and is set up from the panel
 itself. Arm a camera to be alerted when it sees a person, a vehicle or a
 doorbell ring, and play back what each camera recorded. Video travels
-encrypted, and API keys stay out of the shell.
+encrypted, and API keys are kept in your keyring (or a file only you can
+read).
 
 In the bar it is a single camera icon. It pulses in your theme's urgent
 colour when an armed camera has seen something, turns that colour when a
@@ -73,9 +74,20 @@ eld-unifi-protect setup
 Setup runs inside the panel (**Run setup**, or **Add console** later); the
 same steps are available in a terminal with `eld-unifi-protect setup`. It asks
 for the console's address, shows the fingerprint of its TLS certificate for
-you to confirm, then asks for an API key. In the panel, the key goes from a
-password field to the helper on stdin and the field is cleared at once; it is
-never written to a file, a log or a command line.
+you to confirm, then asks for an API key. Pinning trusts the certificate
+the console presents the first time, so do this on a network you trust. A
+browser on the same network sees the same certificate, so comparing there
+only catches mistakes, not an attacker in the path; for an independent
+check, read the fingerprint on the console itself, for example over SSH
+with `openssl x509 -noout -fingerprint -sha256` on its certificate. In the
+panel, the key goes from a
+password field to the helper on stdin and the field is cleared at once; it
+never reaches a log or a command line. It is kept in your keyring, or, when
+no keyring is available, in a file only you can read (see below).
+
+Give the plugin the least it needs: an API key from an account with only
+the access you want it to have, and for recordings a local view-only
+account.
 
 Create the key **on the console itself**; this is the route known to work:
 
@@ -216,9 +228,13 @@ to the log.
 Each alert also sends a **desktop notification**, "Person at Front Door",
 with a snapshot from that moment and a **Watch live** button that opens the
 panel on that camera. To avoid floods there is at most one notification per
-camera per minute; every alert is still recorded. Turn them off with
+camera per minute; every alert is still recorded, up to ten new ones per
+camera per minute (more than that is treated as a flood and dropped). Turn
+them off with
 **Notifications on** in the panel footer, or
-`eld-unifi-protect alert --notify off`.
+`eld-unifi-protect alert --notify off`. Notifications are marked transient,
+but Omarchy's notification history still keeps the latest ones, with their
+picture, under `~/.local/state/omarchy/notifications/` until you clear it.
 
 ```bash
 eld-unifi-protect alert "Front Door"                  # person, vehicle, ring
@@ -327,11 +343,13 @@ The plugin's own files:
 | `~/.config/eld-unifi-protect/config.json` | Consoles, pinned certificates and recordings usernames; API keys and passwords only if there is no keyring (mode 0600) |
 | `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras, favourite, armed cameras, read-only setting (no secrets) |
 | `~/.local/state/eld-unifi-protect/state.json` | Last camera list |
-| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their notification pictures, recordings sessions, thumbnails and clips (tmpfs, gone on reboot) |
+| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their pictures, recordings sessions, thumbnails and clips (tmpfs, gone on reboot; your notification history may keep its own copy of alert pictures) |
+| `~/.local/state/eld-unifi-protect/` | Last camera list, rejected recordings logins, streams the plugin switched on |
 
 ## How it works
 
-The Omarchy shell never speaks HTTP and never sees an API key. The helper
+The Omarchy shell never speaks HTTP and never holds an API key: a key typed
+into the panel goes straight to the helper on stdin. The helper
 `bin/eld-unifi-protect` talks to the Protect Integration API
 (`/proxy/protect/integration/v1`), writes camera state and snapshots to disk,
 and resolves stream URLs. The panel watches those files and plays the
@@ -346,8 +364,9 @@ streams.
 - **Recordings** use a separate sign-in, with a local UniFi account (see
   [Recordings](#recordings)), against the endpoints Protect's web app uses
   (`/proxy/protect/api`): one sign-in per console, kept for the session in
-  the runtime directory (`sessions.json`, mode 0600), and never retried after
-  a rejected password, since UniFi OS locks accounts after repeated failures.
+  the runtime directory (`sessions.json`, mode 0600). A rejected password is
+  never tried again until you sign in again, since UniFi OS locks accounts
+  after repeated failures.
   The password is stored and passed like the API key, on stdin only.
 - **Traffic:** while the panel is closed, one camera-list poll per console per
   minute. Snapshots are fetched only while the panel is open on the grid.
@@ -357,7 +376,11 @@ streams.
 - **TLS:** consoles use self-signed certificates. Setup pins each console's
   certificate fingerprint, and every API request checks it before the key is
   sent. If a console's certificate legitimately changes (firmware update,
-  factory reset), run `eld-unifi-protect trust-cert`.
+  factory reset), run setup again for that console: it asks you to confirm
+  the new certificate and to enter the API key again. `eld-unifi-protect
+  trust-cert` re-pins without a new key, for a fingerprint you have checked
+  on the console itself (`--pin <sha256>` re-pins only to that one); the
+  stored key and recordings login are then sent to the new certificate.
 - **Video is encrypted end to end on your network.** Protect serves video
   as RTSPS (port 7441) behind the same self-signed certificate. FFmpeg, inside
   both QtMultimedia and mpv, refuses unverified TLS and cannot be given the
@@ -370,13 +393,21 @@ streams.
   The relay checks the same pinned certificate as the API, forces all media
   over the encrypted TCP connection (it refuses UDP, and FFmpeg falls back),
   listens only on 127.0.0.1, and requires a random per-session token in every
-  URL, so other local users cannot borrow it. It starts on demand and exits
-  after a minute without viewers. The only unencrypted hop is loopback inside
-  your machine.
+  URL, and accepts connections only from your own user (it checks who owns
+  the other end), so other local users cannot borrow it even if they see a
+  URL, say in the system journal. Those URLs never contain the
+  camera's Protect stream alias, only a random route id that the relay maps
+  back privately, so nothing a player is given could be used against the
+  console. The relay starts on demand and exits after a minute without
+  viewers. The only unencrypted hop is loopback inside your machine.
 - **Streams get switched on:** if a camera has no stream yet for the quality
   you open, the plugin enables one, the same as turning on RTSP in the
-  camera's Protect settings. It stays enabled. To forbid that, turn on
-  read-only mode: `eld-unifi-protect read-only on`. The plugin then never
+  camera's Protect settings. It stays enabled, including after you remove
+  the plugin, and anyone on your network who learns that stream's address
+  can watch it, as with any RTSPS stream Protect serves; turn it off in
+  Protect (camera → Settings → Advanced) if you no longer want it. To
+  forbid the plugin from switching streams on, turn on read-only mode:
+  `eld-unifi-protect read-only on`. The plugin then never
   changes anything on your consoles. It uses only streams already enabled in
   Protect, falling back to the nearest enabled quality, and tells you how to
   enable one when a camera has none.
@@ -407,15 +438,20 @@ machine, against roughly 30 Mbit/s for a busy wall.
 If you installed with `omarchy plugin add`:
 
 ```bash
+helper=~/.config/omarchy/plugins/com.eldtechnologies.unifi-protect/bin/eld-unifi-protect
+"$helper" enabled-streams              # streams to turn off in Protect, if you want
+"$helper" stop --sign-out              # stop it, sign out recordings sessions
 omarchy plugin remove com.eldtechnologies.unifi-protect
-rm -rf ~/.config/eld-unifi-protect ~/.local/state/eld-unifi-protect
+rm -rf ~/.config/eld-unifi-protect ~/.local/state/eld-unifi-protect "$XDG_RUNTIME_DIR/eld-unifi-protect"
 secret-tool clear service eld-unifi-protect
 secret-tool clear service eld-unifi-protect-login
 ```
 
-`omarchy plugin remove` deletes only the plugin folder, so the last three
-lines are needed to delete your settings, API keys and recordings passwords
-(the `secret-tool` lines clear what is held in the keyring).
+`omarchy plugin remove` deletes only the plugin folder, so the other lines
+stop what is running, sign recordings sessions out on the consoles, and
+delete your settings, API keys and recordings passwords. A locked keyring
+keeps its items: check with `secret-tool search --all service
+eld-unifi-protect`.
 
 If you installed with `./install.sh`, run `./uninstall.sh` from the checkout.
 It also removes the `eld-unifi-protect` command and asks whether to delete your
@@ -424,7 +460,8 @@ no).
 
 Either way, revoke the API keys on each console as well, and delete the local
 recordings account if you made one: deleting the local copy does not revoke
-them.
+them. Streams the plugin switched on stay on in Protect until you turn them
+off, and your notification history may keep pictures of past alerts.
 
 ## Developing
 
@@ -439,8 +476,10 @@ it from there. Record changes in `CHANGELOG.md`.
 
 **Demo mode** shows made-up consoles and cameras instead of yours, for
 screenshots, development, or trying the plugin without UniFi hardware:
-`eld-unifi-protect demo on` (and `demo off`). Your real config is never
-touched, and a reboot always ends it. `tools/screenshots.sh [workspace]`
+`eld-unifi-protect demo on` (and `demo off`). Your config and camera
+settings are never changed while it is on, your alert log, snapshots and
+recordings are set aside and come back with `demo off`, and a reboot
+always ends it. `tools/screenshots.sh [workspace]`
 captures the README screenshots from the real UI on demo data, on an empty
 workspace; see [docs/demo](docs/demo/README.md).
 

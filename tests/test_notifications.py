@@ -55,17 +55,24 @@ class FakeBus:
             serial += 1
             if member == "Hello":
                 body = h.DBusWriter(); body.string(":1.42")
-                writer.write(self.reply(serial, fields, "s", body))
+                writer.write(self.reply(serial, fields, "s", body, sender="org.freedesktop.DBus"))
                 # Signals for other things arrive too; they must be ignored.
                 writer.write(self.signal(serial + 1, "org.freedesktop.DBus", "NameAcquired", "s", body))
             elif member == "AddMatch":
-                writer.write(self.reply(serial, fields))
+                writer.write(self.reply(serial, fields, sender="org.freedesktop.DBus"))
+            elif member == "GetNameOwner":
+                body = h.DBusWriter(); body.string(":1.7")
+                writer.write(self.reply(serial, fields, "s", body, sender="org.freedesktop.DBus"))
             elif member == "Notify":
                 self.notified = parse_notify(raw)
                 body = h.DBusWriter(); body.uint32(7)
                 writer.write(self.reply(serial, fields, "u", body))
                 other = h.DBusWriter(); other.uint32(6); other.string("live")
                 writer.write(self.signal(serial + 1, h.NOTIFY_NAME, "ActionInvoked", "us", other))
+                # Someone else on the bus imitating the service is ignored.
+                spoof = h.DBusWriter(); spoof.uint32(7); spoof.string("spoofed")
+                writer.write(self.signal(serial + 1, h.NOTIFY_NAME, "ActionInvoked", "us", spoof,
+                                         sender=":1.666"))
                 if self.answer:
                     mine = h.DBusWriter(); mine.uint32(7); mine.string(self.answer)
                     writer.write(self.signal(serial + 2, h.NOTIFY_NAME, "ActionInvoked", "us", mine))
@@ -74,15 +81,16 @@ class FakeBus:
                     writer.write(self.signal(serial + 2, h.NOTIFY_NAME, "NotificationClosed", "uu", closed))
             await writer.drain()
 
+    # The bus stamps every message with its sender's unique name.
     @staticmethod
-    def reply(serial, fields, signature="", body=None):
-        return h.dbus_message(2, serial, [(5, "u", fields["serial"])], signature,
+    def reply(serial, fields, signature="", body=None, sender=":1.7"):
+        return h.dbus_message(2, serial, [(5, "u", fields["serial"]), (7, "s", sender)], signature,
                               bytes(body.buf) if body else b"")
 
     @staticmethod
-    def signal(serial, interface, member, signature, body):
-        return h.dbus_message(4, serial, [(1, "o", h.NOTIFY_PATH), (2, "s", interface), (3, "s", member)],
-                              signature, bytes(body.buf))
+    def signal(serial, interface, member, signature, body, sender=":1.7"):
+        return h.dbus_message(4, serial, [(1, "o", h.NOTIFY_PATH), (2, "s", interface), (3, "s", member),
+                                          (7, "s", sender)], signature, bytes(body.buf))
 
 
 class Notifications(unittest.TestCase):
@@ -111,12 +119,13 @@ class Notifications(unittest.TestCase):
         bus, chosen = self.run_bus("live")
         self.assertEqual(chosen, "live")
         self.assertEqual(bus.auth, b"\0AUTH EXTERNAL " + str(os.getuid()).encode().hex().encode() + b"\r\n")
-        self.assertEqual([m for m, _ in bus.calls], ["Hello", "AddMatch", "Notify"])
-        self.assertEqual(bus.calls[2][1], h.NOTIFY_NAME)
+        self.assertEqual([m for m, _ in bus.calls], ["Hello", "AddMatch", "GetNameOwner", "Notify"])
+        self.assertEqual(bus.calls[3][1], h.NOTIFY_NAME)
         n = bus.notified
         self.assertEqual((n["app"], n["summary"], n["body"]), ("UniFi Protect", "Person at Front Door", "NVR · 12:34"))
         self.assertEqual(n["actions"], ["live", "Watch live"])
-        self.assertEqual(n["hints"], {"urgency": 1, "image-path": "file:///run/x/alerts/e1.jpg"})
+        self.assertEqual(n["hints"], {"urgency": 1, "transient": True,
+                                      "image-path": "file:///run/x/alerts/e1.jpg"})
         self.assertEqual(n["timeout"], -1)
 
     def test_dismissed_notification_returns_none(self):

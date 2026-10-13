@@ -39,6 +39,9 @@ class Matching(unittest.TestCase):
         self.assertEqual(h.event_time(1791700000000), 1791700000)
         self.assertEqual(h.event_time(1791700000), 1791700000)
         self.assertIsNone(h.event_time(None))
+        # A console's numbers reach alerts.json and strftime: nothing absurd.
+        for bad in (float("nan"), float("inf"), "Infinity", 1e300, -5, True, 12):
+            self.assertIsNone(h.event_time(bad))
 
 
 def unmask(frame):
@@ -101,6 +104,16 @@ class WebSocketFrames(unittest.TestCase):
         texts, _ = self.collect(server_frame(0x1, body) + server_frame(0x8, b""))
         self.assertEqual(texts, [body.decode()])
 
+    def test_fragments_cannot_add_up_past_the_cap(self):
+        chunk = b"x" * 60000
+        data = server_frame(0x1, chunk, fin=False) + server_frame(0x0, chunk, fin=False) * 20
+        with self.assertRaisesRegex(h.ProtectError, "too large"):
+            self.collect(data)
+
+    def test_oversized_control_frames_are_refused(self):
+        with self.assertRaisesRegex(h.ProtectError, "control frame"):
+            self.collect(server_frame(0x9, b"p" * 200))
+
 
 class ListenerLifecycle(unittest.TestCase):
     def listener(self):
@@ -138,6 +151,38 @@ class ListenerLifecycle(unittest.TestCase):
         lst.handle("nvr", {"item": {"id": "e4", "type": "ring", "device": "cam1", "start": 1791700000000}})
         self.assertEqual(lst.alerts[0]["kind"], "ring")
 
+    def test_console_times_never_run_into_the_future(self):
+        lst = self.listener()
+        lst.handle("nvr", {"item": {"id": "f1", "type": "ring", "device": "cam1", "start": 4000000000000}})
+        self.assertLessEqual(lst.alerts[0]["start"], time.time())
+        lst.handle("nvr", {"item": {"id": "f1", "end": "x"}})
+        lst.handle("nvr", {"item": {"id": "f1", "end": 4000000000000}})
+        self.assertIsNone(lst.alerts[0]["end"])
+
+    def test_a_flood_of_new_events_is_capped(self):
+        lst = self.listener()
+        for i in range(50):
+            lst.handle("nvr", {"item": {"id": f"flood{i}", "type": "ring", "device": "cam1"}})
+        self.assertEqual(len(lst.alerts), h.ALERTS_PER_MINUTE)
+
+    def test_a_cleared_alert_does_not_come_back_with_its_events_next_update(self):
+        lst = self.listener()
+        item = {"id": "e7", "modelKey": "event", "type": "smartDetectZone", "device": "cam1",
+                "smartDetectTypes": ["person"]}
+        lst.handle("nvr", {"type": "add", "item": item})
+        lst.alerts = []                      # cleared
+        lst.handle("nvr", {"type": "update", "item": dict(item, smartDetectTypes=["person", "vehicle"])})
+        self.assertEqual(lst.alerts, [])
+
+    def test_malformed_messages_are_ignored(self):
+        lst = self.listener()
+        for message in ([], {"item": []}, {"item": {"id": "e9", "device": ["cam1"], "type": "ring"}},
+                        {"item": {"id": "e9", "device": "cam1", "type": "smartDetectZone",
+                                  "smartDetectTypes": 5}}):
+            lst.handle("nvr", message)
+        self.assertEqual(lst.alerts, [])
+        self.assertEqual(h.event_kind({"type": "smartDetectZone", "smartDetectTypes": 5}), "motion")
+
     def test_unsafe_event_ids_are_dropped(self):
         # The ID names the alert's snapshot file, so a console must not be
         # able to point it anywhere else.
@@ -167,13 +212,25 @@ class AlertImages(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(h.ALERT_IMAGES_DIR, "../../escaped.jpg")))
 
     def test_saved_alerts_with_unsafe_ids_or_images_are_not_loaded(self):
+        now = time.time()
         h.write_json(h.ALERTS_PATH, {"alerts": [
-            {"id": "good", "start": 1, "image": "good.jpg"},
-            {"id": "../bad", "start": 1},
-            {"id": "ok", "start": 1, "image": "../../home.jpg"},
+            {"id": "good", "start": now, "image": "good.jpg"},
+            {"id": "../bad", "start": now},
+            {"id": "ok", "start": now, "image": "../../home.jpg"},
         ]})
         alerts = h.load_alerts()
         self.assertEqual([(a["id"], a.get("image")) for a in alerts], [("good", "good.jpg"), ("ok", None)])
+
+    def test_saved_alerts_with_impossible_times_are_repaired_or_dropped(self):
+        # As an older version could write them: not valid JSON, but Python reads it.
+        os.makedirs(os.path.dirname(h.ALERTS_PATH), exist_ok=True)
+        with open(h.ALERTS_PATH, "w") as handle:
+            handle.write('{"alerts": [{"id": "a", "start": Infinity}, {"id": "b", "start": %f, "end": NaN}]}'
+                         % time.time())
+        alerts = h.load_alerts()
+        self.assertEqual([(a["id"], a["end"]) for a in alerts], [("b", None)])
+        listener = h.AlertListener()
+        listener.save()     # writes strict JSON again
         os.remove(h.ALERTS_PATH)
 
 
@@ -190,6 +247,27 @@ class AlertLog(unittest.TestCase):
         listener.save()
         self.assertEqual([a["id"] for a in listener.alerts], ["b"])
         self.assertEqual(sorted(os.listdir(h.ALERT_IMAGES_DIR)), ["new.jpg"])
+        os.remove(h.ALERTS_ACK_PATH)
+
+    def test_clear_and_seen_follow_the_monotonic_clock(self):
+        # The wall clock stepped back: this alert's wall time is "before" the
+        # Clear, but it was opened after it, and stays.
+        now, mono = time.time(), time.monotonic()
+        h.write_json(h.ALERTS_ACK_PATH, {"ackedAt": now, "clearedAt": now,
+                                         "ackedSeq": mono - 10, "clearedSeq": mono - 10})
+        listener = h.AlertListener()
+        listener.alerts = [{"id": "opened_after", "start": now - 600, "seq": mono, "image": None},
+                           {"id": "opened_before", "start": now + 600, "seq": mono - 20, "image": None}]
+        listener.save()
+        # ...and one dated in the future but opened before the Clear goes.
+        self.assertEqual([a["id"] for a in listener.alerts], ["opened_after"])
+        os.remove(h.ALERTS_ACK_PATH)
+
+    def test_alerts_without_seq_compare_wall_times(self):
+        now = time.time()
+        h.write_json(h.ALERTS_ACK_PATH, {"clearedAt": now - 60})
+        self.assertTrue(h.cleared_by({"start": now - 120}, h.read_ack()))
+        self.assertFalse(h.cleared_by({"start": now - 30}, h.read_ack()))
         os.remove(h.ALERTS_ACK_PATH)
 
     def test_day_old_alerts_expire(self):
@@ -218,8 +296,8 @@ class Notifications(unittest.TestCase):
             for uid in uids:
                 listener.notify("nvr", dict(camera, uid=uid), {"id": uid, "kind": "person", "start": 0})
             await asyncio.sleep(0)
-        # Independent of whether this machine has notify-send installed.
-        with mock.patch.object(h.shutil, "which", return_value="/usr/bin/notify-send"):
+        # Independent of whether this machine (or CI) has a session bus.
+        with mock.patch.object(h, "session_bus_path", return_value="/run/user/0/bus"):
             asyncio.run(run())
 
     def test_at_most_one_notification_per_camera_per_minute(self):
@@ -258,11 +336,11 @@ class ListenerEndToEnd(unittest.TestCase):
             writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                           f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode())
             for item in ({"id": "ev1", "modelKey": "event", "type": "smartDetectZone", "device": "cam1",
-                          "start": 1791700000000, "smartDetectTypes": []},
+                          "start": int(time.time() * 1000) - 2000, "smartDetectTypes": []},
                          {"id": "ev1", "modelKey": "event", "type": "smartDetectZone", "device": "cam1",
                           "smartDetectTypes": ["vehicle"]},
                          {"id": "ev2", "modelKey": "event", "type": "motion", "device": "cam1",
-                          "start": 1791700001000}):
+                          "start": int(time.time() * 1000) - 1000}):
                 writer.write(server_frame(0x1, json.dumps({"type": "add", "item": item}).encode()))
             await writer.drain()
             await asyncio.sleep(5)
@@ -278,6 +356,7 @@ class ListenerEndToEnd(unittest.TestCase):
             listener.alerts = []
             listener.config = {"consoles": [dict(console_config, host=f"127.0.0.1:{port}")]}
             listener.refresh = lambda: None
+            listener.on_new_alert = lambda *args: None   # no snapshot or notification here
             listener.armed = {"nvr": {"cam1": {"uid": "nvr_cam1", "name": "Front Door",
                                                 "consoleName": "NVR", "alerts": ["vehicle"]}}}
             task = asyncio.create_task(listener.watch_console("nvr"))

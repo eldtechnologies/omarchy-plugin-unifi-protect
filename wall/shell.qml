@@ -25,6 +25,18 @@ ShellRoot {
   property bool muted: true
   // Sound for an enlarged camera (the bar's "sound" setting); tiles are silent.
   property bool soundDefault: true
+  property string cli: ""
+  // Stream URLs the helper handed out after wall.json was written (say, after
+  // a relay restart), by "<uid>|<quality>"; shared by every view of a camera.
+  property var freshUrls: ({})
+
+  function setFreshUrl(key, url) {
+    var copy = Object.assign({}, freshUrls)
+    copy[key] = url
+    freshUrls = copy
+  }
+  property string gridQuality: "low"
+  property string focusQuality: "high"
   readonly property MediaDevices mediaDevices: MediaDevices {}
 
   readonly property int count: cameras.length
@@ -61,6 +73,9 @@ ShellRoot {
         shell.snapshotDir = data.snapshotDir || ""
         shell.multiConsole = data.multiConsole === true
         shell.soundDefault = data.sound !== false
+        shell.cli = data.cli || ""
+        shell.gridQuality = data.gridQuality || "low"
+        shell.focusQuality = data.focusQuality || "high"
         shell.cameras = data.cameras || []
       } catch (error) {
         Qt.quit()
@@ -78,7 +93,13 @@ ShellRoot {
 
   component Stream: Item {
     id: stream
-    property string url: ""
+    property string url: ""          // from wall.json; stays bound
+    property string uid: ""
+    property string quality: ""
+    readonly property string key: uid + "|" + quality
+    readonly property string playUrl: shell.freshUrls[key] || url
+    property int failures: 0
+    property bool counted: false
     property string snapshot: ""
     property bool playAudio: false
     readonly property bool live: player.playbackState === MediaPlayer.PlayingState
@@ -87,12 +108,29 @@ ShellRoot {
     property string error: ""
 
     function start() {
-      if (url === "") return
-      player.source = url
+      if (playUrl === "") return
+      counted = false
+      // Setting the same URL again would not reconnect: the player resumes
+      // its dead stream, reports it as buffered and freezes. Clear it first.
+      player.source = ""
+      player.source = playUrl
       player.play()
     }
 
-    onUrlChanged: start()
+    // One failed attempt can be reported twice (an error, then a status).
+    function failed(message) {
+      if (message) error = message
+      if (counted) return
+      counted = true
+      failures++
+      // 3 s, doubling up to a minute while it keeps failing.
+      retry.interval = Math.min(60000, 3000 * Math.pow(2, Math.max(0, failures - 1)))
+      retry.restart()
+    }
+
+    // Another camera (the enlarged view flips) starts afresh.
+    onKeyChanged: { failures = 0; retry.stop() }
+    onPlayUrlChanged: start()
     Component.onCompleted: start()
 
     // A frame to look at while the stream connects.
@@ -100,6 +138,8 @@ ShellRoot {
       anchors.fill: parent
       visible: !stream.live && stream.snapshot !== ""
       source: stream.snapshot
+      // Decoded at tile size, whatever size the console's JPEG claims.
+      sourceSize.width: 1280
       fillMode: Image.PreserveAspectFit
       asynchronous: true
       cache: false
@@ -133,14 +173,15 @@ ShellRoot {
                                       : PlaybackOptions.PlaybackIntent.Playback
       playbackOptions.networkTimeoutMs: 8000
       onErrorOccurred: function(error, errorString) {
-        stream.error = errorString || "stream failed"
-        retry.restart()
+        stream.failed(errorString || "stream failed")
       }
       onMediaStatusChanged: {
-        if (mediaStatus === MediaPlayer.EndOfMedia || mediaStatus === MediaPlayer.InvalidMedia)
-          retry.restart()
-        else if (mediaStatus === MediaPlayer.BufferedMedia)
+        if (mediaStatus === MediaPlayer.EndOfMedia || mediaStatus === MediaPlayer.InvalidMedia) {
+          stream.failed("")
+        } else if (mediaStatus === MediaPlayer.BufferedMedia) {
           stream.error = ""
+          stream.failures = 0
+        }
       }
     }
 
@@ -149,10 +190,41 @@ ShellRoot {
     Timer {
       id: retry
       interval: 3000
-      onTriggered: { player.stop(); stream.start() }
+      onTriggered: {
+        player.stop()
+        // Twice in a row: the URL itself may be stale (the relay restarted
+        // with a new port and token). Ask the helper for a fresh one rather
+        // than knocking on a port that is no longer ours.
+        if (stream.failures >= 2 && shell.cli !== "" && stream.uid !== "" && !refresh.running) {
+          refresh.forKey = stream.key
+          refresh.stale = stream.playUrl
+          refresh.command = [shell.cli, "stream", stream.uid, "--quality", stream.quality]
+          refresh.running = true
+        } else {
+          stream.start()
+        }
+      }
+    }
+
+    Process {
+      id: refresh
+      property string forKey: ""
+      property string stale: ""
+      stdout: StdioCollector { id: refreshOut }
+      onExited: function(exitCode) {
+        // The view moved on to another camera meanwhile: not ours to use.
+        if (forKey !== stream.key) return
+        var fresh = refreshOut.text.trim()
+        if (exitCode === 0 && fresh.indexOf("rtsp://127.0.0.1:") === 0 && fresh !== stale)
+          shell.setFreshUrl(forKey, fresh)      // playUrl changes and starts it
+        else
+          stream.start()
+      }
     }
 
     Text {
+      // Console text: never let Qt read it as HTML (an <img> would load).
+      textFormat: Text.PlainText
       anchors.centerIn: parent
       visible: !stream.live
       text: stream.error !== "" ? stream.error + " · retrying" : "Connecting…"
@@ -215,10 +287,13 @@ ShellRoot {
             anchors.fill: parent
             anchors.margins: tile.border.width
             url: tile.modelData.grid || ""
+            uid: tile.modelData.uid || ""
+            quality: shell.gridQuality
             snapshot: shell.snapshotDir ? "file://" + shell.snapshotDir + "/" + tile.modelData.uid + ".jpg" : ""
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             visible: !!tile.modelData.error
             text: tile.modelData.error || ""
@@ -237,6 +312,7 @@ ShellRoot {
 
             Text {
               id: label
+              textFormat: Text.PlainText
               anchors.centerIn: parent
               text: (tile.index < 9 ? (tile.index + 1) + "  " : "") + tile.modelData.name
                     + (shell.multiConsole ? "  ·  " + tile.modelData.consoleName : "")
@@ -264,6 +340,8 @@ ShellRoot {
         Stream {
           anchors.fill: parent
           url: shell.focusedCamera ? shell.focusedCamera.focus || shell.focusedCamera.grid : ""
+          uid: shell.focusedCamera ? shell.focusedCamera.uid : ""
+          quality: shell.focusedCamera && shell.focusedCamera.focus ? shell.focusQuality : shell.gridQuality
           snapshot: shell.focusedCamera && shell.snapshotDir
                     ? "file://" + shell.snapshotDir + "/" + shell.focusedCamera.uid + ".jpg" : ""
           playAudio: true
@@ -280,6 +358,7 @@ ShellRoot {
 
           Text {
             id: focusLabel
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             text: "● " + (shell.focusedCamera ? shell.focusedCamera.name : "")
                   + (shell.multiConsole && shell.focusedCamera ? "  ·  " + shell.focusedCamera.consoleName : "")
@@ -311,6 +390,7 @@ ShellRoot {
 
       Text {
         id: hints
+        textFormat: Text.PlainText
         anchors.centerIn: parent
         text: shell.focusedIndex >= 0
               ? "←/→ next camera  ·  M mute  ·  Esc or click back to grid  ·  Q close"

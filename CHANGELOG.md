@@ -5,15 +5,77 @@ All notable changes to this plugin. The version is set in `manifest.json`;
 
 ## Unreleased
 
+Security-focused hardening release.
+
 ### Security
 
-- Notifications no longer run `notify-send` with the camera, console and
-  time in its command line, where other local users could read them for as
-  long as the notification stayed up. The helper now sends them to the
-  notification service over D-Bus itself.
-- mpv pop-out and clip windows get their title on stdin rather than as
-  `--title`, and the panel no longer passes camera names to the helper.
-  Reported in the marketplace review.
+- **Private details stay out of command lines,** which every local user can
+  read. Notifications no longer run `notify-send` with the camera, console
+  and time for as long as they are shown; the helper sends them to the
+  notification service over D-Bus itself, and accepts "Watch live" only
+  from that service. mpv gets its title and video on stdin; the panel
+  passes event times in the environment and the console name typed at
+  setup on stdin. What command lines still carry are ids (a console's short
+  id, made from its name, and Protect's camera ids) and, during setup, a
+  console's address.
+- **Stream relay.** Players' URLs no longer contain the camera's Protect
+  stream alias, only a random route id the relay maps back privately, and
+  the relay serves only your own user, so a URL seen elsewhere (in the
+  system journal, say) is useless to anyone else. It never lets a console
+  redirect a player out of the encrypted tunnel (it passes only
+  well-formed, non-redirect responses naming itself), holds no API keys,
+  picks up removed consoles and new certificates within seconds, gets a
+  fresh token every start, never exits right after a URL is handed out,
+  and limits connections that have not shown the token.
+- **Consoles are untrusted:** responses, event-stream messages, snapshots,
+  thumbnails and event lists are size- and time-limited; times, shapes and
+  addresses are checked; text is shown as plain text (a camera name written
+  as HTML could make the wall load an image from anywhere) and stripped of
+  terminal escape sequences. Snapshots and thumbnails share memory
+  budgets. A console can no longer pose as, hide or change the settings of
+  another console's camera (when two consoles report one camera online,
+  both are shown, the settings saved for that camera no longer apply to
+  either until you set them again, and `cameras` warns), and
+  a console's alerts can no longer be dated so they are never cleared; a
+  flood of alerts is capped at ten new ones per camera per minute.
+- **Setup:** a changed console certificate must be confirmed explicitly and
+  the API key typed again (`trust-cert` is for a fingerprint checked on the
+  console itself, and `--pin` replaces `--yes`); addresses are checked
+  before they reach a command line or DNS, so a pasted key goes nowhere.
+- **Recordings sign-in:** a rejected password is never retried, even after
+  a reboot, until you sign in again (UniFi OS locks accounts after
+  repeated failures); a new login is tried in memory and kept, as one
+  step, only once it works; `logout`, `remove`, a new login and
+  `uninstall.sh --purge` sign the old session out on the console, and say
+  so when the console does not confirm it.
+- **Files and processes:** files are created with their final permissions
+  (cameras.json is now 0600; `clip -o` writes 0600 and never through a
+  link); shared files are changed under a lock across processes; the wall
+  toggle only ever signals the wall it started; demo mode no longer touches
+  your settings or alert log; `uninstall.sh` takes the plugin out of the
+  shell first, stops what it started (new `stop` command), lists the
+  streams it switched on in Protect (new `enabled-streams`), and reports
+  keyring entries a locked keyring kept.
+- **CI** actions are pinned to commits and kept current by Dependabot.
+
+### Fixed
+
+- The camera wall recovers when its streams drop: a retry with the same URL
+  used to freeze on the last frame instead of reconnecting, and after
+  repeated failures it now asks for a fresh URL, backing off up to a minute.
+- `snapshot -o` accepts a bare file name.
+- `alert --clear` now empties the log right away while the listener runs.
+
+### Upgrading
+
+Versions up to 0.4.1 put each camera's Protect stream alias in the player
+URL, and the panel's video player writes that URL to the system journal,
+where other accounts in the `adm`, `wheel` or `systemd-journal` groups can
+read it, across reboots. The alias alone lets anyone on your network watch
+that camera. If other people have accounts on your computer, get new aliases
+by turning each camera's RTSPS stream off and on again in Protect (camera →
+Settings → Advanced), and optionally trim old journal entries with
+`journalctl --vacuum-time`.
 
 ## 0.4.1 — 2026-10-12
 
