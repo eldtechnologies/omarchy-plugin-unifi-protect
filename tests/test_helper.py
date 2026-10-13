@@ -293,7 +293,8 @@ class ConsoleInput(unittest.TestCase):
                                ("10.0.0.2:443", "10.0.0.2"), ("10.0.0.2:8443", "10.0.0.2:8443"),
                                ("[fd00::1]", "[fd00::1]"), ("unifi", "unifi")):
             self.assertEqual(h.normalize_host(good), expected)
-        for bad in ("abcdefghijklmnopqrstuvwxyz0123456789ABCD", "nvr;rm -rf", "-x", "a b", "h:99999"):
+        for bad in ("abcdefghijklmnopqrstuvwxyz0123456789ABCD", "nvr;rm -rf", "-x", "a b", "h:99999",
+                    "192.168.1.1Zq7XkP2mN9vB4cR8tY1wL6hJ3dF5gS0a", "Zq7XkP2mN9vB4c.lan", "192.168.1.256"):
             with self.assertRaises(h.ProtectError, msg=bad):
                 h.normalize_host(bad)
 
@@ -311,6 +312,8 @@ class ConsoleInput(unittest.TestCase):
             return {"uid": uid, "mac": "aabbccddeeff", "online": online, "consoleName": uid, "name": "Door"}
         both = h.merge_cameras([cam("gw_fake", True), cam("nvr_real", True)])
         self.assertEqual(sorted(c["uid"] for c in both), ["gw_fake", "nvr_real"])
+        # Their settings are then keyed by uid, never by the disputed MAC.
+        self.assertEqual(sorted(h.camera_key(c) for c in both), ["gw_fake", "nvr_real"])
         moved = h.merge_cameras([cam("gw_old", False), cam("nvr_new", True)])
         self.assertEqual([c["uid"] for c in moved], ["nvr_new"])
 

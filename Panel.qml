@@ -716,10 +716,18 @@ Panel {
     var name = host.replace(/^https?:\/\//, "").replace(/\/+$/, "").replace(/:\d{1,5}$/, "")
     if (/^\[[0-9A-Fa-f:.]+\]$/.test(name) || /^[0-9A-Fa-f:.]+$/.test(name) && name.indexOf(":") >= 0)
       return true
+    if (/^[0-9.]+$/.test(name))
+      return /^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$/.test(name)
     var labels = name.replace(/\.$/, "").split(".")
     if (name.length > 253 || (labels.length === 1 && name.length > 24)) return false
-    for (var i = 0; i < labels.length; i++)
-      if (!/^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(labels[i])) return false
+    // Starts like an IP address but is not one: a key pasted after the IP.
+    if (/^\d+$/.test(labels[0])) return false
+    for (var i = 0; i < labels.length; i++) {
+      var label = labels[i]
+      if (!/^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label)) return false
+      // Long, mixed case and digits: far more likely a key than a host name.
+      if (label.length > 12 && /[A-Z]/.test(label) && /[a-z]/.test(label) && /\d/.test(label)) return false
+    }
     return true
   }
 

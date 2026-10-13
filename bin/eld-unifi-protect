@@ -387,7 +387,7 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
             if hashlib.sha256(der).hexdigest() != self._pin:
                 self.sock.close()
                 raise ProtectError(
-                    "console certificate changed; if expected, run `eld-unifi-protect trust-cert`"
+                    "console certificate changed; if you expect that, run `eld-unifi-protect setup` and enter this console's address (it asks for the key again)"
                 )
 
 
@@ -1238,7 +1238,7 @@ async def ws_open(console, path, timeout=10):
     der = writer.get_extra_info("ssl_object").getpeercert(binary_form=True)
     if hashlib.sha256(der).hexdigest() != console.get("certSha256"):
         writer.close()
-        raise ProtectError("console certificate changed; if expected, run `eld-unifi-protect trust-cert`")
+        raise ProtectError("console certificate changed; if you expect that, run `eld-unifi-protect setup` and enter this console's address (it asks for the key again)")
     key = base64.b64encode(os.urandom(16)).decode()
     writer.write((f"GET {path} HTTP/1.1\r\nHost: {name}\r\nUpgrade: websocket\r\n"
                   f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
@@ -2392,7 +2392,8 @@ class Protect:
 # could pose as another console's camera.
 CAMERA_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
 MAX_CAMERAS = 256           # per console; more is not a real Protect setup
-SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024   # a 4K high-quality JPEG is a few MB
+SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024   # a 4K high-quality JPEG is a few MB
+SNAPSHOT_BUDGET = 128 * 1024 * 1024    # all snapshots together (they live in RAM)
 
 
 def clean_text(value, fallback="", limit=80):
@@ -2455,7 +2456,8 @@ CLIP_MAX_SECONDS = 300      # longer events are cut to their first five minutes
 CLIP_ONGOING_SECONDS = 60   # an event still in progress: its first minute so far
 CLIPS_MAX_BYTES = 600 * 1024 * 1024   # clips live in RAM (the runtime dir)
 CLIPS_KEEP = 25
-THUMBNAIL_MAX_BYTES = 512 * 1024
+THUMBNAIL_MAX_BYTES = 256 * 1024
+THUMBNAILS_BUDGET = 16 * 1024 * 1024   # per camera listing
 RECORDINGS_KEEP_CAMERAS = 8   # cameras whose thumbnails stay in memory
 CLIP_DEADLINE = 900        # seconds for a whole export, even a slow 600 MB one
 CLIP_CHANNELS = {"high": 0, "medium": 1, "low": 2}
@@ -2952,13 +2954,24 @@ def recordings_for(config, uid, hours=24, motion=False):
         return dict(result, needsLogin=True, loginError=str(error), events=[])
     folder = os.path.join(RECORDINGS_DIR, uid)
     os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.utime(folder)
+    # Only the most recently viewed cameras keep thumbnails (memory is RAM);
+    # pruned before as well as after, so stopped listings cannot pile up.
+    prune_recordings(keep=folder)
+    budget = {"left": THUMBNAILS_BUDGET}
+    budget_lock = threading.Lock()
 
     def thumb(event):
         path = os.path.join(folder, event["id"] + ".jpg")
         if not os.path.exists(path):
             try:
-                write_atomic(path, session.thumbnail(event["id"]))
-            except ProtectError:
+                data = session.thumbnail(event["id"])
+                with budget_lock:
+                    if len(data) > budget["left"]:
+                        return dict(event, thumb="")
+                    budget["left"] -= len(data)
+                write_atomic(path, data)
+            except (ProtectError, OSError):
                 return dict(event, thumb="")
         return dict(event, thumb=path)
 
@@ -2969,15 +2982,20 @@ def recordings_for(config, uid, hours=24, motion=False):
     for name in os.listdir(folder):
         if name not in wanted:
             os.remove(os.path.join(folder, name))
-    # And only the most recently viewed cameras keep theirs: memory is RAM.
+    prune_recordings(keep=folder)
+    return dict(result, events=events)
+
+
+def prune_recordings(keep):
+    """Keep thumbnails for RECORDINGS_KEEP_CAMERAS cameras, keep always among them."""
     try:
-        folders = sorted((os.path.join(RECORDINGS_DIR, n) for n in os.listdir(RECORDINGS_DIR)),
+        folders = [os.path.join(RECORDINGS_DIR, n) for n in os.listdir(RECORDINGS_DIR)]
+        folders = sorted((f for f in folders if f != keep),
                          key=lambda f: os.stat(f).st_mtime, reverse=True)
-        for old in folders[RECORDINGS_KEEP_CAMERAS:]:
+        for old in folders[RECORDINGS_KEEP_CAMERAS - 1:]:
             shutil.rmtree(old, ignore_errors=True)
     except OSError:
         pass
-    return dict(result, events=events)
 
 
 def fetch_clip(config, uid, start, end, quality):
@@ -3151,7 +3169,12 @@ def merge_cameras(cameras):
             order.append(key)
         elif camera["online"] and not best[key]["online"]:
             best[key] = camera
-        elif camera["online"] and best[key]["online"]:
+        elif camera["online"] and best[key]["online"] and camera["uid"] not in best:
+            # Two consoles claim one MAC online: keep both, and key their
+            # settings by uid, so neither can hide, disarm or impersonate the
+            # other through a MAC-keyed setting.
+            for copy in (best[key], camera):
+                copy["mac"], copy["macConflict"] = "", True
             best[camera["uid"]] = camera
             order.append(camera["uid"])
     return sorted((best[k] for k in order), key=lambda c: (c["consoleName"].lower(), c["name"].lower()))
@@ -3259,6 +3282,8 @@ def load_index():
 
 def refresh_snapshots(config, cameras, index):
     clients = {c["id"]: Protect(c, config) for c in config["consoles"]}
+    budget = {"left": SNAPSHOT_BUDGET}
+    budget_lock = threading.Lock()
 
     def grab(camera):
         client = clients.get(camera.get("console"))
@@ -3266,9 +3291,21 @@ def refresh_snapshots(config, cameras, index):
             return None
         try:
             data = client.snapshot(camera["id"])
-            if data:
-                write_atomic(snapshot_path(camera["uid"]), data)
-                return camera["uid"]
+            with budget_lock:
+                # One console cannot fill memory: past the budget, the camera
+                # has no snapshot this round (an older one would still count).
+                over = not data or len(data) > budget["left"]
+                if not over:
+                    budget["left"] -= len(data)
+            if over:
+                if data:
+                    try:
+                        os.remove(snapshot_path(camera["uid"]))
+                    except FileNotFoundError:
+                        pass
+                return None
+            write_atomic(snapshot_path(camera["uid"]), data)
+            return camera["uid"]
         except (ProtectError, OSError):
             pass    # a camera that fails, or a full disk, skips this round
         return None
@@ -3338,6 +3375,21 @@ def save_console(config, existing, host, pin, key, name):
 HOST_LABEL = re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 
 
+def looks_like_key(label):
+    return (len(label) > 12 and any(c.isupper() for c in label)
+            and any(c.islower() for c in label) and any(c.isdigit() for c in label))
+
+
+def same_host(stored, host):
+    """Whether a saved console address is the one typed; saved addresses from
+    older versions may not pass normalize_host's checks, and must not break
+    setup for every console."""
+    try:
+        return normalize_host(stored) == host
+    except ProtectError:
+        return stored.strip().lower() == host.lower()
+
+
 def normalize_host(host):
     """A console address as typed, cleaned up and checked.
 
@@ -3361,8 +3413,14 @@ def normalize_host(host):
     except ValueError:
         labels = name.rstrip(".").split(".")
         valid = (len(name) <= 253 and all(HOST_LABEL.fullmatch(l) for l in labels)
-                 # A single long word is far more likely a key than a host.
-                 and not (len(labels) == 1 and len(name) > 24))
+                 # A single long word is far more likely a key than a host,
+                 and not (len(labels) == 1 and len(name) > 24)
+                 # as is a long label mixing cases and digits (host names are
+                 # case-insensitive and rarely look like that),
+                 and not any(looks_like_key(l) for l in labels)
+                 # and anything that starts like an IP address must be one:
+                 # a key pasted after "192.168.1.1" is not a host name.
+                 and not labels[0].isdigit())
     if not valid:
         raise ProtectError("that does not look like a console address (an IP address or host name)")
     if port == "443":
@@ -3380,7 +3438,7 @@ def cmd_setup_probe(args):
     except OSError as error:
         raise ProtectError(f"cannot reach {host}: {error.strerror or error}")
     config = load_config() or {"consoles": []}
-    existing = next((c for c in config["consoles"] if normalize_host(c["host"]) == host), {})
+    existing = next((c for c in config["consoles"] if same_host(c["host"], host)), {})
     print(json.dumps({
         "host": host,
         "fingerprint": pin,
@@ -3404,7 +3462,7 @@ def cmd_setup_save(args):
     if demo_on():
         raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = load_config() or {"consoles": [], "timeoutSec": 8}
-    existing = next((c for c in config["consoles"] if normalize_host(c["host"]) == host), {})
+    existing = next((c for c in config["consoles"] if same_host(c["host"], host)), {})
     repinned = bool(existing.get("certSha256")) and existing["certSha256"] != args.pin
     if not key and not repinned:
         key = existing.get("apiKey", "")
@@ -3442,7 +3500,7 @@ def cmd_setup(args):
     host = normalize_host(host)
     if not host:
         raise ProtectError("no address given")
-    existing = next((c for c in consoles if normalize_host(c["host"]) == host), {})
+    existing = next((c for c in consoles if same_host(c["host"], host)), {})
 
     try:
         pin = fetch_cert_fingerprint(host)
@@ -3727,7 +3785,18 @@ def cmd_trust_cert(args):
         if pin == console.get("certSha256"):
             print("  already trusted")
             continue
-        if args.yes or input("  Trust the current certificate? [y/N] ").strip().lower() in ("y", "yes"):
+        # The stored API key (and recordings login) will go to whoever holds
+        # this certificate: only for a fingerprint checked on the console
+        # itself, never one merely seen over the same network.
+        if args.pin:
+            trusted = args.pin.lower().replace(":", "") == pin
+            if not trusted:
+                print("  not the fingerprint you gave; left as it was")
+        else:
+            print("  Check this fingerprint on the console itself first. If you trust it, the\n"
+                  "  stored API key and recordings login will be sent to it.")
+            trusted = input("  Trust the current certificate? [y/N] ").strip().lower() in ("y", "yes")
+        if trusted:
             console["certSha256"] = pin
             changed = True
     if changed:
@@ -4200,9 +4269,9 @@ def main():
     p = sub.add_parser("migrate-keys", help="move API keys to the keyring, or back to the config file")
     p.add_argument("--to", choices=("keyring", "file"), default="keyring")
     p.set_defaults(func=cmd_migrate_keys)
-    p = sub.add_parser("trust-cert", help="re-pin console certificates")
+    p = sub.add_parser("trust-cert", help="re-pin a console certificate you have checked")
     p.add_argument("console", nargs="?")
-    p.add_argument("--yes", action="store_true")
+    p.add_argument("--pin", help="re-pin only if the console now presents this SHA-256 fingerprint")
     p.set_defaults(func=cmd_trust_cert)
     p = sub.add_parser("poll", help="refresh the state file")
     p.add_argument("--print", action="store_true")
