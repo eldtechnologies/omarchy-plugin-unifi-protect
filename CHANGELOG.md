@@ -3,9 +3,9 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
-## Unreleased
+## 0.4.2 — 2026-10-13
 
-Security-focused hardening release.
+Security-focused hardening release (#30, #31).
 
 ### Security
 
