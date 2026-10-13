@@ -9,8 +9,10 @@ The images are AI-generated and show no real place or person. Demo mode
 blurs their top-left corner, where generated "camera" images tend to put a
 vendor logo, so screenshots never suggest an official product.
 
-What each shipped image shows (to replace one, generate a similar scene as
-a 16:9 security-camera still with no text or timestamps):
+What each shipped image shows. They were made with an AI image generator by
+the plugin's author; some carry a made-up timestamp, and a generator's logo
+is blurred as described above. To replace one, generate a similar 16:9
+security-camera scene:
 
 | File | Shows |
 |---|---|

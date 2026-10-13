@@ -176,9 +176,21 @@ def keyring_lookup(console_id):
     return _key_cache[console_id]
 
 
+def keyring_still_has(service, console_id):
+    """True if the keyring still holds an item after a clear (a locked
+    collection keeps its items and secret-tool says nothing)."""
+    try:
+        result = _secret_tool(["search", "--all", "service", service, "console", console_id])
+    except KeyringUnavailable:
+        return False
+    return bool(result.stdout.strip())
+
+
 def keyring_clear(console_id):
     _key_cache.pop(console_id, None)
     _secret_tool(["clear", "service", KEYRING_SERVICE, "console", console_id])
+    if keyring_still_has(KEYRING_SERVICE, console_id):
+        raise KeyringUnavailable("the keyring kept the API key (is it locked?)")
 
 
 def resolve_keys(config):
@@ -211,7 +223,7 @@ def store_key(config, console, key):
         return "file"
 
 
-def load_config(keys=True):
+def load_config(keys=True, demo=True):
     """Return {"consoles": [...], "timeoutSec": n}, or None when unconfigured.
 
     keys=False leaves every secret out (the relay needs only hosts and pins).
@@ -220,7 +232,7 @@ def load_config(keys=True):
     config is a list. The original single-console shape is still read and
     converted on the next save.
     """
-    if demo_on():
+    if demo and demo_on():
         return demo_config()
     try:
         with open(CONFIG_PATH) as handle:
@@ -543,6 +555,46 @@ def _ensure_relay():
         if relay_alive(fresh):
             return fresh
     raise ProtectError("the stream relay did not start; run `eld-unifi-protect relay` to see why")
+
+
+ENABLED_STREAMS_PATH = os.path.join(STATE_DIR, "enabled-streams.json")
+
+
+def record_enabled_streams(console_id, camera_id, qualities):
+    """Remember streams this plugin switched on in Protect, so `doctor` and
+    uninstalling can say which to turn off again."""
+    try:
+        with open(ENABLED_STREAMS_PATH) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    key = f"{console_id}_{camera_id}"
+    data[key] = sorted(set(data.get(key, [])) | set(qualities))
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        write_json(ENABLED_STREAMS_PATH, data)
+    except OSError:
+        pass
+
+
+def cmd_enabled_streams(args):
+    """List the RTSPS streams this plugin switched on in Protect."""
+    try:
+        with open(ENABLED_STREAMS_PATH) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = {}
+    names = {c.get("uid"): f"{c.get('name')} ({c.get('consoleName')})"
+             for c in previous_state().get("cameras", [])}
+    if not data:
+        print("No streams are recorded as switched on by the plugin (it records them since\n"
+              "0.4.2; check camera → Settings → Advanced in Protect for older ones).")
+        return
+    print("Streams this plugin switched on in Protect (camera → Settings → Advanced to turn off):")
+    for uid, qualities in sorted(data.items()):
+        print(f"  {names.get(uid, uid)}: {', '.join(qualities)}")
 
 
 def forget_alerts(console_id):
@@ -1728,6 +1780,8 @@ class AlertListener:
         self.notify_enabled = prefs["notify"]
 
     def save(self):
+        if plugin_gone():
+            return      # uninstalled: write nothing, not even a runtime dir
         # Older than a day, or before the user last cleared the log: drop.
         # So is anything dated in the future, which could never be cleared.
         now = time.time()
@@ -1898,7 +1952,7 @@ class AlertListener:
                 return  # the shell that started us is gone
             if demo_on():
                 return  # demo data must never be mixed with real events
-            if not os.path.exists(os.path.realpath(__file__)):
+            if plugin_gone():
                 return  # the plugin was uninstalled
             self.refresh()
             if not self.armed:
@@ -1922,6 +1976,11 @@ class AlertListener:
                 self.ack_stamp = ack
                 self.save()
             await asyncio.sleep(5)
+
+
+def plugin_gone():
+    """The plugin was uninstalled under a still-running helper."""
+    return not os.path.exists(os.path.realpath(__file__))
 
 
 def stop_process(pid, started, script_arg):
@@ -1960,13 +2019,20 @@ def cmd_stop(args):
             stopped.append("alert listener")
     except (OSError, ValueError):
         pass
+    failed = []
     if args.sign_out:
-        config = load_config(keys=False) or {"consoles": []}
+        # Your real consoles, even while demo mode shows made-up ones.
+        config = load_config(keys=False, demo=False) or {"consoles": []}
         for console in config["consoles"]:
             if console.get("loginUser"):
-                end_session(console, config)
-                stopped.append(f"recordings session on {console['name']}")
+                if end_session(console, config):
+                    stopped.append(f"recordings session on {console['name']}")
+                else:
+                    failed.append(console["name"])
     print("stopped: " + (", ".join(stopped) if stopped else "nothing was running"))
+    for name in failed:
+        print(f"could not sign out of {name}'s recordings session; delete its local account "
+              "on the console to be sure it ends", file=sys.stderr)
 
 
 def cmd_events(args):
@@ -2384,6 +2450,7 @@ class Protect:
             ) or {}
             if isinstance(created, dict):
                 streams.update({k: v for k, v in created.items() if v})
+                record_enabled_streams(self.console["id"], camera_id, missing)
         urls = {}
         for quality in qualities:
             url = streams.get(quality)
@@ -2597,6 +2664,8 @@ def clear_login(console, config=None):
         _key_cache.pop((LOGIN_SERVICE, console["id"]), None)
         try:
             _secret_tool(["clear", "service", LOGIN_SERVICE, "console", console["id"]])
+            if keyring_still_has(LOGIN_SERVICE, console["id"]):
+                raise KeyringUnavailable("the keyring kept it (is it locked?)")
         except KeyringUnavailable as error:
             print(f"Could not remove the password from the keyring: {error}", file=sys.stderr)
     for field in ("loginUser", "loginStore", "loginPassword"):
@@ -3476,7 +3545,10 @@ def save_console(config, existing, host, pin, key, name):
     if existing and not ("loginUser" in entry):
         dropped = clear_login(existing, config) if existing.get("loginUser") else None
     if existing and existing.get("keyStore") == "keyring" and existing.get("id") != console_id:
-        keyring_clear(existing["id"])
+        try:
+            keyring_clear(existing["id"])
+        except KeyringUnavailable as error:
+            print(f"Could not remove the old key from the keyring: {error}", file=sys.stderr)
     where = store_key(config, entry, key)
     if existing:
         consoles[consoles.index(existing)] = entry
@@ -3983,7 +4055,7 @@ def cmd_watch(args):
     index = load_index()
     last_poll = 0.0
     cameras = previous_state().get("cameras", [])
-    while os.getppid() == parent:
+    while os.getppid() == parent and not plugin_gone():
         started = time.monotonic()
         try:
             config = load_config()
@@ -4465,6 +4537,8 @@ def main():
     p.add_argument("--stdin", action="store_true", help="read username and password as two lines")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_login)
+    p = sub.add_parser("enabled-streams", help="list the streams the plugin switched on in Protect")
+    p.set_defaults(func=cmd_enabled_streams)
     p = sub.add_parser("stop", help="stop the wall, the stream relay and the alert listener")
     p.add_argument("--sign-out", action="store_true", help="also end every recordings session")
     p.set_defaults(func=cmd_stop)

@@ -47,7 +47,7 @@ the source before installing. In short, this plugin:
   during setup or when opening Protect in the browser;
 - installs no service, runs no code at install time, and never uses `sudo`;
   `uninstall.sh` stops what it started and, with `--purge`, signs out its
-  recordings sessions.
+  recordings sessions (and says when a console did not confirm it).
 
 Outside its own files: desktop notifications are marked transient, but a
 notification history (Omarchy's included) may keep a copy of the latest

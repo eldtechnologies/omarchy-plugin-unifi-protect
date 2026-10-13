@@ -17,9 +17,14 @@ if [[ $purge != "--purge" && $purge != "--keep-config" && -t 0 ]]; then
   [[ $answer == [yY]* ]] && purge="--purge"
 fi
 
-# Stop what runs in the background before its files go; when purging, also
-# sign recordings sessions out on the consoles.
+# Take the plugin out of the shell first, so its panel cannot start anything
+# again; then stop what runs in the background (and, when purging, sign
+# recordings sessions out on the consoles); only then delete files.
+omarchy plugin disable "$plugin_id" 2>/dev/null || true
+omarchy-shell shell rescanPlugins 2>/dev/null || true
+streams=""
 if [[ -x $helper ]]; then
+  streams=$("$helper" enabled-streams 2>/dev/null || true)
   if [[ $purge == "--purge" ]]; then
     "$helper" stop --sign-out || true
   else
@@ -27,7 +32,6 @@ if [[ -x $helper ]]; then
   fi
 fi
 
-omarchy plugin disable "$plugin_id" 2>/dev/null || true
 if [[ -L $plugin_dir ]]; then rm "$plugin_dir"; else rm -rf "$plugin_dir"; fi
 rm -f "$HOME/.local/bin/eld-unifi-protect"
 [[ -n $runtime_dir ]] && rm -rf "$runtime_dir"
@@ -35,26 +39,32 @@ omarchy-shell shell rescanPlugins 2>/dev/null || true
 
 if [[ $purge == "--purge" ]]; then
   rm -rf "$config_dir" "$state_dir"
-  # API keys and recordings logins stored in the desktop keyring. Exit 1 with
-  # nothing on stderr means there was nothing to clear.
-  left=0
+  # API keys and recordings logins stored in the desktop keyring. A locked
+  # keyring keeps its items without a word, so check what is left.
+  kept=0
   if command -v secret-tool >/dev/null; then
     for service in eld-unifi-protect eld-unifi-protect-login; do
-      if ! err=$(secret-tool clear service "$service" 2>&1) && [[ -n $err ]]; then
-        echo "Could not clear $service from the keyring: $err" >&2
-        left=1
+      secret-tool clear service "$service" 2>/dev/null || true
+      if [[ -n $(secret-tool search --all service "$service" 2>/dev/null) ]]; then
+        echo "The keyring kept items for $service (it may be locked)." >&2
+        kept=1
       fi
     done
   fi
-  if [[ $left == 1 ]]; then
-    echo "Removed, except what the keyring kept (above): unlock it and run"
+  if [[ $kept == 1 ]]; then
+    echo "Removed, except what the keyring kept: unlock it and run"
     echo "  secret-tool clear service eld-unifi-protect; secret-tool clear service eld-unifi-protect-login"
   else
     echo "Removed."
   fi
   echo "Revoke the API key on the console too, and delete any local recordings account:"
-  echo "deleting the local copy does not revoke them. Streams the plugin switched on stay"
-  echo "on in Protect (camera → Settings → Advanced → RTSPS) until you turn them off."
+  echo "deleting the local copy does not revoke them."
 else
   echo "Removed. Your config is still in $config_dir"
 fi
+if [[ $streams == *"switched on in Protect ("* ]]; then
+  echo
+  echo "$streams"
+fi
+echo "Desktop notifications it showed may still be in your notification history"
+echo "(Omarchy: ~/.local/state/omarchy/notifications)."

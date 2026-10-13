@@ -61,6 +61,16 @@ demo_guard() {
     echo "aborted: demo mode is not on; nothing was saved" >&2
     exit 1
   fi
+  # And the alert log on screen holds only demo alerts.
+  if ! python3 - "$runtime/alerts.json" <<'PY'
+import json, sys
+alerts = json.load(open(sys.argv[1])).get("alerts", [])
+sys.exit(0 if all(str(a.get("id", "")).startswith("demo-") for a in alerts) else 1)
+PY
+  then
+    echo "aborted: the alert log holds real alerts; nothing was saved" >&2
+    exit 1
+  fi
 }
 shot() { demo_guard; guard; grim -o "$output" "$1"; guard; }
 # Demo mode sets your own alert log (and which alerts you have seen) aside

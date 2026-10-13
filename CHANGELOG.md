@@ -22,30 +22,38 @@ Security-focused hardening release.
   stream alias, only a random route id the relay maps back privately, and
   the relay serves only your own user, so a URL seen elsewhere (in the
   system journal, say) is useless to anyone else. It never lets a console
-  redirect a player out of the encrypted tunnel, holds no API keys, picks
-  up removed consoles and new certificates at once, gets a fresh token
-  every start, never exits right after a URL is handed out, and limits
-  connections that have not shown the token.
+  redirect a player out of the encrypted tunnel (it passes only
+  well-formed, non-redirect responses naming itself), holds no API keys,
+  picks up removed consoles and new certificates within seconds, gets a
+  fresh token every start, never exits right after a URL is handed out,
+  and limits connections that have not shown the token.
 - **Consoles are untrusted:** responses, event-stream messages, snapshots,
   thumbnails and event lists are size- and time-limited; times, shapes and
   addresses are checked; text is shown as plain text (a camera name written
   as HTML could make the wall load an image from anywhere) and stripped of
-  terminal escape sequences. A console can no longer pose as another
-  console's camera, and a console's alerts can no longer be dated so they
-  are never cleared.
+  terminal escape sequences. Snapshots and thumbnails share memory
+  budgets. A console can no longer pose as, hide or change the settings of
+  another console's camera, and a console's alerts can no longer be dated
+  so they are never cleared; a flood of alerts is capped at ten new ones
+  per camera per minute.
 - **Setup:** a changed console certificate must be confirmed explicitly and
-  the API key typed again; addresses are checked before they reach a
-  command line or DNS.
-- **Recordings sign-in:** a rejected password is never retried until you
-  sign in again (UniFi OS locks accounts after repeated failures); a login
-  is tried in memory and kept only once it works; dropping a login in any
-  way signs its session out on the console.
+  the API key typed again (`trust-cert` is for a fingerprint checked on the
+  console itself, and `--pin` replaces `--yes`); addresses are checked
+  before they reach a command line or DNS, so a pasted key goes nowhere.
+- **Recordings sign-in:** a rejected password is never retried, even after
+  a reboot, until you sign in again (UniFi OS locks accounts after
+  repeated failures); a new login is tried in memory and kept, as one
+  step, only once it works; `logout`, `remove`, a new login and
+  `uninstall.sh --purge` sign the old session out on the console, and say
+  so when the console does not confirm it.
 - **Files and processes:** files are created with their final permissions
   (cameras.json is now 0600; `clip -o` writes 0600 and never through a
   link); shared files are changed under a lock across processes; the wall
   toggle only ever signals the wall it started; demo mode no longer touches
-  your settings or alert log; `uninstall.sh` stops what the plugin started
-  and, with `--purge`, signs out its recordings sessions.
+  your settings or alert log; `uninstall.sh` takes the plugin out of the
+  shell first, stops what it started (new `stop` command), lists the
+  streams it switched on in Protect (new `enabled-streams`), and reports
+  keyring entries a locked keyring kept.
 - **CI** actions are pinned to commits and kept current by Dependabot.
 
 ### Fixed

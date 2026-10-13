@@ -74,9 +74,13 @@ eld-unifi-protect setup
 Setup runs inside the panel (**Run setup**, or **Add console** later); the
 same steps are available in a terminal with `eld-unifi-protect setup`. It asks
 for the console's address, shows the fingerprint of its TLS certificate for
-you to confirm, then asks for an API key. To confirm the fingerprint, open
-`https://<console-ip>` in a browser and compare it with the certificate the
-browser shows (its SHA-256 fingerprint). In the panel, the key goes from a
+you to confirm, then asks for an API key. Pinning trusts the certificate
+the console presents the first time, so do this on a network you trust. A
+browser on the same network sees the same certificate, so comparing there
+only catches mistakes, not an attacker in the path; for an independent
+check, read the fingerprint on the console itself, for example over SSH
+with `openssl x509 -noout -fingerprint -sha256` on its certificate. In the
+panel, the key goes from a
 password field to the helper on stdin and the field is cleared at once; it
 never reaches a log or a command line. It is kept in your keyring, or, when
 no keyring is available, in a file only you can read (see below).
@@ -224,7 +228,9 @@ to the log.
 Each alert also sends a **desktop notification**, "Person at Front Door",
 with a snapshot from that moment and a **Watch live** button that opens the
 panel on that camera. To avoid floods there is at most one notification per
-camera per minute; every alert is still recorded. Turn them off with
+camera per minute; every alert is still recorded, up to ten new ones per
+camera per minute (more than that is treated as a flood and dropped). Turn
+them off with
 **Notifications on** in the panel footer, or
 `eld-unifi-protect alert --notify off`. Notifications are marked transient,
 but Omarchy's notification history still keeps the latest ones, with their
@@ -337,7 +343,8 @@ The plugin's own files:
 | `~/.config/eld-unifi-protect/config.json` | Consoles, pinned certificates and recordings usernames; API keys and passwords only if there is no keyring (mode 0600) |
 | `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras, favourite, armed cameras, read-only setting (no secrets) |
 | `~/.local/state/eld-unifi-protect/state.json` | Last camera list |
-| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their notification pictures, recordings sessions, thumbnails and clips (tmpfs, gone on reboot) |
+| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their pictures, recordings sessions, thumbnails and clips (tmpfs, gone on reboot; your notification history may keep its own copy of alert pictures) |
+| `~/.local/state/eld-unifi-protect/` | Last camera list, rejected recordings logins, streams the plugin switched on |
 
 ## How it works
 
@@ -369,7 +376,11 @@ streams.
 - **TLS:** consoles use self-signed certificates. Setup pins each console's
   certificate fingerprint, and every API request checks it before the key is
   sent. If a console's certificate legitimately changes (firmware update,
-  factory reset), run `eld-unifi-protect trust-cert`.
+  factory reset), run setup again for that console: it asks you to confirm
+  the new certificate and to enter the API key again. `eld-unifi-protect
+  trust-cert` re-pins without a new key, for a fingerprint you have checked
+  on the console itself (`--pin <sha256>` re-pins only to that one); the
+  stored key and recordings login are then sent to the new certificate.
 - **Video is encrypted end to end on your network.** Protect serves video
   as RTSPS (port 7441) behind the same self-signed certificate. FFmpeg, inside
   both QtMultimedia and mpv, refuses unverified TLS and cannot be given the
@@ -427,15 +438,20 @@ machine, against roughly 30 Mbit/s for a busy wall.
 If you installed with `omarchy plugin add`:
 
 ```bash
+eld-unifi-protect enabled-streams      # streams to turn off in Protect, if you want
+eld-unifi-protect stop --sign-out      # stop it, sign out recordings sessions
 omarchy plugin remove com.eldtechnologies.unifi-protect
-rm -rf ~/.config/eld-unifi-protect ~/.local/state/eld-unifi-protect
+rm -rf ~/.config/eld-unifi-protect ~/.local/state/eld-unifi-protect "$XDG_RUNTIME_DIR/eld-unifi-protect"
 secret-tool clear service eld-unifi-protect
 secret-tool clear service eld-unifi-protect-login
 ```
 
-`omarchy plugin remove` deletes only the plugin folder, so the last three
-lines are needed to delete your settings, API keys and recordings passwords
-(the `secret-tool` lines clear what is held in the keyring).
+(Without `./install.sh`, the command is `~/.config/omarchy/plugins/com.eldtechnologies.unifi-protect/bin/eld-unifi-protect`.)
+`omarchy plugin remove` deletes only the plugin folder, so the other lines
+stop what is running, sign recordings sessions out on the consoles, and
+delete your settings, API keys and recordings passwords. A locked keyring
+keeps its items: check with `secret-tool search --all service
+eld-unifi-protect`.
 
 If you installed with `./install.sh`, run `./uninstall.sh` from the checkout.
 It also removes the `eld-unifi-protect` command and asks whether to delete your
@@ -444,7 +460,8 @@ no).
 
 Either way, revoke the API keys on each console as well, and delete the local
 recordings account if you made one: deleting the local copy does not revoke
-them.
+them. Streams the plugin switched on stay on in Protect until you turn them
+off, and your notification history may keep pictures of past alerts.
 
 ## Developing
 
