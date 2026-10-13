@@ -301,6 +301,20 @@ class ConsoleInput(unittest.TestCase):
         h.update_prefs(lambda p: p.update(favorite=""))
         self.assertEqual(h.load_prefs()["favorite"], "")
 
+    def test_quick_clicks_take_effect_in_the_order_made(self):
+        import argparse
+        h.write_json(h.STATE_PATH, {"cameras": [{"uid": "nvr_cam1", "id": "cam1", "name": "Door",
+                                                  "mac": "aabbccddeeff", "consoleName": "NVR"}]})
+        h.save_prefs(h.load_prefs())
+        # No console is asked before the change: the last camera list will do.
+        with mock.patch.object(h, "poll_cameras") as poll, \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_favorite(argparse.Namespace(camera="nvr_cam1", clear=False))
+            self.assertEqual(h.load_prefs()["favorite"], "aabbccddeeff")
+            h.cmd_favorite(argparse.Namespace(camera=None, clear=True))
+        self.assertEqual(h.load_prefs()["favorite"], "")
+        self.assertTrue(all(call.args == () for call in poll.call_args_list))   # only refreshes after
+
     def test_console_addresses_are_ip_addresses_or_host_names(self):
         for good, expected in (("192.168.1.1", "192.168.1.1"), ("https://nvr.local/", "nvr.local"),
                                ("10.0.0.2:443", "10.0.0.2"), ("10.0.0.2:8443", "10.0.0.2:8443"),

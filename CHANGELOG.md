@@ -34,7 +34,8 @@ Security-focused hardening release.
   terminal escape sequences. Snapshots and thumbnails share memory
   budgets. A console can no longer pose as, hide or change the settings of
   another console's camera (when two consoles report one camera online,
-  both are shown with settings kept per console, and `cameras` warns), and
+  both are shown, the settings saved for that camera no longer apply to
+  either until you set them again, and `cameras` warns), and
   a console's alerts can no longer be dated so they are never cleared; a
   flood of alerts is capped at ten new ones per camera per minute.
 - **Setup:** a changed console certificate must be confirmed explicitly and

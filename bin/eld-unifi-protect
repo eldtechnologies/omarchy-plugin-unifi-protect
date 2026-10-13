@@ -1381,17 +1381,13 @@ def armed_cameras(config, prefs):
 
 
 def read_ack():
-    """When alerts were last seen and cleared, never later than now (after the
-    clock steps back, a time in the future would hide every new alert)."""
+    """When alerts were last seen and cleared (see AlertListener.align_clock)."""
     try:
         with open(ALERTS_ACK_PATH) as handle:
             ack = json.load(handle)
     except (OSError, ValueError):
         return {}
-    if not isinstance(ack, dict):
-        return {}
-    now = time.time()
-    return {k: min(v, now) if isinstance(v, (int, float)) else v for k, v in ack.items()}
+    return ack if isinstance(ack, dict) else {}
 
 
 def alert_image_path(name):
@@ -1429,9 +1425,9 @@ def load_alerts():
         start = event_time(alert.get("start"))
         if start is None:
             continue
-        end = event_time(alert.get("end"))
-        now = time.time()
-        alert = dict(alert, start=min(start, now), end=min(end, now) if end is not None else None)
+        # Times later than now are left for the listener to shift as a whole
+        # (align_clock), which keeps their order.
+        alert = dict(alert, start=start, end=event_time(alert.get("end")))
         if alert.get("image") and not alert_image_path(alert["image"]):
             alert["image"] = None
         kept.append(alert)
@@ -1793,19 +1789,12 @@ class AlertListener:
     def save(self):
         if plugin_gone():
             return      # uninstalled: write nothing, not even a runtime dir
-        # Older than a day, or before the user last cleared the log: drop.
-        # So is anything dated in the future, which could never be cleared.
         now = time.time()
+        self.align_clock(now)
+        # Older than a day, or before the user last cleared the log: drop.
         cutoff = max(now - ALERTS_MAX_AGE, read_ack().get("clearedAt", 0))
         # A console that was removed takes its alerts (and pictures) along.
         known = {c["id"] for c in (self.config or {}).get("consoles", [])} if self.config else None
-        # Times after now (the clock went back, say) are clamped, not
-        # dropped: a clock step must not delete genuine alerts.
-        for alert in self.alerts:
-            if (alert.get("start") or 0) > now:
-                alert["start"] = now
-            if alert.get("end") and alert["end"] > now:
-                alert["end"] = now
         self.alerts = [a for a in self.alerts
                        if cutoff < (a.get("start") or 0)
                        and (known is None or str(a.get("uid", "")).split("_")[0] in known)][-ALERTS_KEEP:]
@@ -1813,6 +1802,33 @@ class AlertListener:
         write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": self.alerts,
                                  "consoles": self.status})
         prune_alert_images({a.get("image") for a in self.alerts})
+
+    def align_clock(self, now):
+        """After the clock steps back, move every stored time back with it.
+
+        Alerts and the seen/cleared times are shifted by the same amount, so
+        their order holds (an alert after a Clear stays after it) and nothing
+        sits in the future, where it could never be cleared or would hide new
+        alerts. The shifted seen/cleared times are written back for the panel.
+        """
+        ack = read_ack()
+        times = [t for a in self.alerts for t in (a.get("start"), a.get("end"))
+                 if isinstance(t, (int, float))]
+        times += [v for v in ack.values() if isinstance(v, (int, float))]
+        latest = max(times, default=0)
+        if latest <= now:
+            return
+        delta = latest - now
+        for alert in self.alerts:
+            for field in ("start", "end"):
+                if isinstance(alert.get(field), (int, float)):
+                    alert[field] -= delta
+        if any(isinstance(v, (int, float)) and v > now - delta for v in ack.values()):
+            try:
+                write_json(ALERTS_ACK_PATH, {k: v - delta if isinstance(v, (int, float)) else v
+                                             for k, v in ack.items()})
+            except OSError:
+                pass
 
     def handle(self, console_id, message):
         item = message.get("item") if isinstance(message, dict) else None
@@ -1836,6 +1852,7 @@ class AlertListener:
         kind_is_new = False
         if kind and existing is None and self.allow_new_alert(camera["uid"], now):
             kind_is_new = True
+            self.align_clock(now)      # before this alert joins the log
             # Smart detections often arrive as an empty "add" followed by an
             # "update" naming what was seen, so either can open an alert.
             # The console's clock decides the time, but never the future.
@@ -1888,6 +1905,8 @@ class AlertListener:
             try:
                 data = await asyncio.to_thread(
                     lambda: Protect(console, self.config).snapshot(camera["id"]))
+                if plugin_gone():
+                    return
                 name = f"{alert['id']}.jpg"
                 path = alert_image_path(name)
                 if not path:
@@ -2105,13 +2124,12 @@ def cmd_alert(args):
             when = time.strftime("%H:%M:%S", time.localtime(alert["start"]))
             print(f"  {when}  {alert['kind']:8} {alert['camera']}")
         return
-    state = poll_cameras(require_config())
-    matches = find_cameras(state["cameras"], args.camera)
+    refuse_in_demo()
+    matches = find_known_cameras(args.camera)
     if len(matches) != 1:
         raise ProtectError(f"{args.camera!r} matches {len(matches)} cameras; use its id "
                            "from `eld-unifi-protect cameras`")
     camera = matches[0]
-    refuse_in_demo()
     if args.off:
         update_prefs(lambda p: p["alerts"].pop(camera_key(camera), None))
         print(f"alerts off: {camera['name']}")
@@ -2811,6 +2829,7 @@ class ProtectSession:
         # process and, for LOGIN_RETRY_AFTER, in every other: UniFi OS
         # locks accounts out after a burst of failures. `login` clears it.
         self.login_error, self.login_rejected, self.session = None, False, None
+        self.dead_tokens = set()     # sessions the console turned down
         rejected = None if fresh else load_rejected().get(console["id"])
         if isinstance(rejected, dict) and rejected.get("user") == console.get("loginUser"):
             # A rejected password stays rejected, across reboots, until
@@ -2894,12 +2913,21 @@ class ProtectSession:
                 current = next((c for c in (load_config(keys=False) or {"consoles": []})["consoles"]
                                 if c["id"] == self.console["id"]), None)
                 kept = bool(current) and current.get("loginUser") == self.console.get("loginUser")
-                if kept:
+                saved = load_sessions().get(self.console["id"]) if kept else None
+                # Another helper signed in meanwhile: keep its session (one
+                # session per console), and sign this one out.
+                theirs = (isinstance(saved, dict) and saved.get("token")
+                          and saved.get("token") not in self.dead_tokens
+                          and saved.get("expires", 0) > time.time() + 60)
+                if kept and not theirs:
                     restore_session(self.console["id"], self.session)
             if not kept:
                 self.logout()
                 self.session = None
                 raise ProtectError("the recordings login was removed meanwhile")
+            if theirs:
+                self.logout()
+                self.session = saved
 
     def logout(self):
         """End the saved session on the console too; best effort."""
@@ -2943,6 +2971,7 @@ class ProtectSession:
                                         headers=headers, timeout=timeout, deadline=deadline)
             if response.status == 401 and attempt == 0:
                 conn.finish()
+                self.dead_tokens.add(session.get("token"))   # never "theirs" again
                 with self.lock:
                     # Another thread may have signed in again already.
                     if self.session is session:
@@ -3122,8 +3151,11 @@ def recordings_for(config, uid, hours=24, motion=False):
     # stopped midway cannot pile up in the folder.
     wanted = {e["id"] + ".jpg" for e in events}
     for name in os.listdir(folder):
-        if name not in wanted:
-            os.remove(os.path.join(folder, name))
+        if name not in wanted and ".tmp." not in name:   # another listing's file in flight
+            try:
+                os.remove(os.path.join(folder, name))
+            except FileNotFoundError:
+                pass
     budget = {"left": THUMBNAILS_BUDGET}
     budget_lock = threading.Lock()
 
@@ -3275,6 +3307,17 @@ def refuse_in_demo():
     """cameras.json is the real one: demo mode must not change it."""
     if demo_on():
         raise ProtectError("demo mode is on; camera settings can't be changed")
+
+
+def find_known_cameras(wanted):
+    """Cameras matching wanted, from the last camera list when it has them.
+
+    Settings commands apply their change straight away and refresh after:
+    quick clicks then take effect in the order they were made, not in the
+    order slow consoles answer a poll.
+    """
+    found = find_cameras(previous_state().get("cameras", []), wanted)
+    return found or find_cameras(poll_cameras(require_config())["cameras"], wanted)
 
 
 def update_prefs(change):
@@ -3472,6 +3515,8 @@ def load_index():
 
 
 def refresh_snapshots(config, cameras, index):
+    if plugin_gone():
+        return
     clients = {c["id"]: Protect(c, config) for c in config["consoles"]}
     started = time.time()
     budget = {"left": SNAPSHOT_BUDGET}
@@ -3589,17 +3634,24 @@ HOST_LABEL = re.compile(r"[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?")
 
 
 def looks_like_key(label):
-    """A pasted API key: a long run of letters and digits with no hyphen."""
-    return len(label) >= 30 and "-" not in label
+    """A pasted API key: a long run of letters and digits with no hyphen, or
+    a shorter one mixing upper case, lower case and digits (real host names
+    of that length nearly always have a hyphen)."""
+    if "-" in label:
+        return False
+    mixed = (any(c.isupper() for c in label) and any(c.islower() for c in label)
+             and any(c.isdigit() for c in label))
+    return len(label) >= 30 or (len(label) >= 16 and mixed)
 
 
 def typed_host(raw, config):
     """The address typed in setup: a saved console's address exactly as saved
     (older versions saved some the stricter check now refuses), else checked."""
     text = raw.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+    loose = text.lower().removesuffix(":443")
     for console in (config or {}).get("consoles", []):
-        if console.get("host") == text:
-            return text
+        if str(console.get("host", "")).lower().removesuffix(":443") == loose:
+            return console["host"]
     return normalize_host(raw)
 
 
@@ -3931,7 +3983,8 @@ def cmd_login(args):
             set_rejected(console["id"], None)
             restore_session(console["id"], trial.session)
         old = [s for s in (old_session, replaced) if isinstance(s, dict) and s.get("token")
-               and s.get("token") != (trial.session or {}).get("token")]
+               and s.get("token") != (trial.session or {}).get("token")
+               and s.get("expires", 0) > time.time()]      # an expired one is over already
         unconfirmed = [s for s in {s["token"]: s for s in old}.values()
                        if not logout_session(dict(console, loginUser=previous.get("loginUser") or user), s, config)]
     finally:
@@ -4257,10 +4310,9 @@ def cmd_doctor(args):
 
 def cmd_hide(args, hide=True):
     refuse_in_demo()
-    state = poll_cameras(require_config())
     keys = set()
     for wanted in args.cameras:
-        matches = find_cameras(state["cameras"], wanted)
+        matches = find_known_cameras(wanted)
         if not matches:
             raise ProtectError(f"no camera {wanted!r}; see `eld-unifi-protect cameras`")
         for camera in matches:
@@ -4305,8 +4357,7 @@ def cmd_favorite(args):
         poll_cameras()
         print("no favourite camera")
         return
-    state = poll_cameras(require_config())
-    matches = find_cameras(state["cameras"], args.camera)
+    matches = find_known_cameras(args.camera)
     if len(matches) != 1:
         raise ProtectError(f"{args.camera!r} matches {len(matches)} cameras; use its id "
                            "from `eld-unifi-protect cameras`")

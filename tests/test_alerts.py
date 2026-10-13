@@ -240,6 +240,20 @@ class AlertLog(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(h.ALERT_IMAGES_DIR)), ["new.jpg"])
         os.remove(h.ALERTS_ACK_PATH)
 
+    def test_a_clock_step_back_keeps_alerts_and_their_order(self):
+        # Cleared, then a ring a minute later; then the clock steps back ten minutes.
+        now = time.time()
+        h.write_json(h.ALERTS_ACK_PATH, {"ackedAt": now + 540, "clearedAt": now + 540})
+        listener = h.AlertListener()
+        listener.alerts = [{"id": "after", "start": now + 600, "image": None}]
+        listener.save()
+        self.assertEqual([a["id"] for a in listener.alerts], ["after"])     # still after the Clear
+        self.assertLessEqual(listener.alerts[0]["start"], time.time())
+        ack = h.read_ack()
+        self.assertLess(ack["clearedAt"], listener.alerts[0]["start"])      # shifted together
+        self.assertLessEqual(ack["ackedAt"], time.time())                   # the panel sees it
+        os.remove(h.ALERTS_ACK_PATH)
+
     def test_day_old_alerts_expire(self):
         listener = h.AlertListener()
         listener.alerts = [{"id": "a", "start": time.time() - h.ALERTS_MAX_AGE - 5}]
