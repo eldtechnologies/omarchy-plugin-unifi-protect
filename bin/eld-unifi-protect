@@ -1131,6 +1131,8 @@ NOTIFY_EVERY = 60   # seconds; at most one notification per camera per minute
 CAPTURE_EVERY = 5   # seconds; at most one alert snapshot per camera
 PLUGIN_ID = "com.eldtechnologies.unifi-protect"
 ALERTS_MAX_AGE = 24 * 3600
+ALERTS_PER_MINUTE = 10      # new alerts per camera
+ALERT_SKEW = 300            # seconds a console's clock may run ahead
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
@@ -1255,10 +1257,10 @@ async def ws_messages(reader, writer, idle=60):
         if opcode in (0x0, 0x1) and len(fragments) + length > 1 << 20:
             # Fragments add up: cap the whole message, not just each frame.
             raise ProtectError("event message too large")
-        mask = await asyncio.wait_for(reader.readexactly(4), idle) if masked else None
+        if masked:
+            # Servers never mask (RFC 6455); unmasking in Python is slow.
+            raise ProtectError("event stream sent a masked frame")
         payload = await asyncio.wait_for(reader.readexactly(length), idle)
-        if mask:
-            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
         if opcode == 0x9:
             writer.write(ws_frame(0xA, payload))
             await writer.drain()
@@ -1327,7 +1329,7 @@ def load_alerts():
         if not isinstance(alert, dict) or not EVENT_ID.fullmatch(str(alert.get("id") or "")):
             continue
         start = event_time(alert.get("start"))
-        if start is None:
+        if start is None or start > time.time() + ALERT_SKEW:
             continue
         alert = dict(alert, start=start, end=event_time(alert.get("end")))
         if alert.get("image") and not alert_image_path(alert["image"]):
@@ -1407,8 +1409,8 @@ class DBusWriter:
 
     def variant(self, code, value):
         self.signature(code)
-        {"s": self.string, "o": self.string, "u": self.uint32,
-         "y": self.byte, "g": self.signature}[code](value)
+        {"s": self.string, "o": self.string, "u": self.uint32, "y": self.byte,
+         "g": self.signature, "b": lambda v: self.uint32(1 if v else 0)}[code](value)
 
 
 def dbus_message(kind, serial, fields, signature="", body=b""):
@@ -1591,7 +1593,8 @@ def notify_body(summary, body, image, actions, timeout_ms=-1):
     out.array(4, write_actions)
 
     def write_hints():
-        hints = [("urgency", "y", 1)]
+        # transient: "show it, don't keep it" (what a history may honour).
+        hints = [("urgency", "y", 1), ("transient", "b", True)]
         if image:
             hints.append(("image-path", "s", "file://" + image))
         for key, code, value in hints:
@@ -1615,10 +1618,20 @@ async def send_desktop_notification(summary, body, image="", actions=(), wait=36
         match.string(f"type='signal',sender='{NOTIFY_NAME}',interface='{NOTIFY_NAME}',path='{NOTIFY_PATH}'")
         await bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
                        "AddMatch", "s", bytes(match.buf))
+        # Who owns the notification service, as the bus itself says: only
+        # that connection may answer Notify or report a chosen action.
+        name = DBusWriter()
+        name.string(NOTIFY_NAME)
+        owner = await bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                               "GetNameOwner", "s", bytes(name.buf))
+        if bus.reply_sender != "org.freedesktop.DBus" or not owner:
+            raise ProtectError("no notification service on the bus")
+        server = owner[0]
         values = await bus.call(NOTIFY_NAME, NOTIFY_PATH, NOTIFY_NAME, "Notify", "susssasa{sv}i",
                                 notify_body(summary, body, image, list(actions)))
+        if bus.reply_sender != server:
+            raise ProtectError("an unexpected party answered the notification")
         notification = values[0] if values else None
-        server = bus.reply_sender   # the notification service's unique name
         if not actions:
             return None
 
@@ -1651,6 +1664,10 @@ class AlertListener:
         self.notify_enabled = True
         self.last_notified = {}      # camera uid -> time of its last notification
         self.last_captured = {}      # camera uid -> time of its last alert snapshot
+        self.recent = {}             # camera uid -> times of its latest new alerts
+        self.dirty = False           # alerts changed since the last save
+        self.last_save = 0.0
+        self.ack_stamp = None
 
     def refresh(self):
         """Re-read config and arming when cameras.json or config.json change."""
@@ -1670,8 +1687,12 @@ class AlertListener:
 
     def save(self):
         # Older than a day, or before the user last cleared the log: drop.
-        cutoff = max(time.time() - ALERTS_MAX_AGE, read_ack().get("clearedAt", 0))
-        self.alerts = [a for a in self.alerts if (a.get("start") or 0) > cutoff][-ALERTS_KEEP:]
+        # So is anything dated in the future, which could never be cleared.
+        now = time.time()
+        cutoff = max(now - ALERTS_MAX_AGE, read_ack().get("clearedAt", 0))
+        self.alerts = [a for a in self.alerts
+                       if cutoff < (a.get("start") or 0) <= now + ALERT_SKEW][-ALERTS_KEEP:]
+        self.dirty, self.last_save = False, time.monotonic()
         write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": self.alerts,
                                  "consoles": self.status})
         prune_alert_images({a.get("image") for a in self.alerts})
@@ -1694,22 +1715,42 @@ class AlertListener:
         existing = next((a for a in self.alerts if a["id"] == event_id), None)
         kind = alert_kind(item, camera["alerts"]) if camera else None
         changed = False
-        if kind and existing is None:
+        now = time.time()
+        kind_is_new = False
+        if kind and existing is None and self.allow_new_alert(camera["uid"], now):
+            kind_is_new = True
             # Smart detections often arrive as an empty "add" followed by an
             # "update" naming what was seen, so either can open an alert.
+            # The console's clock decides the time, but never the future.
             existing = {
                 "id": event_id, "uid": camera["uid"], "camera": camera["name"],
                 "consoleName": camera["consoleName"], "kind": kind,
-                "start": event_time(item.get("start")) or time.time(), "end": None,
+                "start": min(event_time(item.get("start")) or now, now), "end": None,
             }
             self.alerts.append(existing)
             changed = True
             self.on_new_alert(console_id, camera, existing)
         if existing is not None and item.get("end") and not existing.get("end"):
-            existing["end"] = event_time(item["end"])
-            changed = True
+            end = event_time(item["end"])
+            if end is not None and end <= now + ALERT_SKEW:
+                existing["end"] = end
+                changed = True
         if changed:
-            self.save()
+            # A new alert is written at once (they are capped per camera);
+            # other changes at most once a second, run() flushing the rest.
+            if kind_is_new or time.monotonic() - self.last_save >= 1:
+                self.save()
+            else:
+                self.dirty = True
+
+    def allow_new_alert(self, uid, now):
+        """At most ALERTS_PER_MINUTE new alerts per camera: no console flood."""
+        recent = [t for t in self.recent.get(uid, []) if now - t < 60]
+        if len(recent) >= ALERTS_PER_MINUTE:
+            self.recent[uid] = recent
+            return False
+        self.recent[uid] = recent + [now]
+        return True
 
     def on_new_alert(self, console_id, camera, alert):
         """Snapshot the moment for the alert log, then notify."""
@@ -1816,6 +1857,15 @@ class AlertListener:
                 if console_id not in self.armed:
                     self.tasks.pop(console_id).cancel()
                     self.status.pop(console_id, None)
+            # Flush throttled changes, apply `alert --clear` right away, and
+            # let the age limit act even when nothing happens.
+            try:
+                ack = os.stat(ALERTS_ACK_PATH).st_mtime_ns
+            except OSError:
+                ack = None
+            if self.dirty or ack != self.ack_stamp or time.monotonic() - self.last_save > 60:
+                self.ack_stamp = ack
+                self.save()
             await asyncio.sleep(5)
 
 

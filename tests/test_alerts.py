@@ -151,6 +151,20 @@ class ListenerLifecycle(unittest.TestCase):
         lst.handle("nvr", {"item": {"id": "e4", "type": "ring", "device": "cam1", "start": 1791700000000}})
         self.assertEqual(lst.alerts[0]["kind"], "ring")
 
+    def test_console_times_never_run_into_the_future(self):
+        lst = self.listener()
+        lst.handle("nvr", {"item": {"id": "f1", "type": "ring", "device": "cam1", "start": 4000000000000}})
+        self.assertLessEqual(lst.alerts[0]["start"], time.time())
+        lst.handle("nvr", {"item": {"id": "f1", "end": "x"}})
+        lst.handle("nvr", {"item": {"id": "f1", "end": 4000000000000}})
+        self.assertIsNone(lst.alerts[0]["end"])
+
+    def test_a_flood_of_new_events_is_capped(self):
+        lst = self.listener()
+        for i in range(50):
+            lst.handle("nvr", {"item": {"id": f"flood{i}", "type": "ring", "device": "cam1"}})
+        self.assertEqual(len(lst.alerts), h.ALERTS_PER_MINUTE)
+
     def test_malformed_messages_are_ignored(self):
         lst = self.listener()
         for message in ([], {"item": []}, {"item": {"id": "e9", "device": ["cam1"], "type": "ring"}},
