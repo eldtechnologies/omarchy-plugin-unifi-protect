@@ -74,9 +74,16 @@ eld-unifi-protect setup
 Setup runs inside the panel (**Run setup**, or **Add console** later); the
 same steps are available in a terminal with `eld-unifi-protect setup`. It asks
 for the console's address, shows the fingerprint of its TLS certificate for
-you to confirm, then asks for an API key. In the panel, the key goes from a
-password field to the helper on stdin and the field is cleared at once; it is
-never written to a file, a log or a command line.
+you to confirm, then asks for an API key. To confirm the fingerprint, open
+`https://<console-ip>` in a browser and compare it with the certificate the
+browser shows (its SHA-256 fingerprint). In the panel, the key goes from a
+password field to the helper on stdin and the field is cleared at once; it
+never reaches a log or a command line. It is kept in your keyring, or, when
+no keyring is available, in a file only you can read (see below).
+
+Give the plugin the least it needs: an API key from an account with only
+the access you want it to have, and for recordings a local view-only
+account.
 
 Create the key **on the console itself**; this is the route known to work:
 
@@ -219,7 +226,9 @@ with a snapshot from that moment and a **Watch live** button that opens the
 panel on that camera. To avoid floods there is at most one notification per
 camera per minute; every alert is still recorded. Turn them off with
 **Notifications on** in the panel footer, or
-`eld-unifi-protect alert --notify off`.
+`eld-unifi-protect alert --notify off`. Notifications are marked transient,
+but Omarchy's notification history still keeps the latest ones, with their
+picture, under `~/.local/state/omarchy/notifications/` until you clear it.
 
 ```bash
 eld-unifi-protect alert "Front Door"                  # person, vehicle, ring
@@ -348,8 +357,9 @@ streams.
 - **Recordings** use a separate sign-in, with a local UniFi account (see
   [Recordings](#recordings)), against the endpoints Protect's web app uses
   (`/proxy/protect/api`): one sign-in per console, kept for the session in
-  the runtime directory (`sessions.json`, mode 0600), and never retried after
-  a rejected password, since UniFi OS locks accounts after repeated failures.
+  the runtime directory (`sessions.json`, mode 0600). A rejected password is
+  never tried again until you sign in again, since UniFi OS locks accounts
+  after repeated failures.
   The password is stored and passed like the API key, on stdin only.
 - **Traffic:** while the panel is closed, one camera-list poll per console per
   minute. Snapshots are fetched only while the panel is open on the grid.
@@ -372,15 +382,21 @@ streams.
   The relay checks the same pinned certificate as the API, forces all media
   over the encrypted TCP connection (it refuses UDP, and FFmpeg falls back),
   listens only on 127.0.0.1, and requires a random per-session token in every
-  URL, so other local users cannot borrow it. Those URLs never contain the
+  URL, and accepts connections only from your own user (it checks who owns
+  the other end), so other local users cannot borrow it even if they see a
+  URL, say in the system journal. Those URLs never contain the
   camera's Protect stream alias, only a random route id that the relay maps
   back privately, so nothing a player is given could be used against the
   console. The relay starts on demand and exits after a minute without
   viewers. The only unencrypted hop is loopback inside your machine.
 - **Streams get switched on:** if a camera has no stream yet for the quality
   you open, the plugin enables one, the same as turning on RTSP in the
-  camera's Protect settings. It stays enabled. To forbid that, turn on
-  read-only mode: `eld-unifi-protect read-only on`. The plugin then never
+  camera's Protect settings. It stays enabled, including after you remove
+  the plugin, and anyone on your network who learns that stream's address
+  can watch it, as with any RTSPS stream Protect serves; turn it off in
+  Protect (camera → Settings → Advanced) if you no longer want it. To
+  forbid the plugin from switching streams on, turn on read-only mode:
+  `eld-unifi-protect read-only on`. The plugin then never
   changes anything on your consoles. It uses only streams already enabled in
   Protect, falling back to the nearest enabled quality, and tells you how to
   enable one when a camera has none.
@@ -443,8 +459,10 @@ it from there. Record changes in `CHANGELOG.md`.
 
 **Demo mode** shows made-up consoles and cameras instead of yours, for
 screenshots, development, or trying the plugin without UniFi hardware:
-`eld-unifi-protect demo on` (and `demo off`). Your real config is never
-touched, and a reboot always ends it. `tools/screenshots.sh [workspace]`
+`eld-unifi-protect demo on` (and `demo off`). Your config and camera
+settings are never changed while it is on, your alert log, snapshots and
+recordings are set aside and come back with `demo off`, and a reboot
+always ends it. `tools/screenshots.sh [workspace]`
 captures the README screenshots from the real UI on demo data, on an empty
 workspace; see [docs/demo](docs/demo/README.md).
 

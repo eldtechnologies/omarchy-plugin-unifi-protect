@@ -138,6 +138,8 @@ ShellRoot {
       anchors.fill: parent
       visible: !stream.live && stream.snapshot !== ""
       source: stream.snapshot
+      // Decoded at tile size, whatever size the console's JPEG claims.
+      sourceSize.width: 1280
       fillMode: Image.PreserveAspectFit
       asynchronous: true
       cache: false

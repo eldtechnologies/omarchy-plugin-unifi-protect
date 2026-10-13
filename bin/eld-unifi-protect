@@ -1845,6 +1845,8 @@ class AlertListener:
                 return  # the shell that started us is gone
             if demo_on():
                 return  # demo data must never be mixed with real events
+            if not os.path.exists(os.path.realpath(__file__)):
+                return  # the plugin was uninstalled
             self.refresh()
             if not self.armed:
                 self.status = {}
@@ -1869,13 +1871,62 @@ class AlertListener:
             await asyncio.sleep(5)
 
 
+def stop_process(pid, started, script_arg):
+    """SIGTERM pid only if it is still the process we started (same start time
+    and this helper's command); True if signalled."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as handle:
+            argv = handle.read().split(b"\0")[:-1]
+        if process_start_time(int(pid)) != int(started) or script_arg not in argv:
+            return False
+        os.kill(int(pid), signal.SIGTERM)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def cmd_stop(args):
+    """Stop what runs in the background: the wall, the stream relay and the
+    alert listener. --sign-out also ends every recordings session on its
+    console. For uninstalling; the panel starts what it needs again."""
+    stopped = []
+    pid = running_wall()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped.append("camera wall")
+        except ProcessLookupError:
+            pass
+    info = read_relay_info()
+    if relay_alive(info) and stop_process(info["pid"], info["started"], b"relay"):
+        stopped.append("stream relay")
+    try:
+        with open(EVENTS_LOCK) as handle:
+            pid, started = handle.read().split()
+        if stop_process(pid, started, b"events"):
+            stopped.append("alert listener")
+    except (OSError, ValueError):
+        pass
+    if args.sign_out:
+        config = load_config(keys=False) or {"consoles": []}
+        for console in config["consoles"]:
+            if console.get("loginUser"):
+                end_session(console, config)
+                stopped.append(f"recordings session on {console['name']}")
+    print("stopped: " + (", ".join(stopped) if stopped else "nothing was running"))
+
+
 def cmd_events(args):
     """Listen for alerts on armed cameras until none are armed."""
-    lock = open(EVENTS_LOCK, "w")
+    lock = open(EVENTS_LOCK, "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return  # another listener is already running
+    # Who holds it, for `stop`: pid and start time, as for the wall.
+    lock.truncate(0)
+    lock.write(f"{os.getpid()} {process_start_time(os.getpid())}\n")
+    lock.flush()
     try:
         asyncio.run(AlertListener(follow_parent=args.follow_parent).run())
     except KeyboardInterrupt:
@@ -1893,7 +1944,7 @@ def cmd_alert(args):
         if args.clear:
             # The listener drops cleared alerts on its next save. If it isn't
             # running, nothing else writes the log, so empty it here.
-            lock = open(EVENTS_LOCK, "w")
+            lock = open(EVENTS_LOCK, "a")
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -3979,6 +4030,13 @@ def cmd_wall(args):
     Running it again while it is up closes it, so one keybinding toggles it.
     """
     pid = running_wall()
+    if args.close:
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        return
     if pid:
         if args.no_toggle:
             return
@@ -4153,6 +4211,9 @@ def main():
     p.add_argument("--stdin", action="store_true", help="read username and password as two lines")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_login)
+    p = sub.add_parser("stop", help="stop the wall, the stream relay and the alert listener")
+    p.add_argument("--sign-out", action="store_true", help="also end every recordings session")
+    p.set_defaults(func=cmd_stop)
     p = sub.add_parser("logout", help="remove a console's recordings login")
     p.add_argument("console", nargs="?")
     p.set_defaults(func=cmd_logout)
@@ -4189,6 +4250,7 @@ def main():
     p.add_argument("--quality", choices=QUALITIES, default="medium", help="stream for grid tiles")
     p.add_argument("--focus-quality", choices=QUALITIES, default="high", help="stream for an enlarged camera")
     p.add_argument("--no-toggle", action="store_true", help="do nothing if already open")
+    p.add_argument("--close", action="store_true", help="close it if open; never open it")
     p.add_argument("--mode", choices=("window", "overlay"), default="window",
                    help="window: maximized, keeps workspaces and the bar (default); "
                         "overlay: covers everything")

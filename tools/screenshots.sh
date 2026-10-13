@@ -24,6 +24,10 @@ monitor=$(hyprctl monitors -j | python3 -c 'import json,sys; m=[m for m in json.
 read -r output scale bar_top <<<"$monitor"
 bar_px=$(python3 -c "print(int(($bar_top) * $scale) + 2)")
 home_ws=$(hyprctl activeworkspace -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["name"])')
+if [[ ! $home_ws =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "your current workspace has an unusual name; switch to a numbered one first" >&2
+  exit 1
+fi
 used_ws=$(hyprctl workspaces -j | python3 -c 'import json,sys; print(" ".join(w["name"] for w in json.load(sys.stdin) if w["windows"]))')
 if [[ -n ${1:-} ]]; then
   empty_ws=$1
@@ -51,18 +55,26 @@ guard() {
     exit 1
   fi
 }
-shot() { guard; grim -o "$output" "$1"; guard; }
-# Which alerts count as seen is yours: kept aside, put back at the end.
+# Demo data only: never capture while your real cameras are showing.
+demo_guard() {
+  if [[ $("$cli" demo status) != "demo mode on" ]]; then
+    echo "aborted: demo mode is not on; nothing was saved" >&2
+    exit 1
+  fi
+}
+shot() { demo_guard; guard; grim -o "$output" "$1"; guard; }
+# Demo mode sets your own alert log (and which alerts you have seen) aside
+# and puts it back when it ends, so the script can write the demo's freely.
 ack="$runtime/alerts-ack.json"
-[[ -f $ack ]] && cp -p "$ack" "$work/alerts-ack.json"
 seen_alerts() { printf '{"ackedAt": %s}\n' "$(python3 -c "import time; print(time.time() - $1)")" >"$ack"; }
 
+demo_started=0
 cleanup() {
   "${ipc[@]}" close >/dev/null 2>&1 || true
-  "$cli" wall --no-toggle >/dev/null 2>&1 && "$cli" wall >/dev/null 2>&1 || true
-  goto "$home_ws"
-  "$cli" demo off >/dev/null
-  if [[ -f $work/alerts-ack.json ]]; then cp -p "$work/alerts-ack.json" "$ack"; else rm -f "$ack"; fi
+  "$cli" wall --close >/dev/null 2>&1 || true
+  goto "$home_ws" || true
+  # Only end demo mode if this script turned it on.
+  if [[ $demo_started == 1 ]]; then "$cli" demo off >/dev/null || true; fi
 }
 trap 'cleanup; rm -rf "$work"' EXIT
 
@@ -89,6 +101,11 @@ PY
 }
 
 echo "demo mode on…"
+if [[ $("$cli" demo status) == "demo mode on" ]]; then
+  echo "demo mode is already on; turn it off first so this script owns it" >&2
+  exit 1
+fi
+demo_started=1
 "$cli" demo on >/dev/null
 goto "$empty_ws"
 "${ipc[@]}" close >/dev/null 2>&1 || true

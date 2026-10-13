@@ -9,43 +9,52 @@ Security-focused hardening release.
 
 ### Security
 
-- **No private details in command lines,** which every local user can read.
-  Notifications no longer run `notify-send` with the camera, console and
-  time for as long as they are shown; the helper sends them to the
-  notification service over D-Bus itself. mpv gets its title and video on
-  stdin; the panel passes event times in the environment and the console
-  name typed at setup on stdin. Keyring labels carry only the console's
-  short id.
-- **Stream relay.** Loopback stream URLs no longer contain the camera's
-  Protect stream alias, only a random route id the relay maps back
-  privately. Before, once the relay exited after a minute idle, another
-  local user could listen on its old port and collect the alias from the
-  next player. The relay is now trusted only while it holds its lock, gets
-  a fresh token every start, never exits right after being handed out, and
-  caps and times out connections that have not shown the token.
-- **The camera wall shows text as plain text;** a camera name written as
-  HTML could make it load an image from any address.
-- **Console input is bounded and checked:** API responses (16 MiB, 60 s),
-  event-stream messages (1 MiB, with a time limit once begun), event and
-  token times (no NaN or Infinity, which broke the alert log), and the
-  shapes of camera lists, event lists and server info. Text a console sends
-  is stripped of terminal escape sequences wherever it is printed.
-- **The wall toggle** only ever signals the wall it started, never another
-  process that reused its pid.
-- **Recordings sign-in:** a rejected login is remembered for ten minutes
-  across all helper processes instead of being retried (UniFi OS locks
-  accounts after repeated failures), and the panel asks for it again.
-  Dropping a login in any way also signs its session out on the console.
-- **Files** are created with their final permissions; cameras.json is now
-  0600. `migrate-keys` reports keys the keyring refused.
-- **CI** actions are pinned to commits.
+- **Private details stay out of command lines,** which every local user can
+  read. Notifications no longer run `notify-send` with the camera, console
+  and time for as long as they are shown; the helper sends them to the
+  notification service over D-Bus itself, and accepts "Watch live" only
+  from that service. mpv gets its title and video on stdin; the panel
+  passes event times in the environment and the console name typed at
+  setup on stdin. What command lines still carry are ids (a console's short
+  id, made from its name, and Protect's camera ids) and, during setup, a
+  console's address.
+- **Stream relay.** Players' URLs no longer contain the camera's Protect
+  stream alias, only a random route id the relay maps back privately, and
+  the relay serves only your own user, so a URL seen elsewhere (in the
+  system journal, say) is useless to anyone else. It never lets a console
+  redirect a player out of the encrypted tunnel, holds no API keys, picks
+  up removed consoles and new certificates at once, gets a fresh token
+  every start, never exits right after a URL is handed out, and limits
+  connections that have not shown the token.
+- **Consoles are untrusted:** responses, event-stream messages, snapshots,
+  thumbnails and event lists are size- and time-limited; times, shapes and
+  addresses are checked; text is shown as plain text (a camera name written
+  as HTML could make the wall load an image from anywhere) and stripped of
+  terminal escape sequences. A console can no longer pose as another
+  console's camera, and a console's alerts can no longer be dated so they
+  are never cleared.
+- **Setup:** a changed console certificate must be confirmed explicitly and
+  the API key typed again; addresses are checked before they reach a
+  command line or DNS.
+- **Recordings sign-in:** a rejected password is never retried until you
+  sign in again (UniFi OS locks accounts after repeated failures); a login
+  is tried in memory and kept only once it works; dropping a login in any
+  way signs its session out on the console.
+- **Files and processes:** files are created with their final permissions
+  (cameras.json is now 0600; `clip -o` writes 0600 and never through a
+  link); shared files are changed under a lock across processes; the wall
+  toggle only ever signals the wall it started; demo mode no longer touches
+  your settings or alert log; `uninstall.sh` stops what the plugin started
+  and, with `--purge`, signs out its recordings sessions.
+- **CI** actions are pinned to commits and kept current by Dependabot.
 
 ### Fixed
 
 - The camera wall recovers when its streams drop: a retry with the same URL
   used to freeze on the last frame instead of reconnecting, and after
-  repeated failures it now asks for a fresh URL.
+  repeated failures it now asks for a fresh URL, backing off up to a minute.
 - `snapshot -o` accepts a bare file name.
+- `alert --clear` now empties the log right away while the listener runs.
 
 ## 0.4.1 — 2026-10-12
 

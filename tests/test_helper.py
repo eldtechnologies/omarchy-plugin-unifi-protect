@@ -317,6 +317,22 @@ class ConsoleInput(unittest.TestCase):
         self.assertEqual(index, {"nvr_a": 1})
 
 class WallPid(unittest.TestCase):
+    def test_stop_signals_only_the_process_it_started(self):
+        import subprocess
+        import sys
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "relay"])
+        self.addCleanup(child.kill)
+        for _ in range(100):       # until the child runs its own command line
+            with open(f"/proc/{child.pid}/cmdline", "rb") as handle:
+                if b"relay" in handle.read().split(b"\0"):
+                    break
+            time.sleep(0.01)
+        started = h.process_start_time(child.pid)
+        self.assertFalse(h.stop_process(child.pid, started + 1, b"relay"))   # reused pid
+        self.assertFalse(h.stop_process(child.pid, started, b"events"))      # other command
+        self.assertTrue(h.stop_process(child.pid, started, b"relay"))
+        self.assertEqual(child.wait(5), -15)
+
     def test_a_stale_pid_never_names_another_process(self):
         os.makedirs(os.path.dirname(h.WALL_PID), exist_ok=True)
         me = os.getpid()

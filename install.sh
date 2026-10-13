@@ -11,6 +11,9 @@ plugin_id="com.eldtechnologies.unifi-protect"
 plugins_root="$HOME/.config/omarchy/plugins"
 plugin_dir="$plugins_root/$plugin_id"
 
+# Check the plugin before anything is copied or linked.
+omarchy plugin validate "$source_dir"
+
 mkdir -p "$plugins_root"
 
 if [[ ${1:-} == "--link" ]]; then
@@ -23,7 +26,7 @@ if [[ ${1:-} == "--link" ]]; then
 else
   [[ -L $plugin_dir ]] && rm "$plugin_dir"
   mkdir -p "$plugin_dir/bin"
-  for file in manifest.json BarWidget.qml Panel.qml LICENSE README.md CHANGELOG.md; do
+  for file in manifest.json BarWidget.qml Panel.qml LICENSE README.md CHANGELOG.md SECURITY.md; do
     install -m 644 "$source_dir/$file" "$plugin_dir/$file"
   done
   install -m 755 "$source_dir/bin/eld-unifi-protect" "$plugin_dir/bin/eld-unifi-protect"
@@ -40,7 +43,6 @@ fi
 mkdir -p "$HOME/.local/bin"
 ln -sf "$plugin_dir/bin/eld-unifi-protect" "$HOME/.local/bin/eld-unifi-protect"
 
-omarchy plugin validate "$source_dir"
 omarchy-shell shell rescanPlugins
 omarchy plugin enable "$plugin_id" --section right
 
