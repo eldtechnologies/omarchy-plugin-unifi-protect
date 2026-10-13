@@ -243,16 +243,23 @@ class AlertLog(unittest.TestCase):
     def test_a_clock_step_back_keeps_alerts_and_their_order(self):
         # Cleared, then a ring a minute later; then the clock steps back ten minutes.
         now = time.time()
-        h.write_json(h.ALERTS_ACK_PATH, {"ackedAt": now + 540, "clearedAt": now + 540})
+        h.write_json(h.ALERTS_ACK_PATH, {"ackedAt": now - 60, "clearedAt": now - 60})
         listener = h.AlertListener()
-        listener.alerts = [{"id": "after", "start": now + 600, "image": None}]
+        listener.alerts = [{"id": "after", "start": now, "image": None}]
+        listener.clock_offset += 600          # as if wall time just went back 600 s
         listener.save()
         self.assertEqual([a["id"] for a in listener.alerts], ["after"])     # still after the Clear
-        self.assertLessEqual(listener.alerts[0]["start"], time.time())
-        ack = h.read_ack()
-        self.assertLess(ack["clearedAt"], listener.alerts[0]["start"])      # shifted together
-        self.assertLessEqual(ack["ackedAt"], time.time())                   # the panel sees it
+        self.assertAlmostEqual(listener.alerts[0]["start"], now - 600, delta=2)
+        self.assertAlmostEqual(h.read_ack()["clearedAt"], now - 660, delta=2)
         os.remove(h.ALERTS_ACK_PATH)
+
+    def test_no_clock_step_no_shift(self):
+        # A console running ahead must not move anything (no step happened).
+        now = time.time()
+        listener = h.AlertListener()
+        listener.alerts = [{"id": "a", "start": now - 1000, "end": now - 990, "image": None}]
+        listener.align_clock(time.time())
+        self.assertEqual(listener.alerts[0]["start"], now - 1000)
 
     def test_day_old_alerts_expire(self):
         listener = h.AlertListener()
@@ -320,11 +327,11 @@ class ListenerEndToEnd(unittest.TestCase):
             writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                           f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode())
             for item in ({"id": "ev1", "modelKey": "event", "type": "smartDetectZone", "device": "cam1",
-                          "start": 1791700000000, "smartDetectTypes": []},
+                          "start": int(time.time() * 1000) - 2000, "smartDetectTypes": []},
                          {"id": "ev1", "modelKey": "event", "type": "smartDetectZone", "device": "cam1",
                           "smartDetectTypes": ["vehicle"]},
                          {"id": "ev2", "modelKey": "event", "type": "motion", "device": "cam1",
-                          "start": 1791700001000}):
+                          "start": int(time.time() * 1000) - 1000}):
                 writer.write(server_frame(0x1, json.dumps({"type": "add", "item": item}).encode()))
             await writer.drain()
             await asyncio.sleep(5)

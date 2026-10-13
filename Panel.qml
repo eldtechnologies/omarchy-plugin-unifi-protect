@@ -713,6 +713,8 @@ Panel {
   // An IP address or host name only: whatever is typed here reaches a
   // command line and DNS, so a mis-pasted API key must stop here.
   function plausibleHost(host) {
+    var port = host.match(/^[^\[\]]*:(\d+)\/*$/)
+    if (port && (Number(port[1]) < 1 || Number(port[1]) > 65535)) return false
     var name = host.replace(/^https?:\/\//, "").replace(/\/+$/, "").replace(/:\d{1,5}$/, "")
     if (/^\[[0-9A-Fa-f:.]+\]$/.test(name) || /^[0-9A-Fa-f:.]+$/.test(name) && name.indexOf(":") >= 0)
       return true

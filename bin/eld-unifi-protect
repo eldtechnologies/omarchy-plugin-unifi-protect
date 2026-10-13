@@ -1380,6 +1380,14 @@ def armed_cameras(config, prefs):
     return {k: v for k, v in armed.items() if k in known}
 
 
+ACK_THREAD_LOCK = threading.RLock()
+
+
+def ack_lock():
+    """Shared by everything that rewrites alerts-ack.json."""
+    return file_lock(os.path.join(RUNTIME_DIR, "alerts-ack.lock"), ACK_THREAD_LOCK)
+
+
 def read_ack():
     """When alerts were last seen and cleared (see AlertListener.align_clock)."""
     try:
@@ -1758,6 +1766,7 @@ class AlertListener:
         self.alerts = load_alerts()
         self.status = {}
         self.event_cameras = {}      # event id -> camera id, for sparse updates
+        self.event_starts = {}       # event id -> its start, likewise
         self.armed = {}
         self.config = None
         self.prefs_stamp = None
@@ -1768,6 +1777,23 @@ class AlertListener:
         self.recent = {}             # camera uid -> times of its latest new alerts
         self.dirty = False           # alerts changed since the last save
         self.last_save = 0.0
+        self.clock_offset = time.time() - time.monotonic()   # see align_clock
+        # A step back while no listener ran cannot be measured: then times in
+        # the future are simply brought back to now, so none of them can sit
+        # out of reach of Clear.
+        now = time.time()
+        for alert in self.alerts:
+            for field in ("start", "end"):
+                if isinstance(alert.get(field), (int, float)) and alert[field] > now:
+                    alert[field] = now
+        try:
+            with ack_lock():
+                ack = read_ack()
+                if any(isinstance(v, (int, float)) and v > now for v in ack.values()):
+                    write_json(ALERTS_ACK_PATH, {k: min(v, now) if isinstance(v, (int, float)) else v
+                                                 for k, v in ack.items()})
+        except (OSError, ProtectError):
+            pass
         self.ack_stamp = None
 
     def refresh(self):
@@ -1804,31 +1830,33 @@ class AlertListener:
         prune_alert_images({a.get("image") for a in self.alerts})
 
     def align_clock(self, now):
-        """After the clock steps back, move every stored time back with it.
+        """After the wall clock steps back, move stored times back with it.
 
-        Alerts and the seen/cleared times are shifted by the same amount, so
-        their order holds (an alert after a Clear stays after it) and nothing
-        sits in the future, where it could never be cleared or would hide new
-        alerts. The shifted seen/cleared times are written back for the panel.
+        A step is measured, not guessed: the gap between wall time and the
+        monotonic clock changes only when the clock is set. Alerts and the
+        seen/cleared times move back by exactly that much, so their order
+        holds and nothing sits in the future, where it could never be
+        cleared or would hide new alerts. Checked every few seconds and
+        before each new alert. Forward steps need nothing.
         """
-        ack = read_ack()
-        times = [t for a in self.alerts for t in (a.get("start"), a.get("end"))
-                 if isinstance(t, (int, float))]
-        times += [v for v in ack.values() if isinstance(v, (int, float))]
-        latest = max(times, default=0)
-        if latest <= now:
+        offset = now - time.monotonic()
+        step = self.clock_offset - offset
+        self.clock_offset = offset
+        if step < 30:        # no step back (or only drift)
             return
-        delta = latest - now
         for alert in self.alerts:
             for field in ("start", "end"):
                 if isinstance(alert.get(field), (int, float)):
-                    alert[field] -= delta
-        if any(isinstance(v, (int, float)) and v > now - delta for v in ack.values()):
-            try:
-                write_json(ALERTS_ACK_PATH, {k: v - delta if isinstance(v, (int, float)) else v
-                                             for k, v in ack.items()})
-            except OSError:
-                pass
+                    alert[field] -= step
+        with ack_lock():
+            ack = read_ack()
+            if any(isinstance(v, (int, float)) for v in ack.values()):
+                try:
+                    write_json(ALERTS_ACK_PATH, {k: v - step if isinstance(v, (int, float)) else v
+                                                 for k, v in ack.items()})
+                except OSError:
+                    pass
+        self.dirty = True
 
     def handle(self, console_id, message):
         item = message.get("item") if isinstance(message, dict) else None
@@ -1841,8 +1869,13 @@ class AlertListener:
         if not isinstance(camera_id, str) or not CAMERA_ID.fullmatch(camera_id):
             return
         self.event_cameras[event_id] = camera_id
+        if event_time(item.get("start")) is not None:
+            # Updates may omit the start, like the device: remember it.
+            self.event_starts[event_id] = event_time(item.get("start"))
         if len(self.event_cameras) > 1000:
-            self.event_cameras.pop(next(iter(self.event_cameras)))
+            gone = next(iter(self.event_cameras))
+            self.event_cameras.pop(gone)
+            self.event_starts.pop(gone, None)
         self.refresh()
         camera = self.armed.get(console_id, {}).get(camera_id)
         existing = next((a for a in self.alerts if a["id"] == event_id), None)
@@ -1859,7 +1892,7 @@ class AlertListener:
             existing = {
                 "id": event_id, "uid": camera["uid"], "camera": camera["name"],
                 "consoleName": camera["consoleName"], "kind": kind,
-                "start": min(event_time(item.get("start")) or now, now), "end": None,
+                "start": min(self.event_starts.get(event_id) or now, now), "end": None,
             }
             self.alerts.append(existing)
             changed = True
@@ -1867,7 +1900,7 @@ class AlertListener:
         if existing is not None and item.get("end") and not existing.get("end"):
             end = event_time(item["end"])
             if end is not None and end <= now + ALERT_SKEW:
-                existing["end"] = end
+                existing["end"] = max(existing["start"], min(end, now))
                 changed = True
         if changed:
             # A new alert is written at once (they are capped per camera);
@@ -2000,6 +2033,7 @@ class AlertListener:
                 if console_id not in self.armed:
                     self.tasks.pop(console_id).cancel()
                     self.status.pop(console_id, None)
+            self.align_clock(time.time())
             # Flush throttled changes, apply `alert --clear` right away, and
             # let the age limit act even when nothing happens.
             try:
@@ -2090,11 +2124,12 @@ def cmd_events(args):
 def cmd_alert(args):
     prefs = load_prefs()
     if args.ack or args.clear:
-        ack = read_ack()
-        ack["ackedAt"] = time.time()
-        if args.clear:
-            ack["clearedAt"] = ack["ackedAt"]
-        write_json(ALERTS_ACK_PATH, ack)
+        with ack_lock():
+            ack = read_ack()
+            ack["ackedAt"] = time.time()
+            if args.clear:
+                ack["clearedAt"] = ack["ackedAt"]
+            write_json(ALERTS_ACK_PATH, ack)
         if args.clear:
             # The listener drops cleared alerts on its next save. If it isn't
             # running, nothing else writes the log, so empty it here.
@@ -2904,6 +2939,7 @@ class ProtectSession:
         if not token:
             raise ProtectError("the console signed in but sent no session cookie")
         self.session = {"token": token, "expires": token_expiry(token),
+                        "user": self.console.get("loginUser"),
                         "csrf": response.headers.get("X-Updated-CSRF-Token")
                                 or response.headers.get("X-CSRF-Token") or ""}
         if self.persist:
@@ -2917,6 +2953,7 @@ class ProtectSession:
                 # Another helper signed in meanwhile: keep its session (one
                 # session per console), and sign this one out.
                 theirs = (isinstance(saved, dict) and saved.get("token")
+                          and saved.get("user") == self.console.get("loginUser")
                           and saved.get("token") not in self.dead_tokens
                           and saved.get("expires", 0) > time.time() + 60)
                 if kept and not theirs:
@@ -3151,11 +3188,13 @@ def recordings_for(config, uid, hours=24, motion=False):
     # stopped midway cannot pile up in the folder.
     wanted = {e["id"] + ".jpg" for e in events}
     for name in os.listdir(folder):
-        if name not in wanted and ".tmp." not in name:   # another listing's file in flight
-            try:
-                os.remove(os.path.join(folder, name))
-            except FileNotFoundError:
-                pass
+        path = os.path.join(folder, name)
+        try:
+            # Another listing's file in flight stays, unless it is long dead.
+            if name not in wanted and (".tmp." not in name or os.stat(path).st_mtime < time.time() - 300):
+                os.remove(path)
+        except FileNotFoundError:
+            pass
     budget = {"left": THUMBNAILS_BUDGET}
     budget_lock = threading.Lock()
 
@@ -3541,6 +3580,8 @@ def refresh_snapshots(config, cameras, index):
                     except FileNotFoundError:
                         pass
                 return None
+            if plugin_gone():
+                return None
             write_atomic(snapshot_path(camera["uid"]), data)
             return camera["uid"]
         except (ProtectError, OSError):
@@ -3579,7 +3620,8 @@ def refresh_snapshots(config, cameras, index):
                 os.remove(os.path.join(SNAP_DIR, name))
     except OSError:
         pass
-    write_json(SNAP_INDEX, index)
+    if not plugin_gone():
+        write_json(SNAP_INDEX, index)
 
 
 # ---- commands ------------------------------------------------------------
@@ -3648,9 +3690,14 @@ def typed_host(raw, config):
     """The address typed in setup: a saved console's address exactly as saved
     (older versions saved some the stricter check now refuses), else checked."""
     text = raw.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
-    loose = text.lower().removesuffix(":443")
+    def loose(host):
+        host = host.lower()
+        # ":443" is a port only on a name, an IPv4 address or "[v6]".
+        if host.endswith(":443") and (host.count(":") == 1 or host.endswith("]:443")):
+            host = host[:-4]
+        return host
     for console in (config or {}).get("consoles", []):
-        if str(console.get("host", "")).lower().removesuffix(":443") == loose:
+        if loose(str(console.get("host", ""))) == loose(text):
             return console["host"]
     return normalize_host(raw)
 
@@ -3686,7 +3733,7 @@ def normalize_host(host):
         ipaddress.ip_address(name)
         valid = True
     except ValueError:
-        labels = name.rstrip(".").split(".")
+        labels = name.removesuffix(".").split(".")
         valid = (len(name) <= 253 and all(HOST_LABEL.fullmatch(l) for l in labels)
                  # A single long word is far more likely a key than a host,
                  and not (len(labels) == 1 and len(name) > 24)
