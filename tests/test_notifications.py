@@ -55,7 +55,7 @@ class FakeBus:
             serial += 1
             if member == "Hello":
                 body = h.DBusWriter(); body.string(":1.42")
-                writer.write(self.reply(serial, fields, "s", body))
+                writer.write(self.reply(serial, fields, "s", body, sender="org.freedesktop.DBus"))
                 # Signals for other things arrive too; they must be ignored.
                 writer.write(self.signal(serial + 1, "org.freedesktop.DBus", "NameAcquired", "s", body))
             elif member == "AddMatch":

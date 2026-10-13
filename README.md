@@ -438,15 +438,15 @@ machine, against roughly 30 Mbit/s for a busy wall.
 If you installed with `omarchy plugin add`:
 
 ```bash
-eld-unifi-protect enabled-streams      # streams to turn off in Protect, if you want
-eld-unifi-protect stop --sign-out      # stop it, sign out recordings sessions
+helper=~/.config/omarchy/plugins/com.eldtechnologies.unifi-protect/bin/eld-unifi-protect
+"$helper" enabled-streams              # streams to turn off in Protect, if you want
+"$helper" stop --sign-out              # stop it, sign out recordings sessions
 omarchy plugin remove com.eldtechnologies.unifi-protect
 rm -rf ~/.config/eld-unifi-protect ~/.local/state/eld-unifi-protect "$XDG_RUNTIME_DIR/eld-unifi-protect"
 secret-tool clear service eld-unifi-protect
 secret-tool clear service eld-unifi-protect-login
 ```
 
-(Without `./install.sh`, the command is `~/.config/omarchy/plugins/com.eldtechnologies.unifi-protect/bin/eld-unifi-protect`.)
 `omarchy plugin remove` deletes only the plugin folder, so the other lines
 stop what is running, sign recordings sessions out on the consoles, and
 delete your settings, API keys and recordings passwords. A locked keyring

@@ -44,8 +44,12 @@ if [[ $purge == "--purge" ]]; then
   kept=0
   if command -v secret-tool >/dev/null; then
     for service in eld-unifi-protect eld-unifi-protect-login; do
-      secret-tool clear service "$service" 2>/dev/null || true
-      if [[ -n $(secret-tool search --all service "$service" 2>/dev/null) ]]; then
+      # Exit 1 with nothing on stderr: nothing (unlocked) to clear. Anything
+      # on stderr: the keyring could not be reached.
+      if ! err=$(secret-tool clear service "$service" 2>&1) && [[ -n $err ]]; then
+        echo "Could not clear $service from the keyring: $err" >&2
+        kept=1
+      elif [[ -n $(secret-tool search --all service "$service" 2>/dev/null) ]]; then
         echo "The keyring kept items for $service (it may be locked)." >&2
         kept=1
       fi
@@ -62,9 +66,11 @@ if [[ $purge == "--purge" ]]; then
 else
   echo "Removed. Your config is still in $config_dir"
 fi
-if [[ $streams == *"switched on in Protect ("* ]]; then
+if [[ -n $streams ]]; then
   echo
   echo "$streams"
+else
+  echo "Streams the plugin switched on stay on in Protect (camera → Settings → Advanced)."
 fi
 echo "Desktop notifications it showed may still be in your notification history"
 echo "(Omarchy: ~/.local/state/omarchy/notifications)."

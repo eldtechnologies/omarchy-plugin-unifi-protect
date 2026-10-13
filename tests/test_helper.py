@@ -288,27 +288,28 @@ class RelayLiveness(unittest.TestCase):
 
 
 class ConsoleInput(unittest.TestCase):
-    def test_two_settings_changes_at_once_both_count(self):
-        # Two clicks, two helpers, both started from the same cameras.json.
+    def test_settings_changes_apply_to_cameras_json_as_it_is_now(self):
         h.save_prefs(h.load_prefs())
-        first, second = h.load_prefs(), h.load_prefs()
-        before1, before2 = json.loads(json.dumps(first)), json.loads(json.dumps(second))
-        first["alerts"]["cam1"] = ["person"]
-        second["alerts"]["cam2"] = ["ring"]
-        second["hidden"] = ["cam9"]
-        h.save_prefs_changes(before1, first)
-        h.save_prefs_changes(before2, second)
-        final = h.load_prefs()
-        self.assertEqual(final["alerts"], {"cam1": ["person"], "cam2": ["ring"]})
-        self.assertEqual(final["hidden"], ["cam9"])
+        # Two helpers arming different cameras both count...
+        h.update_prefs(lambda p: p["alerts"].__setitem__("cam1", ["person"]))
+        h.update_prefs(lambda p: p["alerts"].__setitem__("cam2", ["ring"]))
+        self.assertEqual(h.load_prefs()["alerts"], {"cam1": ["person"], "cam2": ["ring"]})
+        # ...and a quick second click that undoes the first wins.
+        h.update_prefs(lambda p: p["alerts"].pop("cam1", None))
+        self.assertEqual(h.load_prefs()["alerts"], {"cam2": ["ring"]})
+        h.update_prefs(lambda p: p.update(favorite="cam2"))
+        h.update_prefs(lambda p: p.update(favorite=""))
+        self.assertEqual(h.load_prefs()["favorite"], "")
 
     def test_console_addresses_are_ip_addresses_or_host_names(self):
         for good, expected in (("192.168.1.1", "192.168.1.1"), ("https://nvr.local/", "nvr.local"),
                                ("10.0.0.2:443", "10.0.0.2"), ("10.0.0.2:8443", "10.0.0.2:8443"),
-                               ("[fd00::1]", "[fd00::1]"), ("unifi", "unifi")):
+                               ("[fd00::1]", "[fd00::1]"), ("unifi", "unifi"),
+                               ("UNVR-Pro-Garage2.local", "UNVR-Pro-Garage2.local"), ("my_nvr.lan", "my_nvr.lan")):
             self.assertEqual(h.normalize_host(good), expected)
         for bad in ("abcdefghijklmnopqrstuvwxyz0123456789ABCD", "nvr;rm -rf", "-x", "a b", "h:99999",
-                    "192.168.1.1Zq7XkP2mN9vB4cR8tY1wL6hJ3dF5gS0a", "Zq7XkP2mN9vB4c.lan", "192.168.1.256"):
+                    "192.168.1.1Zq7XkP2mN9vB4cR8tY1wL6hJ3dF5gS0a", "Zq7XkP2mN9vB4cR8tY1wL6hJ3dF5gS0a.lan",
+                    "192.168.1.256"):
             with self.assertRaises(h.ProtectError, msg=bad):
                 h.normalize_host(bad)
 

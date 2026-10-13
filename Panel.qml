@@ -724,9 +724,9 @@ Panel {
     if (/^\d+$/.test(labels[0])) return false
     for (var i = 0; i < labels.length; i++) {
       var label = labels[i]
-      if (!/^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label)) return false
-      // Long, mixed case and digits: far more likely a key than a host name.
-      if (label.length > 12 && /[A-Z]/.test(label) && /[a-z]/.test(label) && /\d/.test(label)) return false
+      if (!/^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$/.test(label)) return false
+      // A long run of letters and digits with no hyphen: a pasted key.
+      if (label.length >= 30 && label.indexOf("-") < 0) return false
     }
     return true
   }

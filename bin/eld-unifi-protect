@@ -558,24 +558,26 @@ def _ensure_relay():
 
 
 ENABLED_STREAMS_PATH = os.path.join(STATE_DIR, "enabled-streams.json")
+ENABLED_STREAMS_LOCK = threading.RLock()
 
 
 def record_enabled_streams(console_id, camera_id, qualities):
     """Remember streams this plugin switched on in Protect, so `doctor` and
     uninstalling can say which to turn off again."""
     try:
-        with open(ENABLED_STREAMS_PATH) as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    key = f"{console_id}_{camera_id}"
-    data[key] = sorted(set(data.get(key, [])) | set(qualities))
-    try:
-        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-        write_json(ENABLED_STREAMS_PATH, data)
-    except OSError:
+        with file_lock(os.path.join(RUNTIME_DIR, "enabled-streams.lock"), ENABLED_STREAMS_LOCK):
+            try:
+                with open(ENABLED_STREAMS_PATH) as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            key = f"{console_id}_{camera_id}"
+            data[key] = sorted(set(data.get(key, [])) | set(qualities))
+            os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+            write_json(ENABLED_STREAMS_PATH, data)
+    except (OSError, ProtectError):
         pass
 
 
@@ -1379,11 +1381,17 @@ def armed_cameras(config, prefs):
 
 
 def read_ack():
+    """When alerts were last seen and cleared, never later than now (after the
+    clock steps back, a time in the future would hide every new alert)."""
     try:
         with open(ALERTS_ACK_PATH) as handle:
-            return json.load(handle)
+            ack = json.load(handle)
     except (OSError, ValueError):
         return {}
+    if not isinstance(ack, dict):
+        return {}
+    now = time.time()
+    return {k: min(v, now) if isinstance(v, (int, float)) else v for k, v in ack.items()}
 
 
 def alert_image_path(name):
@@ -1645,7 +1653,10 @@ class DBusConnection:
 
     async def call(self, destination, path, interface, member, signature="", body=b"", timeout=10,
                    sender=None):
-        """Call a method; with sender, replies from anyone else are ignored."""
+        """Call a method; replies from anyone but the expected sender (the bus
+        itself for its own methods) are ignored."""
+        if sender is None and destination == "org.freedesktop.DBus":
+            sender = "org.freedesktop.DBus"
         self.serial += 1
         serial = self.serial
         self.writer.write(dbus_call(serial, destination, path, interface, member, signature, body))
@@ -1867,9 +1878,12 @@ class AlertListener:
             pass  # no event loop (called outside the listener)
 
     async def capture(self, console_id, camera, alert):
-        now = time.time()
+        if plugin_gone():
+            return
+        now = time.monotonic()     # throttles: a wall-clock step must not silence them
         console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
-        if console is not None and now - self.last_captured.get(camera["uid"], 0) >= CAPTURE_EVERY:
+        last = self.last_captured.get(camera["uid"])
+        if console is not None and (last is None or now - last >= CAPTURE_EVERY):
             self.last_captured[camera["uid"]] = now
             try:
                 data = await asyncio.to_thread(
@@ -1890,8 +1904,9 @@ class AlertListener:
         """Desktop notification for a new alert, at most once a minute per camera."""
         if not self.notify_enabled or not session_bus_path():
             return
-        now = time.time()
-        if now - self.last_notified.get(camera["uid"], 0) < NOTIFY_EVERY:
+        now = time.monotonic()
+        last = self.last_notified.get(camera["uid"])
+        if last is not None and now - last < NOTIFY_EVERY:
             return
         self.last_notified[camera["uid"]] = now
         console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
@@ -2025,7 +2040,8 @@ def cmd_stop(args):
         config = load_config(keys=False, demo=False) or {"consoles": []}
         for console in config["consoles"]:
             if console.get("loginUser"):
-                if end_session(console, config):
+                # The login stays: so does a record that its password was rejected.
+                if end_session(console, config, clear_rejected=False):
                     stopped.append(f"recordings session on {console['name']}")
                 else:
                     failed.append(console["name"])
@@ -2054,7 +2070,6 @@ def cmd_events(args):
 
 def cmd_alert(args):
     prefs = load_prefs()
-    before = json.loads(json.dumps(prefs))
     if args.ack or args.clear:
         ack = read_ack()
         ack["ackedAt"] = time.time()
@@ -2075,7 +2090,7 @@ def cmd_alert(args):
     if args.notify:
         refuse_in_demo()
         prefs["notify"] = args.notify == "on"
-        save_prefs_changes(before, prefs)
+        update_prefs(lambda p: p.update(notify=prefs["notify"]))
         poll_cameras()   # the panel reads the setting from the state file
         print("alert notifications " + ("on" if prefs["notify"] else "off"))
         return
@@ -2098,16 +2113,15 @@ def cmd_alert(args):
     camera = matches[0]
     refuse_in_demo()
     if args.off:
-        prefs["alerts"].pop(camera_key(camera), None)
+        update_prefs(lambda p: p["alerts"].pop(camera_key(camera), None))
         print(f"alerts off: {camera['name']}")
     else:
         triggers = [t.strip() for t in (args.on or ",".join(DEFAULT_TRIGGERS)).split(",") if t.strip()]
         unknown = [t for t in triggers if t not in ALERT_TRIGGERS]
         if unknown:
             raise ProtectError(f"unknown trigger {unknown[0]!r}; choose from {', '.join(ALERT_TRIGGERS)}")
-        prefs["alerts"][camera_key(camera)] = triggers
+        update_prefs(lambda p: p["alerts"].__setitem__(camera_key(camera), triggers))
         print(f"alerts on: {camera['name']} ({', '.join(triggers)})")
-    save_prefs_changes(before, prefs)
     poll_cameras()
 
 
@@ -2634,7 +2648,7 @@ def logout_session(console, session, config=None):
         return False
 
 
-def end_session(console, config=None):
+def end_session(console, config=None, clear_rejected=True):
     """Take a console's saved session away and sign it out on the console.
 
     Taken under the sessions lock, so a helper signing in at the same moment
@@ -2647,7 +2661,8 @@ def end_session(console, config=None):
         entry = sessions.pop(console["id"], None)
         if entry is not None:
             write_json(SESSIONS_PATH, sessions)
-        set_rejected(console["id"], None)
+        if clear_rejected:
+            set_rejected(console["id"], None)
     if not (isinstance(entry, dict) and entry.get("token")):
         return True
     return logout_session(console, entry, config) if has_login(console) else False
@@ -3103,6 +3118,12 @@ def recordings_for(config, uid, hours=24, motion=False):
     # Only the most recently viewed cameras keep thumbnails (memory is RAM);
     # pruned before as well as after, so stopped listings cannot pile up.
     prune_recordings(keep=folder)
+    # Thumbnails no listed event needs go first, so listings that were
+    # stopped midway cannot pile up in the folder.
+    wanted = {e["id"] + ".jpg" for e in events}
+    for name in os.listdir(folder):
+        if name not in wanted:
+            os.remove(os.path.join(folder, name))
     budget = {"left": THUMBNAILS_BUDGET}
     budget_lock = threading.Lock()
 
@@ -3122,11 +3143,6 @@ def recordings_for(config, uid, hours=24, motion=False):
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         events = list(pool.map(thumb, events))
-    # Thumbnails of events that dropped out of the window go too.
-    wanted = {e["id"] + ".jpg" for e in events}
-    for name in os.listdir(folder):
-        if name not in wanted:
-            os.remove(os.path.join(folder, name))
     prune_recordings(keep=folder)
     return dict(result, events=events)
 
@@ -3261,30 +3277,19 @@ def refuse_in_demo():
         raise ProtectError("demo mode is on; camera settings can't be changed")
 
 
-def save_prefs_changes(before, after):
-    """Apply what a command changed (before -> after) to cameras.json as it
-    is now, under the lock only for that moment: commands that poll the
-    consoles for seconds no longer hold it, and none loses another's change."""
+def update_prefs(change):
+    """Apply one command's own change to cameras.json as it is right now.
+
+    Under the lock only for that moment (commands that poll consoles for
+    seconds do not hold it), and as an operation, not a diff: a second click
+    that undoes the first wins, and no change from another helper is lost.
+    Returns what change returns.
+    """
     with prefs_lock():
-        current = load_prefs()
-        for key, value in after.items():
-            old = before.get(key)
-            if value == old:
-                continue
-            if isinstance(value, dict) and isinstance(old, dict) and isinstance(current.get(key), dict):
-                for k in set(old) | set(value):
-                    if old.get(k) != value.get(k):
-                        if k in value:
-                            current[key][k] = value[k]
-                        else:
-                            current[key].pop(k, None)
-            elif isinstance(value, list) and isinstance(old, list) and isinstance(current.get(key), list):
-                gone = set(old) - set(value)
-                kept = [x for x in current[key] if x not in gone]
-                current[key] = kept + [x for x in value if x not in old and x not in kept]
-            else:
-                current[key] = value
-        save_prefs(current)
+        prefs = load_prefs()
+        result = change(prefs)
+        save_prefs(prefs)
+        return result
 
 
 def save_prefs(prefs):
@@ -3344,7 +3349,11 @@ def merge_cameras(cameras):
     """
     best = {}
     order = []
+    seen = set()
     for camera in cameras:
+        if camera["uid"] in seen:
+            continue      # a console listing one camera twice
+        seen.add(camera["uid"])
         key = camera["mac"] or camera["uid"]
         if key not in best:
             best[key] = camera
@@ -3464,12 +3473,13 @@ def load_index():
 
 def refresh_snapshots(config, cameras, index):
     clients = {c["id"]: Protect(c, config) for c in config["consoles"]}
+    started = time.time()
     budget = {"left": SNAPSHOT_BUDGET}
     budget_lock = threading.Lock()
 
     def grab(camera):
         client = clients.get(camera.get("console"))
-        if client is None or not camera.get("online"):
+        if client is None or not camera.get("online") or plugin_gone():
             return None
         try:
             data = client.snapshot(camera["id"])
@@ -3501,6 +3511,21 @@ def refresh_snapshots(config, cameras, index):
     # Snapshots of cameras no longer listed go: nothing a console once
     # listed stays in memory for good.
     listed = {c["uid"] for c in cameras}
+    # And everything kept counts: older snapshots of cameras not refreshed
+    # this round go, oldest first, until the budget holds.
+    try:
+        kept = sorted((os.path.join(SNAP_DIR, n) for n in os.listdir(SNAP_DIR) if n.endswith(".jpg")),
+                      key=lambda f: os.stat(f).st_mtime)
+        total = sum(os.path.getsize(f) for f in kept)
+        fresh = {snapshot_path(u) for u, t in index.items() if t >= started}
+        for path in kept:
+            if total <= SNAPSHOT_BUDGET:
+                break
+            if path not in fresh:
+                total -= os.path.getsize(path)
+                os.remove(path)
+    except OSError:
+        pass
     for uid in [u for u in index if u not in listed]:
         index.pop(uid)
     try:
@@ -3560,12 +3585,22 @@ def save_console(config, existing, host, pin, key, name):
     return entry, where
 
 
-HOST_LABEL = re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+HOST_LABEL = re.compile(r"[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?")
 
 
 def looks_like_key(label):
-    return (len(label) > 12 and any(c.isupper() for c in label)
-            and any(c.islower() for c in label) and any(c.isdigit() for c in label))
+    """A pasted API key: a long run of letters and digits with no hyphen."""
+    return len(label) >= 30 and "-" not in label
+
+
+def typed_host(raw, config):
+    """The address typed in setup: a saved console's address exactly as saved
+    (older versions saved some the stricter check now refuses), else checked."""
+    text = raw.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+    for console in (config or {}).get("consoles", []):
+        if console.get("host") == text:
+            return text
+    return normalize_host(raw)
 
 
 def same_host(stored, host):
@@ -3603,8 +3638,7 @@ def normalize_host(host):
         valid = (len(name) <= 253 and all(HOST_LABEL.fullmatch(l) for l in labels)
                  # A single long word is far more likely a key than a host,
                  and not (len(labels) == 1 and len(name) > 24)
-                 # as is a long label mixing cases and digits (host names are
-                 # case-insensitive and rarely look like that),
+                 # as is any long label without a hyphen,
                  and not any(looks_like_key(l) for l in labels)
                  # and anything that starts like an IP address must be one:
                  # a key pasted after "192.168.1.1" is not a host name.
@@ -3618,7 +3652,7 @@ def normalize_host(host):
 
 def cmd_setup_probe(args):
     """Panel setup, step 1: reach the console and report its certificate."""
-    host = normalize_host(args.host)
+    host = typed_host(args.host, load_config(keys=False))
     if not host:
         raise ProtectError("enter the console's address")
     try:
@@ -3646,7 +3680,7 @@ def cmd_setup_save(args):
     key = sys.stdin.readline().strip()
     # The panel sends the name on the next line, off the command line.
     name = sys.stdin.readline().strip() or args.name or ""
-    host = normalize_host(args.host)
+    host = typed_host(args.host, load_config(keys=False))
     if demo_on():
         raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = load_config() or {"consoles": [], "timeoutSec": 8}
@@ -3685,7 +3719,7 @@ def cmd_setup(args):
     default_host = "" if consoles else "192.168.1.1"
     prompt = f"Console address [{default_host}]: " if default_host else "Console address: "
     host = input(prompt).strip() or default_host
-    host = normalize_host(host)
+    host = typed_host(host, config)
     if not host:
         raise ProtectError("no address given")
     existing = next((c for c in consoles if same_host(c["host"], host)), {})
@@ -3891,14 +3925,22 @@ def cmd_login(args):
             trial.logout()
             raise
         with sessions_lock():
+            # Whatever is saved now (another helper may have signed the old
+            # account in again meanwhile) is replaced, and signed out below.
+            replaced = load_sessions().get(console["id"])
             set_rejected(console["id"], None)
             restore_session(console["id"], trial.session)
-        if isinstance(old_session, dict) and old_session.get("token"):
-            logout_session(console, old_session, config)
+        old = [s for s in (old_session, replaced) if isinstance(s, dict) and s.get("token")
+               and s.get("token") != (trial.session or {}).get("token")]
+        unconfirmed = [s for s in {s["token"]: s for s in old}.values()
+                       if not logout_session(dict(console, loginUser=previous.get("loginUser") or user), s, config)]
     finally:
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
     poll_cameras(config)
+    if unconfirmed:
+        print("The console did not confirm signing out the previous session; it may last until it "
+              "expires.", file=sys.stderr)
     if args.json:
         print(json.dumps({"console": console["id"], "name": console["name"], "store": where}))
     else:
@@ -4034,6 +4076,12 @@ def cmd_cameras(args):
         status = "online " if camera["online"] else "OFFLINE"
         status += " hidden" if camera.get("hidden") else "       "
         print(f"{status}  {camera['uid']:<40} {camera['consoleName']:<12} {camera['name']}  ({camera['model']})")
+    conflicts = [c for c in state["cameras"] if c.get("macConflict")]
+    if conflicts:
+        # Two consoles report one camera online: one of them may be lying.
+        print("! these cameras share a MAC address across consoles, so their settings are kept\n"
+              "  per console and earlier ones no longer apply; check which console is right: "
+              + ", ".join(f"{c['name']} ({c['consoleName']})" for c in conflicts), file=sys.stderr)
 
 
 def cmd_snapshot(args):
@@ -4210,27 +4258,22 @@ def cmd_doctor(args):
 def cmd_hide(args, hide=True):
     refuse_in_demo()
     state = poll_cameras(require_config())
-    prefs = load_prefs()
-    before = json.loads(json.dumps(prefs))
-    hidden = set(prefs["hidden"])
+    keys = set()
     for wanted in args.cameras:
         matches = find_cameras(state["cameras"], wanted)
         if not matches:
             raise ProtectError(f"no camera {wanted!r}; see `eld-unifi-protect cameras`")
         for camera in matches:
-            (hidden.add if hide else hidden.discard)(camera_key(camera))
+            keys.add(camera_key(camera))
             print(("hidden   " if hide else "visible  ") + camera["name"] + "  ·  " + camera["consoleName"])
-    prefs["hidden"] = sorted(hidden)
-    save_prefs_changes(before, prefs)
+    update_prefs(lambda p: p.update(hidden=sorted(set(p["hidden"]) | keys if hide
+                                                  else set(p["hidden"]) - keys)))
     poll_cameras()
 
 
 def cmd_unhide(args):
     if args.all:
-        prefs = load_prefs()
-        before = json.loads(json.dumps(prefs))
-        prefs["hidden"] = []
-        save_prefs_changes(before, prefs)
+        update_prefs(lambda p: p.update(hidden=[]))
         poll_cameras()
         print("all cameras visible")
         return
@@ -4241,10 +4284,9 @@ def cmd_unhide(args):
 
 def cmd_read_only(args):
     prefs = load_prefs()
-    before = json.loads(json.dumps(prefs))
     if args.mode != "status":
         prefs["readOnly"] = args.mode == "on"
-        save_prefs_changes(before, prefs)
+        update_prefs(lambda p: p.update(readOnly=prefs["readOnly"]))
         # Cached URLs may include fallbacks chosen under the other setting.
         try:
             os.remove(STREAM_CACHE)
@@ -4258,11 +4300,8 @@ def cmd_read_only(args):
 
 def cmd_favorite(args):
     refuse_in_demo()
-    prefs = load_prefs()
-    before = json.loads(json.dumps(prefs))
     if args.clear or not args.camera:
-        prefs["favorite"] = ""
-        save_prefs_changes(before, prefs)
+        update_prefs(lambda p: p.update(favorite=""))
         poll_cameras()
         print("no favourite camera")
         return
@@ -4271,23 +4310,19 @@ def cmd_favorite(args):
     if len(matches) != 1:
         raise ProtectError(f"{args.camera!r} matches {len(matches)} cameras; use its id "
                            "from `eld-unifi-protect cameras`")
-    prefs["favorite"] = camera_key(matches[0])
-    save_prefs_changes(before, prefs)
+    update_prefs(lambda p: p.update(favorite=camera_key(matches[0])))
     poll_cameras()
     print(f"favourite: {matches[0]['name']}  ·  {matches[0]['consoleName']}")
 
 
 def cmd_hide_offline(args):
     refuse_in_demo()
-    prefs = load_prefs()
-    before = json.loads(json.dumps(prefs))
-    if args.mode == "toggle":
-        prefs["hideOffline"] = not prefs["hideOffline"]
-    else:
-        prefs["hideOffline"] = args.mode == "on"
-    save_prefs_changes(before, prefs)
+    def change(p):
+        p["hideOffline"] = (not p["hideOffline"]) if args.mode == "toggle" else args.mode == "on"
+        return p["hideOffline"]
+    hidden = update_prefs(change)
     poll_cameras()
-    print("offline cameras " + ("hidden" if prefs["hideOffline"] else "shown"))
+    print("offline cameras " + ("hidden" if hidden else "shown"))
 
 
 WALL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "wall")

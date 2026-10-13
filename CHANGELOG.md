@@ -33,9 +33,10 @@ Security-focused hardening release.
   as HTML could make the wall load an image from anywhere) and stripped of
   terminal escape sequences. Snapshots and thumbnails share memory
   budgets. A console can no longer pose as, hide or change the settings of
-  another console's camera, and a console's alerts can no longer be dated
-  so they are never cleared; a flood of alerts is capped at ten new ones
-  per camera per minute.
+  another console's camera (when two consoles report one camera online,
+  both are shown with settings kept per console, and `cameras` warns), and
+  a console's alerts can no longer be dated so they are never cleared; a
+  flood of alerts is capped at ten new ones per camera per minute.
 - **Setup:** a changed console certificate must be confirmed explicitly and
   the API key typed again (`trust-cert` is for a fingerprint checked on the
   console itself, and `--pin` replaces `--yes`); addresses are checked
