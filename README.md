@@ -47,7 +47,8 @@ Version 0.4.1 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologie
   window: `omarchy pkg add mpv`
 - For [recordings](#recordings), optional: a local UniFi account on each
   console that records
-- `notify-send` from `libnotify` for alert notifications (ships with Omarchy)
+- A notification daemon, such as the one that ships with Omarchy, for alert
+  notifications
 
 ## Install
 

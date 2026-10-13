@@ -298,8 +298,10 @@ Panel {
     // From the live view the pop-out keeps its sound state; from the grid it
     // starts at the default.
     var sound = root.liveMode ? !root.muted : root.soundDefault
+    // No camera name here: command lines are visible to other users, so
+    // the helper looks the name up itself.
     Quickshell.execDetached([root.cli, "live", camera.uid,
-                             "--quality", root.popoutQuality, "--title", camera.name,
+                             "--quality", root.popoutQuality,
                              "--sound", sound ? "on" : "off"])
     root.closeLive()
     root.close()
@@ -476,7 +478,7 @@ Panel {
     if (!root.playingClip) return
     var clip = root.playingClip
     var args = [root.cli, "clip", root.liveCamera.uid, "--start", String(clip.eventStart),
-                "--quality", root.popoutQuality, "--play", "--title", root.liveCamera.name,
+                "--quality", root.popoutQuality, "--play",
                 "--sound", root.muted ? "off" : "on"]
     if (clip.eventEnd) args.push("--end", String(clip.eventEnd))
     Quickshell.execDetached(args)
