@@ -231,7 +231,7 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         os.remove(h.CONFIG_PATH)
 
     def test_a_failure_from_the_future_does_not_block(self):
-        h.write_json(h.SESSIONS_PATH, {"nvr": {"failed": time.time() + 3600, "error": "x", "rejected": True}})
+        h.write_json(h.SESSIONS_PATH, {"nvr": {"failed": time.time() + 3600, "error": "x", "rejected": False}})
         self.assertEqual(len(h.recordings_for(self.config, f"nvr_{CAMERA}")["events"]), 2)
 
     def test_reads_are_bounded_in_time_and_must_be_whole(self):
@@ -246,6 +246,25 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         with self.assertRaisesRegex(h.ProtectError, "partway|mid-answer"):
             h.read_body(response, 1 << 20)
         conn.finish()
+
+    def test_clip_output_is_private_and_never_follows_a_link(self):
+        start = time.time() - 60
+        h.save_config(self.config)
+        target = os.path.join(tempfile.mkdtemp(), "door.mp4")
+        args = argparse.Namespace(camera=f"nvr_{CAMERA}", start=start, end=start + 12, quality="low",
+                                  output=target, play=False, title=None, sound="on", json=False)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_clip(args)
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o600)
+        victim = target + ".victim"
+        open(victim, "w").close()
+        link = target + ".link"
+        os.symlink(victim, link)
+        args.output = link
+        with self.assertRaises(h.ProtectError), mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_clip(args)
+        self.assertEqual(os.path.getsize(victim), 0)
+        os.remove(h.CONFIG_PATH)
 
     def test_no_login_asks_for_one(self):
         del self.console["loginUser"]

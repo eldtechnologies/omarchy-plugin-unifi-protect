@@ -1902,6 +1902,7 @@ def cmd_alert(args):
             prune_alert_images(set())
         return
     if args.notify:
+        refuse_in_demo()
         prefs["notify"] = args.notify == "on"
         save_prefs(prefs)
         poll_cameras()   # the panel reads the setting from the state file
@@ -1924,6 +1925,7 @@ def cmd_alert(args):
         raise ProtectError(f"{args.camera!r} matches {len(matches)} cameras; use its id "
                            "from `eld-unifi-protect cameras`")
     camera = matches[0]
+    refuse_in_demo()
     if args.off:
         prefs["alerts"].pop(camera_key(camera), None)
         print(f"alerts off: {camera['name']}")
@@ -2055,11 +2057,19 @@ def build_demo_camera(slug, name):
     return camera_id
 
 
+# What `demo on` moves aside and `demo off` puts back (in RUNTIME_DIR).
+DEMO_SET_ASIDE = ("alerts.json", "alerts-ack.json", "alerts", "snapshots", "recordings", "clips")
+DEMO_ASIDE = os.path.join(RUNTIME_DIR, "before-demo")
+
+
 def cmd_demo(args):
     if args.mode == "status":
         print("demo mode " + ("on" if demo_on() else "off"))
         return
     if args.mode == "off":
+        if not demo_on():
+            print("demo mode is already off")
+            return
         for path in (DEMO_FLAG, ALERTS_PATH, ALERTS_ACK_PATH, SNAP_INDEX):
             try:
                 os.remove(path)
@@ -2067,9 +2077,22 @@ def cmd_demo(args):
                 pass
         for folder in (DEMO_DIR, ALERT_IMAGES_DIR, SNAP_DIR, RECORDINGS_DIR, CLIPS_DIR):
             shutil.rmtree(folder, ignore_errors=True)
+        # Your own alert log and pictures, set aside by `demo on`, come back.
+        for name in DEMO_SET_ASIDE:
+            kept = os.path.join(DEMO_ASIDE, name)
+            if os.path.exists(kept):
+                os.replace(kept, os.path.join(RUNTIME_DIR, name))
+        shutil.rmtree(DEMO_ASIDE, ignore_errors=True)
         poll_cameras()
         print("demo mode off; your consoles are back")
         return
+    # Set your own alert log, snapshots and recordings aside, untouched.
+    if not demo_on():
+        os.makedirs(DEMO_ASIDE, mode=0o700, exist_ok=True)
+        for name in DEMO_SET_ASIDE:
+            path = os.path.join(RUNTIME_DIR, name)
+            if os.path.exists(path):
+                os.replace(path, os.path.join(DEMO_ASIDE, name))
     os.makedirs(DEMO_DIR, mode=0o700, exist_ok=True)
     print("rendering demo cameras…")
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -2327,7 +2350,11 @@ def summarize_camera(camera, console):
 LOGIN_SERVICE = KEYRING_SERVICE + "-login"
 PRIVATE_API = "/proxy/protect/api"
 SESSIONS_PATH = os.path.join(RUNTIME_DIR, "sessions.json")
-SESSIONS_LOCK = threading.Lock()
+SESSIONS_THREAD_LOCK = threading.RLock()
+
+
+def sessions_lock():
+    return file_lock(os.path.join(RUNTIME_DIR, "sessions.lock"), SESSIONS_THREAD_LOCK)
 LOGIN_RETRY_AFTER = 600   # seconds before helpers try a rejected login again
 RECORDINGS_DIR = os.path.join(RUNTIME_DIR, "recordings")
 CLIPS_DIR = os.path.join(RUNTIME_DIR, "clips")
@@ -2336,6 +2363,8 @@ CLIP_MAX_SECONDS = 300      # longer events are cut to their first five minutes
 CLIP_ONGOING_SECONDS = 60   # an event still in progress: its first minute so far
 CLIPS_MAX_BYTES = 600 * 1024 * 1024   # clips live in RAM (the runtime dir)
 CLIPS_KEEP = 25
+THUMBNAIL_MAX_BYTES = 512 * 1024
+RECORDINGS_KEEP_CAMERAS = 8   # cameras whose thumbnails stay in memory
 CLIP_DEADLINE = 900        # seconds for a whole export, even a slow 600 MB one
 CLIP_CHANNELS = {"high": 0, "medium": 1, "low": 2}
 RECORDING_KINDS = ("person", "vehicle", "animal", "package", "face", "licensePlate")
@@ -2385,7 +2414,7 @@ def store_login(console, user, password):
 
 def restore_session(console_id, entry):
     """Put a console's sessions.json entry back as it was (or remove it)."""
-    with SESSIONS_LOCK:
+    with sessions_lock():
         sessions = load_sessions()
         if entry is None:
             sessions.pop(console_id, None)
@@ -2437,7 +2466,7 @@ def load_sessions():
 
 
 def forget_session(console_id):
-    with SESSIONS_LOCK:
+    with sessions_lock():
         sessions = load_sessions()
         if sessions.pop(console_id, None) is not None:
             write_json(SESSIONS_PATH, sessions)
@@ -2540,8 +2569,9 @@ class ProtectSession:
         self.name, self.port = split_host(self.host)
         self.pin = console.get("certSha256")
         self.timeout = float((config or {}).get("timeoutSec", 8))
-        # A trial of new credentials (`login`) starts clean: no saved session,
-        # no remembered failure.
+        # A trial of new credentials (`login`) starts clean (no saved session,
+        # no remembered failure) and writes nothing until `login` keeps it.
+        self.persist = not fresh
         saved = None if fresh else load_sessions().get(console["id"])
         # Thumbnails are fetched four at a time through one session.
         self.lock = threading.Lock()
@@ -2550,7 +2580,9 @@ class ProtectSession:
         # locks accounts out after a burst of failures. `login` clears it.
         self.login_error, self.login_rejected, self.session = None, False, None
         if isinstance(saved, dict) and isinstance(saved.get("failed"), (int, float)):
-            if 0 <= time.time() - saved["failed"] < LOGIN_RETRY_AFTER:
+            # A rejected password stays rejected until `login` replaces it;
+            # rate limiting and the like are retried after a while.
+            if saved.get("rejected") or 0 <= time.time() - saved["failed"] < LOGIN_RETRY_AFTER:
                 self.login_error = str(saved.get("error") or "sign-in failed")
                 self.login_rejected = bool(saved.get("rejected"))
         elif isinstance(saved, dict) and saved.get("token"):
@@ -2558,7 +2590,9 @@ class ProtectSession:
 
     def fail_login(self, message, rejected):
         """Remember a failed sign-in for every helper process, then raise."""
-        with SESSIONS_LOCK:
+        if not self.persist:
+            raise (LoginRejected if rejected else ProtectError)(message)
+        with sessions_lock():
             sessions = load_sessions()
             sessions[self.console["id"]] = {"failed": time.time(), "error": message, "rejected": rejected}
             write_json(SESSIONS_PATH, sessions)
@@ -2612,10 +2646,8 @@ class ProtectSession:
         self.session = {"token": token, "expires": token_expiry(token),
                         "csrf": response.headers.get("X-Updated-CSRF-Token")
                                 or response.headers.get("X-CSRF-Token") or ""}
-        with SESSIONS_LOCK:
-            sessions = load_sessions()
-            sessions[self.console["id"]] = self.session
-            write_json(SESSIONS_PATH, sessions)
+        if self.persist:
+            restore_session(self.console["id"], self.session)
 
     def logout(self):
         """End the saved session on the console too; best effort."""
@@ -2712,10 +2744,11 @@ class ProtectSession:
             events.append({"id": event_id, "kind": event_kind(event), "start": start,
                            "end": event_time(event.get("end")),
                            "score": event.get("score") if isinstance(event.get("score"), int) else None})
-        return sorted(events, key=lambda e: e["start"], reverse=True)
+        return sorted(events, key=lambda e: e["start"], reverse=True)[:limit]
 
     def thumbnail(self, event_id):
-        data = self.get(f"/events/{event_id}/thumbnail", params={"w": 320})
+        # A w=320 JPEG is tens of KB; nothing bigger is kept in memory.
+        data = self.get(f"/events/{event_id}/thumbnail", params={"w": 320}, limit=THUMBNAIL_MAX_BYTES)
         if not is_complete_jpeg(data):
             raise ProtectError("console sent no thumbnail")
         return data
@@ -2844,6 +2877,14 @@ def recordings_for(config, uid, hours=24, motion=False):
     for name in os.listdir(folder):
         if name not in wanted:
             os.remove(os.path.join(folder, name))
+    # And only the most recently viewed cameras keep theirs: memory is RAM.
+    try:
+        folders = sorted((os.path.join(RECORDINGS_DIR, n) for n in os.listdir(RECORDINGS_DIR)),
+                         key=lambda f: os.stat(f).st_mtime, reverse=True)
+        for old in folders[RECORDINGS_KEEP_CAMERAS:]:
+            shutil.rmtree(old, ignore_errors=True)
+    except OSError:
+        pass
     return dict(result, events=events)
 
 
@@ -2909,7 +2950,53 @@ def load_prefs():
             "notify": bool(prefs.get("notify", True))}
 
 
+class file_lock:
+    """An exclusive flock across helper processes, plus a thread lock.
+
+    Every read-modify-write of a shared file (cameras.json, sessions.json)
+    runs under one, so two quick clicks or two helpers never lose a change.
+    """
+
+    def __init__(self, path, thread_lock):
+        self.path, self.thread_lock = path, thread_lock
+
+    def __enter__(self):
+        self.thread_lock.acquire()
+        try:
+            os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+            for _ in range(600):           # at most 30 s
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return self
+                except BlockingIOError:
+                    time.sleep(0.05)
+            os.close(self.fd)
+            raise ProtectError("another eld-unifi-protect command is busy; try again")
+        except BaseException:
+            self.thread_lock.release()
+            raise
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+        self.thread_lock.release()
+
+
+PREFS_LOCK = threading.RLock()
+
+
+def prefs_lock():
+    return file_lock(os.path.join(RUNTIME_DIR, "prefs.lock"), PREFS_LOCK)
+
+
+def refuse_in_demo():
+    """cameras.json is the real one: demo mode must not change it."""
+    if demo_on():
+        raise ProtectError("demo mode is on; camera settings can't be changed")
+
+
 def save_prefs(prefs):
+    refuse_in_demo()
     write_atomic(PREFS_PATH, json.dumps(prefs, indent=2) + "\n")
 
 
@@ -3429,19 +3516,24 @@ def cmd_login(args):
     old_session = load_sessions().get(console["id"])
     console.pop("loginStore", None)
     console.update(loginUser=user, loginPassword=password)
+    # Stopped by the panel (SIGTERM)? Leave through the finally below.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    trial = ProtectSession(console, config, fresh=True)
+    proven = False
     try:
-        # Prove it before saving: sign in and list one event. The trial starts
-        # clean, but nothing about the saved login changes unless it works.
+        # Prove it before keeping anything: sign in and list one event. The
+        # trial lives in memory only, so the saved login is untouched unless
+        # this works.
         now = time.time()
-        ProtectSession(console, config, fresh=True).events(None, now - 3600, now, limit=1)
-    except ProtectError:
-        for field in ("loginUser", "loginPassword"):
-            console.pop(field, None)
-        console.update(previous)
-        # The trial wrote its own session or failure; put back what the
-        # saved login had (a working session, or its remembered failure).
-        restore_session(console["id"], old_session)
-        raise
+        trial.events(None, now - 3600, now, limit=1)
+        proven = True
+    finally:
+        if not proven:
+            for field in ("loginUser", "loginPassword"):
+                console.pop(field, None)
+            console.update(previous)
+            trial.logout()     # signed in but not allowed to list: sign out
+    restore_session(console["id"], trial.session)
     # The new login works: sign the old session out on the console.
     if isinstance(old_session, dict) and old_session.get("token"):
         logout_session(console, old_session, config)
@@ -3514,7 +3606,13 @@ def cmd_clip(args):
         raise ProtectError("event times must be numbers")
     clip = fetch_clip(config, uid, args.start, args.end, args.quality)
     if args.output:
-        shutil.copyfile(clip["path"], args.output)
+        # Private like everything else, and never through a planted link.
+        try:
+            fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        except OSError as error:
+            raise ProtectError(f"cannot write {args.output}: {error.strerror or error}")
+        with os.fdopen(fd, "wb") as out, open(clip["path"], "rb") as source:
+            shutil.copyfileobj(source, out)
         clip["path"] = args.output
     if args.play:
         player = shutil.which("mpv")
@@ -3733,6 +3831,7 @@ def cmd_doctor(args):
 
 
 def cmd_hide(args, hide=True):
+    refuse_in_demo()
     state = poll_cameras(require_config())
     prefs = load_prefs()
     hidden = set(prefs["hidden"])
@@ -3762,6 +3861,7 @@ def cmd_unhide(args):
 
 
 def cmd_read_only(args):
+    refuse_in_demo()
     prefs = load_prefs()
     if args.mode != "status":
         prefs["readOnly"] = args.mode == "on"
@@ -3778,6 +3878,7 @@ def cmd_read_only(args):
 
 
 def cmd_favorite(args):
+    refuse_in_demo()
     prefs = load_prefs()
     if args.clear or not args.camera:
         prefs["favorite"] = ""
@@ -3797,6 +3898,7 @@ def cmd_favorite(args):
 
 
 def cmd_hide_offline(args):
+    refuse_in_demo()
     prefs = load_prefs()
     if args.mode == "toggle":
         prefs["hideOffline"] = not prefs["hideOffline"]
@@ -3971,6 +4073,10 @@ def check_runtime_dir():
         raise ProtectError(problem)
 
 
+# Commands that change cameras.json; main() runs each under prefs_lock().
+PREFS_COMMANDS = {cmd_alert, cmd_hide, cmd_unhide, cmd_read_only, cmd_favorite, cmd_hide_offline}
+
+
 def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     parser = argparse.ArgumentParser(prog="eld-unifi-protect", description=__doc__.splitlines()[0])
@@ -4097,7 +4203,12 @@ def main():
     args = parser.parse_args()
     try:
         check_runtime_dir()
-        args.func(args)
+        if args.func in PREFS_COMMANDS:
+            # Load, change and save cameras.json as one step across processes.
+            with prefs_lock():
+                args.func(args)
+        else:
+            args.func(args)
     except ProtectError as error:
         # Messages can quote the console; never let it reach the terminal raw
         # (escape sequences can retitle it or write to the clipboard).
