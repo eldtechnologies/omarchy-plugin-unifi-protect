@@ -56,6 +56,17 @@ Security-focused hardening release.
 - `snapshot -o` accepts a bare file name.
 - `alert --clear` now empties the log right away while the listener runs.
 
+### Upgrading
+
+Versions up to 0.4.1 put each camera's Protect stream alias in the player
+URL, and the panel's video player writes that URL to the system journal,
+where other accounts in the `adm`, `wheel` or `systemd-journal` groups can
+read it, across reboots. The alias alone lets anyone on your network watch
+that camera. If other people have accounts on your computer, get new aliases
+by turning each camera's RTSPS stream off and on again in Protect (camera →
+Settings → Advanced), and optionally trim old journal entries with
+`journalctl --vacuum-time`.
+
 ## 0.4.1 — 2026-10-12
 
 ### Security
