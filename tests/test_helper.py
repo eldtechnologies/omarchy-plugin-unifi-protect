@@ -185,6 +185,14 @@ class RelayRewriting(unittest.TestCase):
         here = "rtsp://127.0.0.1:4000/tok/nvr/R1/"
         self.assertTrue(s.keeps_player_here("RTSP/1.0 200 OK", [("Content-Base", here)], b"a=control:" + here.encode()))
         self.assertFalse(s.keeps_player_here("RTSP/1.0 302 Moved", [("Location", here)], b""))
+        # Spellings FFmpeg still reads as a redirect, or as a URL elsewhere.
+        for start in ("RTSP/1.0  302 Moved", "RTSP/1.0\t302 Moved", "RTSP/1.0 0302 Moved",
+                      "RTSP/1.0 +302 Moved", "RTSP/1.1 200 OK", "HTTP/1.0 200 OK"):
+            self.assertFalse(s.keeps_player_here(start, [], b""), start)
+        for value in ("rtsp:198.51.100.7:8554/x", "rtsp:/198.51.100.7/x", "satip:10.0.0.5:554/x",
+                      "RTSPH://evil/x"):
+            self.assertFalse(s.keeps_player_here("RTSP/1.0 200 OK", [("X", value)], b""), value)
+            self.assertFalse(s.keeps_player_here("RTSP/1.0 200 OK", [], b"a=control:" + value.encode()), value)
         for value in ("satip://10.0.0.5:554/x", "rtspu://10.0.0.5/x", "RTSP://evil:554"):
             self.assertFalse(s.keeps_player_here("RTSP/1.0 200 OK", [("Content-Base", value)], b""), value)
         # Path-less console URLs are rewritten to the relay too.

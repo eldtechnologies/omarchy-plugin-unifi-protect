@@ -545,6 +545,19 @@ def _ensure_relay():
     raise ProtectError("the stream relay did not start; run `eld-unifi-protect relay` to see why")
 
 
+def forget_alerts(console_id):
+    """Drop a console's alerts and their pictures; the listener, if running,
+    does the same on its next save (within a minute)."""
+    with open(EVENTS_LOCK, "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        alerts = [a for a in load_alerts() if not str(a.get("uid", "")).startswith(console_id + "_")]
+        write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": alerts, "consoles": {}})
+        prune_alert_images({a.get("image") for a in alerts})
+
+
 def forget_streams(console):
     """Drop a console's cached stream URLs (they hold its aliases) and routes."""
     with STREAM_CACHE_LOCK:
@@ -680,15 +693,15 @@ def loopback_peer_uid(peer, local):
     def endpoint(address):
         host, port = address[:2]
         return f"{socket.inet_aton(host)[::-1].hex().upper()}:{port:04X}"
-    wanted = (endpoint(peer), endpoint(local))
+    wanted = f" {endpoint(peer)} {endpoint(local)} "
     try:
         with open("/proc/net/tcp") as handle:
-            next(handle)
-            for line in handle:
-                parts = line.split()
-                if (parts[1], parts[2]) == wanted:
-                    return int(parts[7])
-    except (OSError, ValueError, IndexError, StopIteration):
+            table = handle.read()
+        at = table.find(wanted)
+        if at >= 0:
+            line = table[table.rfind("\n", 0, at) + 1:table.find("\n", at)]
+            return int(line.split()[7])
+    except (OSError, ValueError, IndexError):
         pass
     return None
 
@@ -851,7 +864,7 @@ class RelaySession:
                 if console is None:
                     await self.reply(404, "Not Found", cseq)
                     return
-                if self.console is not None and console is not self.console:
+                if self.console is not None and console["id"] != self.console["id"]:
                     await self.reply(400, "Bad Request", cseq)
                     return
                 if not self.authenticated:
@@ -889,7 +902,8 @@ class RelaySession:
                     self.client_writer.write(message[1])
                 else:
                     _, start, headers, body = message
-                    headers = [(n, self.to_client(v)) for n, v in headers]
+                    headers = [(n, self.to_client(v)) for n, v in headers
+                               if n.strip().lower() not in self.DROPPED_HEADERS]
                     if body:
                         body = self.to_client(body.decode("latin-1")).encode("latin-1")
                     if not self.keeps_player_here(start, headers, body):
@@ -904,17 +918,27 @@ class RelaySession:
         finally:
             self.close()
 
-    # What a player would follow: RTSP in every spelling FFmpeg accepts.
-    URL_ANYWHERE = re.compile(r"(?:rtsp[su]?|satip)://[^\s;,\"']*", re.I)
+    # A response must look exactly like this, or the player gets a 502: no
+    # odd spacing, signs or leading zeros FFmpeg would still read as 3xx.
+    STATUS_LINE = re.compile(r"RTSP/1\.0 ([1-9][0-9][0-9]) [\x20-\x7e]*")
+    # Any RTSP-ish scheme as FFmpeg would read it ("rtsp:host" too).
+    SCHEME = re.compile(r"(?:rtsp[hsu]?|satip)\s*:", re.I)
+    DROPPED_HEADERS = {"location", "content-location"}
 
     def keeps_player_here(self, start, headers, body):
-        """True unless a console response would send the player elsewhere."""
-        parts = start.split(" ", 2)
-        if len(parts) > 1 and parts[1][:1] == "3":
+        """True unless a console response could send the player elsewhere.
+
+        Only well-formed, non-redirect responses pass, and every RTSP URL
+        in them must already point at this relay.
+        """
+        status = self.STATUS_LINE.fullmatch(start)
+        if not status or status.group(1)[0] == "3":
             return False
-        texts = [v for _, v in headers] + [body.decode("latin-1")]
-        return all(url.startswith(self.local_base)
-                   for text in texts for url in self.URL_ANYWHERE.findall(text))
+        for text in [v for _, v in headers] + [body.decode("latin-1")]:
+            for match in self.SCHEME.finditer(text):
+                if not text.startswith(self.local_base, match.start()):
+                    return False
+        return True
 
     def close(self):
         """Idempotent: either direction ending closes the whole session."""
@@ -936,6 +960,7 @@ class Relay:
     def __init__(self, config=None, lock_inode=None):
         self.consoles = ({c["id"]: c for c in config["consoles"]} if config is not None
                          else relay_consoles())
+        self.peer_checks = asyncio.Semaphore(4)
         self.config_stamp = self.config_mtime()
         self.lock_inode = lock_inode
         self.sessions = set()
@@ -971,9 +996,12 @@ class Relay:
         fresh = relay_consoles()
         for session in list(self.sessions):
             old = session.console
-            if old is not None and (fresh.get(old["id"]) or {}).get("certSha256") != old.get("certSha256"):
+            new = fresh.get(old["id"]) if old is not None else None
+            if old is not None and (new is None or new.get("certSha256") != old.get("certSha256")
+                                    or new.get("host") != old.get("host")):
                 session.close()
         self.consoles = fresh
+        self.routes = {}       # re-read: a removed console's routes are gone
 
     def lookup_route(self, route):
         if route not in self.routes:
@@ -1000,7 +1028,11 @@ class Relay:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         # This user's players only, whatever URL the caller has.
         peer, local = writer.get_extra_info("peername"), writer.get_extra_info("sockname")
-        if not peer or loopback_peer_uid(peer, local) != os.getuid():
+        # Off the event loop, a few at a time: a long /proc/net/tcp must not
+        # stall the streams already playing.
+        async with self.peer_checks:
+            uid = await asyncio.to_thread(loopback_peer_uid, peer, local) if peer else None
+        if uid != os.getuid():
             writer.close()
             return
         self.reload_consoles()
@@ -1024,6 +1056,12 @@ class Relay:
     async def reap_when_idle(self):
         while True:
             await asyncio.sleep(5)
+            # Removed consoles and new certificates take effect within 5 s,
+            # for streams already playing too.
+            try:
+                self.reload_consoles()
+            except ProtectError:
+                pass
             # Uninstalled, or replaced by a newer relay: these files are not
             # ours any more, so leave them alone and go.
             try:
@@ -1690,8 +1728,11 @@ class AlertListener:
         # So is anything dated in the future, which could never be cleared.
         now = time.time()
         cutoff = max(now - ALERTS_MAX_AGE, read_ack().get("clearedAt", 0))
+        # A console that was removed takes its alerts (and pictures) along.
+        known = {c["id"] for c in (self.config or {}).get("consoles", [])} if self.config else None
         self.alerts = [a for a in self.alerts
-                       if cutoff < (a.get("start") or 0) <= now + ALERT_SKEW][-ALERTS_KEEP:]
+                       if cutoff < (a.get("start") or 0) <= now + ALERT_SKEW
+                       and (known is None or str(a.get("uid", "")).split("_")[0] in known)][-ALERTS_KEEP:]
         self.dirty, self.last_save = False, time.monotonic()
         write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": self.alerts,
                                  "consoles": self.status})
@@ -3476,6 +3517,7 @@ def cmd_remove(args):
     clear_login(console, config)
     forget_recordings(console["id"])
     forget_streams(console)
+    forget_alerts(console["id"])
     if console.get("keyStore") == "keyring":
         try:
             keyring_clear(console["id"])
