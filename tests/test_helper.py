@@ -288,6 +288,20 @@ class RelayLiveness(unittest.TestCase):
 
 
 class ConsoleInput(unittest.TestCase):
+    def test_two_settings_changes_at_once_both_count(self):
+        # Two clicks, two helpers, both started from the same cameras.json.
+        h.save_prefs(h.load_prefs())
+        first, second = h.load_prefs(), h.load_prefs()
+        before1, before2 = json.loads(json.dumps(first)), json.loads(json.dumps(second))
+        first["alerts"]["cam1"] = ["person"]
+        second["alerts"]["cam2"] = ["ring"]
+        second["hidden"] = ["cam9"]
+        h.save_prefs_changes(before1, first)
+        h.save_prefs_changes(before2, second)
+        final = h.load_prefs()
+        self.assertEqual(final["alerts"], {"cam1": ["person"], "cam2": ["ring"]})
+        self.assertEqual(final["hidden"], ["cam9"])
+
     def test_console_addresses_are_ip_addresses_or_host_names(self):
         for good, expected in (("192.168.1.1", "192.168.1.1"), ("https://nvr.local/", "nvr.local"),
                                ("10.0.0.2:443", "10.0.0.2"), ("10.0.0.2:8443", "10.0.0.2:8443"),

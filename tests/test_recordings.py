@@ -147,13 +147,15 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         FakeConsole.valid.clear()
         FakeConsole.no_role.clear()
         FakeConsole.password = "right"
-        for path in (h.SESSIONS_PATH,):
+        for path in (h.SESSIONS_PATH, h.REJECTED_PATH, h.CONFIG_PATH):
             if os.path.exists(path):
                 os.remove(path)
         shutil.rmtree(h.CLIPS_DIR, ignore_errors=True)
         self.console = {"id": "nvr", "name": "NVR", "host": f"127.0.0.1:{self.server.server_port}",
                         "certSha256": self.pin, "apiKey": "k", "loginUser": "viewer", "loginPassword": "right"}
         self.config = {"consoles": [self.console]}
+        # Sign-ins check the saved config before they keep a session.
+        h.save_config(self.config)
 
     def test_events_are_filtered_and_classified(self):
         result = h.recordings_for(self.config, f"nvr_{CAMERA}")
@@ -261,10 +263,31 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         link = target + ".link"
         os.symlink(victim, link)
         args.output = link
-        with self.assertRaises(h.ProtectError), mock.patch("sys.stdout", new_callable=io.StringIO):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
             h.cmd_clip(args)
+        # The link is replaced by a new private file; what it pointed at is untouched.
         self.assertEqual(os.path.getsize(victim), 0)
+        self.assertFalse(os.path.islink(link))
+        self.assertEqual(os.stat(link).st_mode & 0o777, 0o600)
+        # An existing looser file, or another link to it, keeps nothing.
+        os.chmod(target, 0o666)
+        other = target + ".hardlink"
+        os.link(target, other)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_clip(argparse.Namespace(**dict(vars(args), output=target)))
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o600)
+        self.assertNotEqual(os.stat(target).st_ino, os.stat(other).st_ino)
         os.remove(h.CONFIG_PATH)
+
+    def test_a_helper_running_during_logout_leaves_no_session_behind(self):
+        h.recordings_for(self.config, f"nvr_{CAMERA}")
+        straggler = h.ProtectSession(dict(self.console), self.config)   # started before logout
+        with mock.patch.object(h, "poll_cameras"), mock.patch("sys.stdout", new_callable=io.StringIO):
+            h.cmd_logout(argparse.Namespace(console="nvr"))
+        with self.assertRaises(h.ProtectError):
+            straggler.events(CAMERA, time.time() - 3600, time.time())   # re-signs in, then sees the logout
+        self.assertNotIn("nvr", h.load_sessions())
+        self.assertEqual(FakeConsole.valid, set())      # every token signed out on the console
 
     def test_no_login_asks_for_one(self):
         del self.console["loginUser"]

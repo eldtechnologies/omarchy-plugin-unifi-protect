@@ -1367,9 +1367,11 @@ def load_alerts():
         if not isinstance(alert, dict) or not EVENT_ID.fullmatch(str(alert.get("id") or "")):
             continue
         start = event_time(alert.get("start"))
-        if start is None or start > time.time() + ALERT_SKEW:
+        if start is None:
             continue
-        alert = dict(alert, start=start, end=event_time(alert.get("end")))
+        end = event_time(alert.get("end"))
+        now = time.time()
+        alert = dict(alert, start=min(start, now), end=min(end, now) if end is not None else None)
         if alert.get("image") and not alert_image_path(alert["image"]):
             alert["image"] = None
         kept.append(alert)
@@ -1589,13 +1591,17 @@ class DBusConnection:
         self.signals = []
         self.reply_sender = None
 
-    async def call(self, destination, path, interface, member, signature="", body=b"", timeout=10):
+    async def call(self, destination, path, interface, member, signature="", body=b"", timeout=10,
+                   sender=None):
+        """Call a method; with sender, replies from anyone else are ignored."""
         self.serial += 1
         serial = self.serial
         self.writer.write(dbus_call(serial, destination, path, interface, member, signature, body))
         await self.writer.drain()
         while True:
             kind, fields, values, _ = await asyncio.wait_for(dbus_read(self.reader), timeout)
+            if kind in (2, 3) and fields.get(5) == serial and sender not in (None, fields.get(7)):
+                continue    # a reply someone else sent in the service's place
             if kind in (2, 3) and fields.get(5) == serial:
                 if kind == 3:
                     raise ProtectError(f"D-Bus error: {fields.get(4)}")
@@ -1661,14 +1667,12 @@ async def send_desktop_notification(summary, body, image="", actions=(), wait=36
         name = DBusWriter()
         name.string(NOTIFY_NAME)
         owner = await bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-                               "GetNameOwner", "s", bytes(name.buf))
-        if bus.reply_sender != "org.freedesktop.DBus" or not owner:
+                               "GetNameOwner", "s", bytes(name.buf), sender="org.freedesktop.DBus")
+        if not owner:
             raise ProtectError("no notification service on the bus")
         server = owner[0]
         values = await bus.call(NOTIFY_NAME, NOTIFY_PATH, NOTIFY_NAME, "Notify", "susssasa{sv}i",
-                                notify_body(summary, body, image, list(actions)))
-        if bus.reply_sender != server:
-            raise ProtectError("an unexpected party answered the notification")
+                                notify_body(summary, body, image, list(actions)), sender=server)
         notification = values[0] if values else None
         if not actions:
             return None
@@ -1730,8 +1734,15 @@ class AlertListener:
         cutoff = max(now - ALERTS_MAX_AGE, read_ack().get("clearedAt", 0))
         # A console that was removed takes its alerts (and pictures) along.
         known = {c["id"] for c in (self.config or {}).get("consoles", [])} if self.config else None
+        # Times after now (the clock went back, say) are clamped, not
+        # dropped: a clock step must not delete genuine alerts.
+        for alert in self.alerts:
+            if (alert.get("start") or 0) > now:
+                alert["start"] = now
+            if alert.get("end") and alert["end"] > now:
+                alert["end"] = now
         self.alerts = [a for a in self.alerts
-                       if cutoff < (a.get("start") or 0) <= now + ALERT_SKEW
+                       if cutoff < (a.get("start") or 0)
                        and (known is None or str(a.get("uid", "")).split("_")[0] in known)][-ALERTS_KEEP:]
         self.dirty, self.last_save = False, time.monotonic()
         write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": self.alerts,
@@ -1786,6 +1797,7 @@ class AlertListener:
 
     def allow_new_alert(self, uid, now):
         """At most ALERTS_PER_MINUTE new alerts per camera: no console flood."""
+        now = time.monotonic()      # a wall-clock step must not stall alerts
         recent = [t for t in self.recent.get(uid, []) if now - t < 60]
         if len(recent) >= ALERTS_PER_MINUTE:
             self.recent[uid] = recent
@@ -1976,6 +1988,7 @@ def cmd_events(args):
 
 def cmd_alert(args):
     prefs = load_prefs()
+    before = json.loads(json.dumps(prefs))
     if args.ack or args.clear:
         ack = read_ack()
         ack["ackedAt"] = time.time()
@@ -1996,7 +2009,7 @@ def cmd_alert(args):
     if args.notify:
         refuse_in_demo()
         prefs["notify"] = args.notify == "on"
-        save_prefs(prefs)
+        save_prefs_changes(before, prefs)
         poll_cameras()   # the panel reads the setting from the state file
         print("alert notifications " + ("on" if prefs["notify"] else "off"))
         return
@@ -2028,7 +2041,7 @@ def cmd_alert(args):
             raise ProtectError(f"unknown trigger {unknown[0]!r}; choose from {', '.join(ALERT_TRIGGERS)}")
         prefs["alerts"][camera_key(camera)] = triggers
         print(f"alerts on: {camera['name']} ({', '.join(triggers)})")
-    save_prefs(prefs)
+    save_prefs_changes(before, prefs)
     poll_cameras()
 
 
@@ -2159,7 +2172,7 @@ def cmd_demo(args):
         print("demo mode " + ("on" if demo_on() else "off"))
         return
     if args.mode == "off":
-        if not demo_on():
+        if not demo_on() and not os.path.isdir(DEMO_ASIDE):
             print("demo mode is already off")
             return
         for path in (DEMO_FLAG, ALERTS_PATH, ALERTS_ACK_PATH, SNAP_INDEX):
@@ -2178,18 +2191,22 @@ def cmd_demo(args):
         poll_cameras()
         print("demo mode off; your consoles are back")
         return
-    # Set your own alert log, snapshots and recordings aside, untouched.
+    if not demo_on() and os.path.isdir(DEMO_ASIDE) and os.listdir(DEMO_ASIDE):
+        raise ProtectError(f"{DEMO_ASIDE} still holds your data from an earlier demo; "
+                           "run `eld-unifi-protect demo off` to put it back first")
+    os.makedirs(DEMO_DIR, mode=0o700, exist_ok=True)
+    print("rendering demo cameras…")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        ids = dict(zip([n for _, _, n, _ in DEMO_CAMERAS],
+                       pool.map(lambda c: build_demo_camera(c[1], c[2]), DEMO_CAMERAS)))
+    # Rendered: only now set your own alert log, snapshots and recordings
+    # aside, untouched, so a failed render leaves them where they were.
     if not demo_on():
         os.makedirs(DEMO_ASIDE, mode=0o700, exist_ok=True)
         for name in DEMO_SET_ASIDE:
             path = os.path.join(RUNTIME_DIR, name)
             if os.path.exists(path):
                 os.replace(path, os.path.join(DEMO_ASIDE, name))
-    os.makedirs(DEMO_DIR, mode=0o700, exist_ok=True)
-    print("rendering demo cameras…")
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        ids = dict(zip([n for _, _, n, _ in DEMO_CAMERAS],
-                       pool.map(lambda c: build_demo_camera(c[1], c[2]), DEMO_CAMERAS)))
     missing = [slug for _, slug, _, _ in DEMO_CAMERAS if not demo_source_image(slug)]
     write_json(DEMO_FLAG, {"since": time.time()})
     # A believable alert log, with snapshots, ending in an unseen alert.
@@ -2443,6 +2460,29 @@ def summarize_camera(camera, console):
 LOGIN_SERVICE = KEYRING_SERVICE + "-login"
 PRIVATE_API = "/proxy/protect/api"
 SESSIONS_PATH = os.path.join(RUNTIME_DIR, "sessions.json")
+# Rejected recordings logins, kept across reboots until `login` replaces them.
+REJECTED_PATH = os.path.join(STATE_DIR, "login-rejected.json")
+
+
+def load_rejected():
+    try:
+        with open(REJECTED_PATH) as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def set_rejected(console_id, entry):
+    """Record (or with None, clear) a rejected login; call under sessions_lock."""
+    data = load_rejected()
+    if entry is None:
+        if data.pop(console_id, None) is None:
+            return
+    else:
+        data[console_id] = entry
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    write_json(REJECTED_PATH, data)
 SESSIONS_THREAD_LOCK = threading.RLock()
 
 
@@ -2518,27 +2558,41 @@ def restore_session(console_id, entry):
 
 
 def logout_session(console, session, config=None):
-    """Sign one session out on the console; best effort."""
+    """Sign one session out on the console; True if the console confirmed."""
     try:
         client = ProtectSession(console, config, fresh=True)
         client.session = session
-        client.logout()
+        return client.logout()
     except ProtectError:
-        pass
+        return False
 
 
 def end_session(console, config=None):
-    """Sign the saved session out on the console (best effort), then forget it."""
-    if has_login(console):
-        try:
-            ProtectSession(console, config).logout()
-        except ProtectError:
-            pass
-    forget_session(console["id"])
+    """Take a console's saved session away and sign it out on the console.
+
+    Taken under the sessions lock, so a helper signing in at the same moment
+    either has its session taken here or sees the login gone and signs
+    itself out. Callers save the config (without the login) first. Returns
+    True if there was no session, or the console confirmed the sign-out.
+    """
+    with sessions_lock():
+        sessions = load_sessions()
+        entry = sessions.pop(console["id"], None)
+        if entry is not None:
+            write_json(SESSIONS_PATH, sessions)
+        set_rejected(console["id"], None)
+    if not (isinstance(entry, dict) and entry.get("token")):
+        return True
+    return logout_session(console, entry, config) if has_login(console) else False
 
 
 def clear_login(console, config=None):
-    end_session(console, config)
+    """Remove a console's login from it and the keyring; return what it was.
+
+    The session is not touched: save the config, then end_session() the
+    returned copy, so no helper can sign in again in between.
+    """
+    before = dict(console)
     if console.get("loginStore") == "keyring":
         _key_cache.pop((LOGIN_SERVICE, console["id"]), None)
         try:
@@ -2547,7 +2601,7 @@ def clear_login(console, config=None):
             print(f"Could not remove the password from the keyring: {error}", file=sys.stderr)
     for field in ("loginUser", "loginStore", "loginPassword"):
         console.pop(field, None)
-    forget_session(console["id"])
+    return before
 
 
 def load_sessions():
@@ -2673,12 +2727,16 @@ class ProtectSession:
         # process and, for LOGIN_RETRY_AFTER, in every other: UniFi OS
         # locks accounts out after a burst of failures. `login` clears it.
         self.login_error, self.login_rejected, self.session = None, False, None
-        if isinstance(saved, dict) and isinstance(saved.get("failed"), (int, float)):
-            # A rejected password stays rejected until `login` replaces it;
-            # rate limiting and the like are retried after a while.
-            if saved.get("rejected") or 0 <= time.time() - saved["failed"] < LOGIN_RETRY_AFTER:
+        rejected = None if fresh else load_rejected().get(console["id"])
+        if isinstance(rejected, dict) and rejected.get("user") == console.get("loginUser"):
+            # A rejected password stays rejected, across reboots, until
+            # `login` replaces it.
+            self.login_error = str(rejected.get("error") or "the console rejected the login")
+            self.login_rejected = True
+        elif isinstance(saved, dict) and isinstance(saved.get("failed"), (int, float)):
+            # Rate limiting and the like are retried after a while.
+            if 0 <= time.time() - saved["failed"] < LOGIN_RETRY_AFTER:
                 self.login_error = str(saved.get("error") or "sign-in failed")
-                self.login_rejected = bool(saved.get("rejected"))
         elif isinstance(saved, dict) and saved.get("token"):
             self.session = saved
 
@@ -2686,6 +2744,11 @@ class ProtectSession:
         """Remember a failed sign-in for every helper process, then raise."""
         if not self.persist:
             raise (LoginRejected if rejected else ProtectError)(message)
+        if rejected:
+            with sessions_lock():
+                set_rejected(self.console["id"], {"user": self.console.get("loginUser"),
+                                                  "error": message, "at": time.time()})
+            raise LoginRejected(message)
         with sessions_lock():
             sessions = load_sessions()
             sessions[self.console["id"]] = {"failed": time.time(), "error": message, "rejected": rejected}
@@ -2741,21 +2804,34 @@ class ProtectSession:
                         "csrf": response.headers.get("X-Updated-CSRF-Token")
                                 or response.headers.get("X-CSRF-Token") or ""}
         if self.persist:
-            restore_session(self.console["id"], self.session)
+            # Still this console's login? `logout` may have run meanwhile; a
+            # session it can no longer see must not outlive it.
+            with sessions_lock():
+                current = next((c for c in (load_config(keys=False) or {"consoles": []})["consoles"]
+                                if c["id"] == self.console["id"]), None)
+                kept = bool(current) and current.get("loginUser") == self.console.get("loginUser")
+                if kept:
+                    restore_session(self.console["id"], self.session)
+            if not kept:
+                self.logout()
+                self.session = None
+                raise ProtectError("the recordings login was removed meanwhile")
 
     def logout(self):
         """End the saved session on the console too; best effort."""
+        """End the session on the console; True if the console confirmed it."""
         session = self.session
         if not session or not session.get("token"):
-            return
+            return False
         headers = {"Cookie": f"TOKEN={session['token']}"}
         if session.get("csrf"):
             headers["X-CSRF-Token"] = session["csrf"]
         try:
             conn, response = self._send("POST", "/api/auth/logout", body={}, headers=headers)
             conn.finish()
+            return 200 <= response.status < 300
         except ProtectError:
-            pass
+            return False
 
     def open(self, path, params=None, timeout=None, deadline=60):
         """GET a recordings endpoint; returns (conn, response) with status 200.
@@ -2892,7 +2968,7 @@ class DemoSession:
         self.console = console
 
     def logout(self):
-        pass
+        return True
 
     def events(self, camera_id, since, until, motion=False, limit=100):
         slug = next((s for _, s, _, _ in DEMO_CAMERAS if demo_camera_id(s) == camera_id), "")
@@ -3065,7 +3141,10 @@ class file_lock:
 
     Every read-modify-write of a shared file (cameras.json, sessions.json)
     runs under one, so two quick clicks or two helpers never lose a change.
+    Re-entrant within a thread, like its thread lock.
     """
+
+    held = {}    # path -> [fd, depth]; only touched while holding the thread lock
 
     def __init__(self, path, thread_lock):
         self.path, self.thread_lock = path, thread_lock
@@ -3073,22 +3152,30 @@ class file_lock:
     def __enter__(self):
         self.thread_lock.acquire()
         try:
+            if self.path in self.held:
+                self.held[self.path][1] += 1
+                return self
             os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
-            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
             for _ in range(600):           # at most 30 s
                 try:
-                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.held[self.path] = [fd, 1]
                     return self
                 except BlockingIOError:
                     time.sleep(0.05)
-            os.close(self.fd)
+            os.close(fd)
             raise ProtectError("another eld-unifi-protect command is busy; try again")
         except BaseException:
             self.thread_lock.release()
             raise
 
     def __exit__(self, *exc):
-        os.close(self.fd)
+        entry = self.held[self.path]
+        entry[1] -= 1
+        if entry[1] == 0:
+            del self.held[self.path]
+            os.close(entry[0])
         self.thread_lock.release()
 
 
@@ -3103,6 +3190,32 @@ def refuse_in_demo():
     """cameras.json is the real one: demo mode must not change it."""
     if demo_on():
         raise ProtectError("demo mode is on; camera settings can't be changed")
+
+
+def save_prefs_changes(before, after):
+    """Apply what a command changed (before -> after) to cameras.json as it
+    is now, under the lock only for that moment: commands that poll the
+    consoles for seconds no longer hold it, and none loses another's change."""
+    with prefs_lock():
+        current = load_prefs()
+        for key, value in after.items():
+            old = before.get(key)
+            if value == old:
+                continue
+            if isinstance(value, dict) and isinstance(old, dict) and isinstance(current.get(key), dict):
+                for k in set(old) | set(value):
+                    if old.get(k) != value.get(k):
+                        if k in value:
+                            current[key][k] = value[k]
+                        else:
+                            current[key].pop(k, None)
+            elif isinstance(value, list) and isinstance(old, list) and isinstance(current.get(key), list):
+                gone = set(old) - set(value)
+                kept = [x for x in current[key] if x not in gone]
+                current[key] = kept + [x for x in value if x not in old and x not in kept]
+            else:
+                current[key] = value
+        save_prefs(current)
 
 
 def save_prefs(prefs):
@@ -3359,8 +3472,9 @@ def save_console(config, existing, host, pin, key, name):
     if existing and existing.get("id") == console_id and existing.get("certSha256") == pin:
         # A new key keeps the recordings login; a new certificate does not.
         entry.update({k: existing[k] for k in ("loginUser", "loginStore", "loginPassword") if k in existing})
-    elif existing:
-        clear_login(existing, config)
+    dropped = None
+    if existing and not ("loginUser" in entry):
+        dropped = clear_login(existing, config) if existing.get("loginUser") else None
     if existing and existing.get("keyStore") == "keyring" and existing.get("id") != console_id:
         keyring_clear(existing["id"])
     where = store_key(config, entry, key)
@@ -3369,6 +3483,8 @@ def save_console(config, existing, host, pin, key, name):
     else:
         consoles.append(entry)
     save_config(config)
+    if dropped:
+        end_session(dropped, config)     # after the config no longer has it
     return entry, where
 
 
@@ -3567,12 +3683,14 @@ def cmd_consoles(args):
 
 
 def cmd_remove(args):
+    if demo_on():
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = require_config()
     console = find_console(config, args.console)
     if not args.yes and input(f"Remove {console['name']} ({console['host']})? [y/N] ").strip().lower() not in ("y", "yes"):
         raise ProtectError("not changed")
     config["consoles"].remove(console)
-    clear_login(console, config)
+    dropped = clear_login(console, config)
     forget_recordings(console["id"])
     forget_streams(console)
     forget_alerts(console["id"])
@@ -3585,6 +3703,9 @@ def cmd_remove(args):
         save_config(config)
     else:
         os.remove(CONFIG_PATH)
+    if dropped.get("loginUser") and not end_session(dropped, config):
+        print(f"Could not sign {console['name']}'s recordings session out on the console; "
+              "delete its local account to be sure it ends.", file=sys.stderr)
     # Drop its cameras from the panel now rather than on the next poll.
     state = previous_state()
     state["cameras"] = [c for c in state.get("cameras", []) if c.get("console") != console["id"]]
@@ -3648,6 +3769,8 @@ def cmd_login(args):
     Interactive by default. --stdin (used by the panel) reads the username
     and the password as two lines, so the password is never an argument.
     """
+    if demo_on():
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = require_config()
     console = find_console(config, args.console)
     if console.get("demo"):
@@ -3684,12 +3807,25 @@ def cmd_login(args):
                 console.pop(field, None)
             console.update(previous)
             trial.logout()     # signed in but not allowed to list: sign out
-    restore_session(console["id"], trial.session)
-    # The new login works: sign the old session out on the console.
-    if isinstance(old_session, dict) and old_session.get("token"):
-        logout_session(console, old_session, config)
-    where = store_login(console, user, password)
-    save_config(config)
+    # It works: keep it, as one step a stop signal cannot cut in half. The
+    # config and password first, then the session, then the old session
+    # signed out on the console.
+    handlers = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        try:
+            where = store_login(console, user, password)
+            save_config(config)
+        except BaseException:
+            trial.logout()
+            raise
+        with sessions_lock():
+            set_rejected(console["id"], None)
+            restore_session(console["id"], trial.session)
+        if isinstance(old_session, dict) and old_session.get("token"):
+            logout_session(console, old_session, config)
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
     poll_cameras(config)
     if args.json:
         print(json.dumps({"console": console["id"], "name": console["name"], "store": where}))
@@ -3707,16 +3843,22 @@ def forget_recordings(console_id):
 
 
 def cmd_logout(args):
+    if demo_on():
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = require_config()
     console = find_console(config, args.console)
     if not console.get("loginUser"):
         print(f"No recordings login stored for {console['name']}.")
         return
-    clear_login(console, config)        # also signs the session out on the console
-    save_config(config)
+    dropped = clear_login(console, config)
+    save_config(config)              # first: no helper may sign in again now
+    signed_out = end_session(dropped, config)
     forget_recordings(console["id"])
     poll_cameras(config)
     print(f"Signed out of {console['name']}; its login and fetched recordings are removed.")
+    if not signed_out:
+        print("The console did not confirm the sign-out; its session may last until it expires.",
+              file=sys.stderr)
 
 
 def cmd_recordings(args):
@@ -3757,13 +3899,14 @@ def cmd_clip(args):
         raise ProtectError("event times must be numbers")
     clip = fetch_clip(config, uid, args.start, args.end, args.quality)
     if args.output:
-        # Private like everything else, and never through a planted link.
+        # A new private file put in place: never written through a planted
+        # link, and an existing file's looser mode or other links are not kept.
+        with open(clip["path"], "rb") as source:
+            data = source.read()
         try:
-            fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            write_atomic(os.path.abspath(args.output), data)
         except OSError as error:
             raise ProtectError(f"cannot write {args.output}: {error.strerror or error}")
-        with os.fdopen(fd, "wb") as out, open(clip["path"], "rb") as source:
-            shutil.copyfileobj(source, out)
         clip["path"] = args.output
     if args.play:
         player = shutil.which("mpv")
@@ -3996,6 +4139,7 @@ def cmd_hide(args, hide=True):
     refuse_in_demo()
     state = poll_cameras(require_config())
     prefs = load_prefs()
+    before = json.loads(json.dumps(prefs))
     hidden = set(prefs["hidden"])
     for wanted in args.cameras:
         matches = find_cameras(state["cameras"], wanted)
@@ -4005,15 +4149,16 @@ def cmd_hide(args, hide=True):
             (hidden.add if hide else hidden.discard)(camera_key(camera))
             print(("hidden   " if hide else "visible  ") + camera["name"] + "  ·  " + camera["consoleName"])
     prefs["hidden"] = sorted(hidden)
-    save_prefs(prefs)
+    save_prefs_changes(before, prefs)
     poll_cameras()
 
 
 def cmd_unhide(args):
     if args.all:
         prefs = load_prefs()
+        before = json.loads(json.dumps(prefs))
         prefs["hidden"] = []
-        save_prefs(prefs)
+        save_prefs_changes(before, prefs)
         poll_cameras()
         print("all cameras visible")
         return
@@ -4023,11 +4168,11 @@ def cmd_unhide(args):
 
 
 def cmd_read_only(args):
-    refuse_in_demo()
     prefs = load_prefs()
+    before = json.loads(json.dumps(prefs))
     if args.mode != "status":
         prefs["readOnly"] = args.mode == "on"
-        save_prefs(prefs)
+        save_prefs_changes(before, prefs)
         # Cached URLs may include fallbacks chosen under the other setting.
         try:
             os.remove(STREAM_CACHE)
@@ -4042,9 +4187,10 @@ def cmd_read_only(args):
 def cmd_favorite(args):
     refuse_in_demo()
     prefs = load_prefs()
+    before = json.loads(json.dumps(prefs))
     if args.clear or not args.camera:
         prefs["favorite"] = ""
-        save_prefs(prefs)
+        save_prefs_changes(before, prefs)
         poll_cameras()
         print("no favourite camera")
         return
@@ -4054,7 +4200,7 @@ def cmd_favorite(args):
         raise ProtectError(f"{args.camera!r} matches {len(matches)} cameras; use its id "
                            "from `eld-unifi-protect cameras`")
     prefs["favorite"] = camera_key(matches[0])
-    save_prefs(prefs)
+    save_prefs_changes(before, prefs)
     poll_cameras()
     print(f"favourite: {matches[0]['name']}  ·  {matches[0]['consoleName']}")
 
@@ -4062,11 +4208,12 @@ def cmd_favorite(args):
 def cmd_hide_offline(args):
     refuse_in_demo()
     prefs = load_prefs()
+    before = json.loads(json.dumps(prefs))
     if args.mode == "toggle":
         prefs["hideOffline"] = not prefs["hideOffline"]
     else:
         prefs["hideOffline"] = args.mode == "on"
-    save_prefs(prefs)
+    save_prefs_changes(before, prefs)
     poll_cameras()
     print("offline cameras " + ("hidden" if prefs["hideOffline"] else "shown"))
 
@@ -4242,10 +4389,6 @@ def check_runtime_dir():
         raise ProtectError(problem)
 
 
-# Commands that change cameras.json; main() runs each under prefs_lock().
-PREFS_COMMANDS = {cmd_alert, cmd_hide, cmd_unhide, cmd_read_only, cmd_favorite, cmd_hide_offline}
-
-
 def main():
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     parser = argparse.ArgumentParser(prog="eld-unifi-protect", description=__doc__.splitlines()[0])
@@ -4376,12 +4519,7 @@ def main():
     args = parser.parse_args()
     try:
         check_runtime_dir()
-        if args.func in PREFS_COMMANDS:
-            # Load, change and save cameras.json as one step across processes.
-            with prefs_lock():
-                args.func(args)
-        else:
-            args.func(args)
+        args.func(args)
     except ProtectError as error:
         # Messages can quote the console; never let it reach the terminal raw
         # (escape sequences can retitle it or write to the clipboard).
