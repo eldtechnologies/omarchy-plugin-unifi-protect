@@ -278,6 +278,44 @@ class RelayLiveness(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(h.RELAY_ROUTES).st_mode), 0o600)
 
 
+
+class ConsoleInput(unittest.TestCase):
+    def test_console_addresses_are_ip_addresses_or_host_names(self):
+        for good, expected in (("192.168.1.1", "192.168.1.1"), ("https://nvr.local/", "nvr.local"),
+                               ("10.0.0.2:443", "10.0.0.2"), ("10.0.0.2:8443", "10.0.0.2:8443"),
+                               ("[fd00::1]", "[fd00::1]"), ("unifi", "unifi")):
+            self.assertEqual(h.normalize_host(good), expected)
+        for bad in ("abcdefghijklmnopqrstuvwxyz0123456789ABCD", "nvr;rm -rf", "-x", "a b", "h:99999"):
+            with self.assertRaises(h.ProtectError, msg=bad):
+                h.normalize_host(bad)
+
+    def test_a_camera_id_can_never_look_like_a_uid(self):
+        self.assertIsNone(h.summarize_camera({"id": "nvr_abc"}, {"id": "gw", "name": "GW"}))
+        self.assertIsNotNone(h.summarize_camera({"id": "0123456789abcdef01234567"}, {"id": "gw", "name": "GW"}))
+
+    def test_uids_win_over_ids_and_names(self):
+        cams = [{"uid": "gw_x", "id": "x", "name": "nvr_cam", "mac": ""},
+                {"uid": "nvr_cam", "id": "cam", "name": "Door", "mac": ""}]
+        self.assertEqual([c["uid"] for c in h.find_cameras(cams, "nvr_cam")], ["nvr_cam"])
+
+    def test_an_online_camera_is_never_hidden_by_another_consoles_claim(self):
+        def cam(uid, online):
+            return {"uid": uid, "mac": "aabbccddeeff", "online": online, "consoleName": uid, "name": "Door"}
+        both = h.merge_cameras([cam("gw_fake", True), cam("nvr_real", True)])
+        self.assertEqual(sorted(c["uid"] for c in both), ["gw_fake", "nvr_real"])
+        moved = h.merge_cameras([cam("gw_old", False), cam("nvr_new", True)])
+        self.assertEqual([c["uid"] for c in moved], ["nvr_new"])
+
+    def test_snapshots_of_cameras_no_longer_listed_are_removed(self):
+        os.makedirs(h.SNAP_DIR, exist_ok=True)
+        for uid in ("nvr_a", "nvr_gone"):
+            with open(h.snapshot_path(uid), "wb") as handle:
+                handle.write(b"x")
+        index = {"nvr_a": 1, "nvr_gone": 1}
+        h.refresh_snapshots({"consoles": []}, [{"uid": "nvr_a", "console": "nvr", "online": False}], index)
+        self.assertEqual(sorted(os.listdir(h.SNAP_DIR)), sorted(["nvr_a.jpg", os.path.basename(h.SNAP_INDEX)]))
+        self.assertEqual(index, {"nvr_a": 1})
+
 class WallPid(unittest.TestCase):
     def test_a_stale_pid_never_names_another_process(self):
         os.makedirs(os.path.dirname(h.WALL_PID), exist_ok=True)

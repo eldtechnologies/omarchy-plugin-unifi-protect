@@ -250,28 +250,30 @@ Panel {
     streamProcess.running = true
   }
 
+  // Most specific match first: a uid names exactly one camera, whatever a
+  // console calls its other cameras. Hidden cameras count too.
+  function findCamera(name) {
+    var wanted = String(name || "")
+    var lower = wanted.toLowerCase()
+    var tests = [function(c) { return c.uid === wanted },
+                 function(c) { return c.id === wanted },
+                 function(c) { return String(c.name || "").toLowerCase() === lower }]
+    for (var t = 0; t < tests.length; t++)
+      for (var i = 0; i < allCameras.length; i++)
+        if (tests[t](allCameras[i])) return allCameras[i]
+    return null
+  }
+
   function openLiveByName(name) {
-    var wanted = String(name || "").toLowerCase()
-    for (var i = 0; i < cameras.length; i++) {
-      if (cameras[i].name.toLowerCase() === wanted || cameras[i].uid === name || cameras[i].id === name) {
-        root.open()
-        root.openLive(cameras[i])
-        return
-      }
-    }
+    var camera = root.findCamera(name)
     root.open()
+    if (camera) root.openLive(camera)
   }
 
   function openRecordingsByName(name) {
-    var wanted = String(name || "").toLowerCase()
-    for (var i = 0; i < allCameras.length; i++) {
-      if (allCameras[i].name.toLowerCase() === wanted || allCameras[i].uid === name || allCameras[i].id === name) {
-        root.open()
-        root.openRecordings(allCameras[i], null, "live")
-        return
-      }
-    }
+    var camera = root.findCamera(name)
     root.open()
+    if (camera) root.openRecordings(camera, null, "live")
   }
 
   function stepLive(delta) {
@@ -708,9 +710,26 @@ Panel {
     root.close()
   }
 
+  // An IP address or host name only: whatever is typed here reaches a
+  // command line and DNS, so a mis-pasted API key must stop here.
+  function plausibleHost(host) {
+    var name = host.replace(/^https?:\/\//, "").replace(/\/+$/, "").replace(/:\d{1,5}$/, "")
+    if (/^\[[0-9A-Fa-f:.]+\]$/.test(name) || /^[0-9A-Fa-f:.]+$/.test(name) && name.indexOf(":") >= 0)
+      return true
+    var labels = name.replace(/\.$/, "").split(".")
+    if (name.length > 253 || (labels.length === 1 && name.length > 24)) return false
+    for (var i = 0; i < labels.length; i++)
+      if (!/^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(labels[i])) return false
+    return true
+  }
+
   function probeConsole() {
     var host = addressField.text.trim()
     if (host === "" || setupProbe.running) return
+    if (!root.plausibleHost(host)) {
+      root.setupError = "That does not look like a console address: use its IP address or host name"
+      return
+    }
     root.setupError = ""
     root.setupBusy = "Reaching " + host + "…"
     setupProbe.command = [root.cli, "setup-probe", host]

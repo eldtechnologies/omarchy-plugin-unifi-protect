@@ -16,6 +16,7 @@ import fcntl
 import getpass
 import hashlib
 import hmac
+import ipaddress
 import http.client
 import json
 import math
@@ -362,9 +363,12 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
     def _expire(self):
         # The raw socket: http.client hands it to the response and drops
         # its own reference while the body is still being read.
+        # socket.socket.shutdown, not SSLSocket.shutdown: the latter drops the
+        # TLS layer first, after which reads would take plaintext straight
+        # from TCP. This way the next read fails inside TLS.
         if self._raw is not None:
             try:
-                self._raw.shutdown(socket.SHUT_RDWR)
+                socket.socket.shutdown(self._raw, socket.SHUT_RDWR)
             except OSError:
                 pass
 
@@ -580,10 +584,19 @@ def register_relay_route(console_id, path):
     return route
 
 
+def stream_path(rtsps_url):
+    """The path of one of Protect's RTSPS URLs, or None if it is not one."""
+    try:
+        path = urllib.parse.urlsplit(rtsps_url).path
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return path if re.fullmatch(r"(/[A-Za-z0-9_.~-]+)+", path or "") else None
+
+
 def relay_url(console_id, rtsps_url):
     """The loopback URL a player opens for one of Protect's RTSPS URLs."""
-    path = urllib.parse.urlsplit(rtsps_url).path
-    if not re.fullmatch(r"(/[A-Za-z0-9_.~-]+)+", path or ""):
+    path = stream_path(rtsps_url)
+    if path is None:
         raise ProtectError("console sent an unexpected stream URL")
     with RELAY_START_LOCK, relay_guard():
         info = _ensure_relay()
@@ -2135,7 +2148,7 @@ class Protect:
         data = self.request("GET", "/cameras") or []
         if not isinstance(data, list):
             raise ProtectError("console sent an unexpected camera list")
-        return [camera for camera in data if isinstance(camera, dict)]
+        return [camera for camera in data if isinstance(camera, dict)][:MAX_CAMERAS]
 
     def snapshot(self, camera_id, high_quality=False):
         data = self.request(
@@ -2144,6 +2157,8 @@ class Protect:
             params={"highQuality": "true" if high_quality else "false"},
             raw=True,
         )
+        if len(data) > SNAPSHOT_MAX_BYTES:
+            raise ProtectError("console sent an implausibly large snapshot")
         if not is_complete_jpeg(data):
             # A cut-off transfer or an error page: keep the previous frame
             # on screen rather than a half-drawn one.
@@ -2161,7 +2176,7 @@ class Protect:
         cache = load_stream_cache()
         cache_key = f"{self.host}/{camera_id}"
         known = cache.get(cache_key, {})
-        if all(known.get(q) for q in qualities):
+        if all(known.get(q) and stream_path(known[q]) for q in qualities):
             return {q: relay_url(self.console["id"], known[q]) for q in qualities}
 
         streams = self.request("GET", f"/cameras/{camera_id}/rtsps-stream") or {}
@@ -2190,8 +2205,9 @@ class Protect:
         urls = {}
         for quality in qualities:
             url = streams.get(quality)
-            if not url or not isinstance(url, str):
-                raise ProtectError(f"console did not return a {quality} stream for this camera")
+            if not url or not isinstance(url, str) or stream_path(url) is None:
+                # Never cached: a bad URL must not stick around.
+                raise ProtectError(f"console did not return a usable {quality} stream for this camera")
             urls[quality] = url
         with STREAM_CACHE_LOCK:
             # Re-read under the lock so concurrent lookups add to the cache
@@ -2207,7 +2223,11 @@ class Protect:
 
 # Text and IDs from a console are untrusted input. Names are printed to
 # terminals and shown in the panel; IDs become file names and URL paths.
-CAMERA_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# No "_": uids are "<console>_<camera>", and a camera id with "_" in it
+# could pose as another console's camera.
+CAMERA_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
+MAX_CAMERAS = 256           # per console; more is not a real Protect setup
+SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024   # a 4K high-quality JPEG is a few MB
 
 
 def clean_text(value, fallback="", limit=80):
@@ -2232,7 +2252,7 @@ def summarize_camera(camera, console):
         "id": camera_id,
         "console": console["id"],
         "consoleName": console["name"],
-        "mac": re.sub(r"[^0-9a-f]", "", str(camera.get("mac") or "").lower()),
+        "mac": re.sub(r"[^0-9a-f]", "", str(camera.get("mac") or "").lower())[:12],
         "name": clean_text(camera.get("name"), model or "Camera"),
         "model": model,
         "state": state,
@@ -2870,12 +2890,17 @@ def apply_prefs(cameras, prefs):
 
 def find_cameras(cameras, wanted):
     """Match by uid, camera id, MAC, or name (case-insensitive)."""
+    # Most specific first: a uid names exactly one camera, whatever other
+    # consoles call theirs.
     wanted_l = wanted.lower()
-    exact = [c for c in cameras if wanted in (c.get("uid"), c.get("id"))
-             or wanted_l.replace(":", "") == c.get("mac")]
-    if exact:
-        return exact
-    return [c for c in cameras if c.get("name", "").lower() == wanted_l]
+    for match in (lambda c: c.get("uid") == wanted,
+                  lambda c: c.get("id") == wanted,
+                  lambda c: wanted_l.replace(":", "") == c.get("mac"),
+                  lambda c: c.get("name", "").lower() == wanted_l):
+        found = [c for c in cameras if match(c)]
+        if found:
+            return found
+    return []
 
 
 def merge_cameras(cameras):
@@ -2883,7 +2908,10 @@ def merge_cameras(cameras):
 
     A camera moved from a gateway to an NVR stays listed on the gateway as
     DISCONNECTED. Keep one entry per MAC, preferring a connected one, so the
-    ghost never hides the live copy.
+    ghost never hides the live copy. Only an offline copy ever gives way:
+    when two consoles both report the same MAC online, both are kept, so a
+    console cannot make another's camera vanish (and take over its name,
+    favourite and alerts) by claiming its MAC.
     """
     best = {}
     order = []
@@ -2894,6 +2922,9 @@ def merge_cameras(cameras):
             order.append(key)
         elif camera["online"] and not best[key]["online"]:
             best[key] = camera
+        elif camera["online"] and best[key]["online"]:
+            best[camera["uid"]] = camera
+            order.append(camera["uid"])
     return sorted((best[k] for k in order), key=lambda c: (c["consoleName"].lower(), c["name"].lower()))
 
 
@@ -3006,11 +3037,11 @@ def refresh_snapshots(config, cameras, index):
             return None
         try:
             data = client.snapshot(camera["id"])
-        except ProtectError:
-            return None
-        if data:
-            write_atomic(snapshot_path(camera["uid"]), data)
-            return camera["uid"]
+            if data:
+                write_atomic(snapshot_path(camera["uid"]), data)
+                return camera["uid"]
+        except (ProtectError, OSError):
+            pass    # a camera that fails, or a full disk, skips this round
         return None
 
     # A handful of workers: enough that one slow camera does not stretch
@@ -3019,6 +3050,17 @@ def refresh_snapshots(config, cameras, index):
         for uid in pool.map(grab, cameras):
             if uid:
                 index[uid] = time.time()
+    # Snapshots of cameras no longer listed go: nothing a console once
+    # listed stays in memory for good.
+    listed = {c["uid"] for c in cameras}
+    for uid in [u for u in index if u not in listed]:
+        index.pop(uid)
+    try:
+        for name in os.listdir(SNAP_DIR):
+            if name.endswith(".jpg") and name[:-4] not in listed:
+                os.remove(os.path.join(SNAP_DIR, name))
+    except OSError:
+        pass
     write_json(SNAP_INDEX, index)
 
 
@@ -3048,8 +3090,8 @@ def save_console(config, existing, host, pin, key, name):
     while console_id in taken:
         console_id, n = f"{base}-{n}", n + 1
     entry = {"id": console_id, "name": name, "host": host, "certSha256": pin}
-    if existing and existing.get("id") == console_id:
-        # A new key or certificate keeps the recordings login.
+    if existing and existing.get("id") == console_id and existing.get("certSha256") == pin:
+        # A new key keeps the recordings login; a new certificate does not.
         entry.update({k: existing[k] for k in ("loginUser", "loginStore", "loginPassword") if k in existing})
     elif existing:
         clear_login(existing, config)
@@ -3064,8 +3106,39 @@ def save_console(config, existing, host, pin, key, name):
     return entry, where
 
 
+HOST_LABEL = re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+
+
 def normalize_host(host):
-    return host.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+    """A console address as typed, cleaned up and checked.
+
+    Only an IP address or a host name: anything else (a pasted API key, say)
+    must never reach DNS or a command line.
+    """
+    host = host.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+    if not host:
+        return ""
+    name, port = host, None
+    if host.startswith("["):
+        name, _, rest = host[1:].partition("]")
+        port = rest.removeprefix(":") or None
+    elif host.count(":") == 1:
+        name, port = host.split(":")
+    if port is not None and not (port.isdigit() and 0 < int(port) < 65536):
+        raise ProtectError("that does not look like a console address")
+    try:
+        ipaddress.ip_address(name)
+        valid = True
+    except ValueError:
+        labels = name.rstrip(".").split(".")
+        valid = (len(name) <= 253 and all(HOST_LABEL.fullmatch(l) for l in labels)
+                 # A single long word is far more likely a key than a host.
+                 and not (len(labels) == 1 and len(name) > 24))
+    if not valid:
+        raise ProtectError("that does not look like a console address (an IP address or host name)")
+    if port == "443":
+        host = f"[{name}]" if ":" in name else name
+    return host
 
 
 def cmd_setup_probe(args):
@@ -3078,7 +3151,7 @@ def cmd_setup_probe(args):
     except OSError as error:
         raise ProtectError(f"cannot reach {host}: {error.strerror or error}")
     config = load_config() or {"consoles": []}
-    existing = next((c for c in config["consoles"] if c["host"] == host), {})
+    existing = next((c for c in config["consoles"] if normalize_host(c["host"]) == host), {})
     print(json.dumps({
         "host": host,
         "fingerprint": pin,
@@ -3099,12 +3172,15 @@ def cmd_setup_save(args):
     # The panel sends the name on the next line, off the command line.
     name = sys.stdin.readline().strip() or args.name or ""
     host = normalize_host(args.host)
+    if demo_on():
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = load_config() or {"consoles": [], "timeoutSec": 8}
-    existing = next((c for c in config["consoles"] if c["host"] == host), {})
-    if not key:
+    existing = next((c for c in config["consoles"] if normalize_host(c["host"]) == host), {})
+    repinned = bool(existing.get("certSha256")) and existing["certSha256"] != args.pin
+    if not key and not repinned:
         key = existing.get("apiKey", "")
     if not key:
-        raise ProtectError("paste the API key")
+        raise ProtectError("paste the API key" + (" again: the console's certificate changed" if repinned else ""))
     # The pin was shown to the user in step 1; refuse if the console now
     # presents anything else.
     _, cameras = verify_console(config, host, args.pin, key)
@@ -3119,6 +3195,9 @@ def cmd_setup_save(args):
 
 
 def cmd_setup(args):
+    if demo_on():
+        # Checked first: a key verified now could not be saved.
+        raise ProtectError("demo mode is on; run `eld-unifi-protect demo off` first")
     config = load_config() or {"consoles": [], "timeoutSec": 8}
     consoles = config["consoles"]
     print("UniFi Protect setup\n")
@@ -3131,19 +3210,26 @@ def cmd_setup(args):
     default_host = "" if consoles else "192.168.1.1"
     prompt = f"Console address [{default_host}]: " if default_host else "Console address: "
     host = input(prompt).strip() or default_host
-    host = host.removeprefix("https://").removeprefix("http://").rstrip("/")
+    host = normalize_host(host)
     if not host:
         raise ProtectError("no address given")
-    existing = next((c for c in consoles if c["host"] == host), {})
+    existing = next((c for c in consoles if normalize_host(c["host"]) == host), {})
 
     try:
         pin = fetch_cert_fingerprint(host)
     except OSError as error:
         raise ProtectError(f"cannot reach {host}: {error}")
     print(f"\nConsole certificate SHA-256:\n  {pin}")
-    if existing.get("certSha256") and existing["certSha256"] != pin:
-        print("  (this differs from the certificate pinned previously)")
-    if input("Trust this certificate? [Y/n] ").strip().lower() not in ("", "y", "yes"):
+    repinned = bool(existing.get("certSha256")) and existing["certSha256"] != pin
+    if repinned:
+        # Not the certificate we know: make the user say yes, and never
+        # hand the stored key or login to it.
+        print("  (this differs from the certificate pinned previously; check it on the\n"
+              "   console before trusting it, and the stored key will not be reused)")
+        trusted = input("Trust this certificate? [y/N] ").strip().lower() in ("y", "yes")
+    else:
+        trusted = input("Trust this certificate? [Y/n] ").strip().lower() in ("", "y", "yes")
+    if not trusted:
         raise ProtectError("setup cancelled")
 
     print(
@@ -3156,7 +3242,7 @@ def cmd_setup(args):
         "If a key made in Site Manager (unifi.ui.com) is rejected, use one made here.\n"
     )
     key = getpass.getpass("API key (input hidden, paste with Super+V): ").strip()
-    if not key and existing.get("apiKey"):
+    if not key and existing.get("apiKey") and not repinned:
         key = existing["apiKey"]
         print("  keeping the existing key")
     if not key:
@@ -3456,8 +3542,8 @@ def cmd_watch(args):
                 cameras = poll_cameras(config).get("cameras", [])
                 last_poll = started
             refresh_snapshots(config, cameras, index)
-        except ProtectError:
-            pass
+        except (ProtectError, OSError):
+            pass    # a full disk or a bad round must not end the loop
         time.sleep(max(0.2, interval - (time.monotonic() - started)))
 
 
@@ -3762,8 +3848,10 @@ def cmd_wall(args):
         try:
             urls = clients[camera["console"]].stream_urls(camera["id"], qualities)
             return dict(camera, grid=urls[args.quality], focus=urls[args.focus_quality])
-        except (ProtectError, KeyError) as error:
+        except ProtectError as error:
             return dict(camera, error=str(error))
+        except Exception:      # one console's nonsense must not stop the wall
+            return dict(camera, error="console sent something unexpected")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         tiles = list(pool.map(resolve, cameras))
