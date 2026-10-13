@@ -1380,6 +1380,19 @@ def armed_cameras(config, prefs):
     return {k: v for k, v in armed.items() if k in known}
 
 
+def cleared_by(alert, ack):
+    """Whether Clear came after this alert opened.
+
+    Compared on the boot's monotonic clock when both carry it (the runtime
+    directory, like that clock, starts afresh at boot), so a wall-clock step
+    can neither hide new alerts nor keep cleared ones; older entries without
+    it compare wall-clock times.
+    """
+    if isinstance(alert.get("seq"), (int, float)) and isinstance(ack.get("clearedSeq"), (int, float)):
+        return alert["seq"] <= ack["clearedSeq"]
+    return (alert.get("start") or 0) <= (ack.get("clearedAt") or 0)
+
+
 ACK_THREAD_LOCK = threading.RLock()
 
 
@@ -1389,7 +1402,8 @@ def ack_lock():
 
 
 def read_ack():
-    """When alerts were last seen and cleared (see AlertListener.align_clock)."""
+    """When alerts were last seen and cleared (wall clock, plus the monotonic
+    clock for ordering: see cleared_by)."""
     try:
         with open(ALERTS_ACK_PATH) as handle:
             ack = json.load(handle)
@@ -1433,8 +1447,7 @@ def load_alerts():
         start = event_time(alert.get("start"))
         if start is None:
             continue
-        # Times later than now are left for the listener to shift as a whole
-        # (align_clock), which keeps their order.
+        # Order against Clear and "seen" uses each alert's monotonic seq.
         alert = dict(alert, start=start, end=event_time(alert.get("end")))
         if alert.get("image") and not alert_image_path(alert["image"]):
             alert["image"] = None
@@ -1777,23 +1790,7 @@ class AlertListener:
         self.recent = {}             # camera uid -> times of its latest new alerts
         self.dirty = False           # alerts changed since the last save
         self.last_save = 0.0
-        self.clock_offset = time.time() - time.monotonic()   # see align_clock
-        # A step back while no listener ran cannot be measured: then times in
-        # the future are simply brought back to now, so none of them can sit
-        # out of reach of Clear.
-        now = time.time()
-        for alert in self.alerts:
-            for field in ("start", "end"):
-                if isinstance(alert.get(field), (int, float)) and alert[field] > now:
-                    alert[field] = now
-        try:
-            with ack_lock():
-                ack = read_ack()
-                if any(isinstance(v, (int, float)) and v > now for v in ack.values()):
-                    write_json(ALERTS_ACK_PATH, {k: min(v, now) if isinstance(v, (int, float)) else v
-                                                 for k, v in ack.items()})
-        except (OSError, ProtectError):
-            pass
+
         self.ack_stamp = None
 
     def refresh(self):
@@ -1816,47 +1813,16 @@ class AlertListener:
         if plugin_gone():
             return      # uninstalled: write nothing, not even a runtime dir
         now = time.time()
-        self.align_clock(now)
-        # Older than a day, or before the user last cleared the log: drop.
-        cutoff = max(now - ALERTS_MAX_AGE, read_ack().get("clearedAt", 0))
+        ack = read_ack()
         # A console that was removed takes its alerts (and pictures) along.
         known = {c["id"] for c in (self.config or {}).get("consoles", [])} if self.config else None
         self.alerts = [a for a in self.alerts
-                       if cutoff < (a.get("start") or 0)
+                       if (a.get("start") or 0) > now - ALERTS_MAX_AGE and not cleared_by(a, ack)
                        and (known is None or str(a.get("uid", "")).split("_")[0] in known)][-ALERTS_KEEP:]
         self.dirty, self.last_save = False, time.monotonic()
         write_json(ALERTS_PATH, {"updatedAt": time.time(), "alerts": self.alerts,
                                  "consoles": self.status})
         prune_alert_images({a.get("image") for a in self.alerts})
-
-    def align_clock(self, now):
-        """After the wall clock steps back, move stored times back with it.
-
-        A step is measured, not guessed: the gap between wall time and the
-        monotonic clock changes only when the clock is set. Alerts and the
-        seen/cleared times move back by exactly that much, so their order
-        holds and nothing sits in the future, where it could never be
-        cleared or would hide new alerts. Checked every few seconds and
-        before each new alert. Forward steps need nothing.
-        """
-        offset = now - time.monotonic()
-        step = self.clock_offset - offset
-        self.clock_offset = offset
-        if step < 30:        # no step back (or only drift)
-            return
-        for alert in self.alerts:
-            for field in ("start", "end"):
-                if isinstance(alert.get(field), (int, float)):
-                    alert[field] -= step
-        with ack_lock():
-            ack = read_ack()
-            if any(isinstance(v, (int, float)) for v in ack.values()):
-                try:
-                    write_json(ALERTS_ACK_PATH, {k: v - step if isinstance(v, (int, float)) else v
-                                                 for k, v in ack.items()})
-                except OSError:
-                    pass
-        self.dirty = True
 
     def handle(self, console_id, message):
         item = message.get("item") if isinstance(message, dict) else None
@@ -1885,7 +1851,6 @@ class AlertListener:
         kind_is_new = False
         if kind and existing is None and self.allow_new_alert(camera["uid"], now):
             kind_is_new = True
-            self.align_clock(now)      # before this alert joins the log
             # Smart detections often arrive as an empty "add" followed by an
             # "update" naming what was seen, so either can open an alert.
             # The console's clock decides the time, but never the future.
@@ -1893,6 +1858,9 @@ class AlertListener:
                 "id": event_id, "uid": camera["uid"], "camera": camera["name"],
                 "consoleName": camera["consoleName"], "kind": kind,
                 "start": min(self.event_starts.get(event_id) or now, now), "end": None,
+                # When it was opened, on the boot's monotonic clock: what
+                # Clear and "seen" compare, so a clock step cannot reorder them.
+                "seq": time.monotonic(),
             }
             self.alerts.append(existing)
             changed = True
@@ -2033,7 +2001,6 @@ class AlertListener:
                 if console_id not in self.armed:
                     self.tasks.pop(console_id).cancel()
                     self.status.pop(console_id, None)
-            self.align_clock(time.time())
             # Flush throttled changes, apply `alert --clear` right away, and
             # let the age limit act even when nothing happens.
             try:
@@ -2126,9 +2093,9 @@ def cmd_alert(args):
     if args.ack or args.clear:
         with ack_lock():
             ack = read_ack()
-            ack["ackedAt"] = time.time()
+            ack["ackedAt"], ack["ackedSeq"] = time.time(), time.monotonic()
             if args.clear:
-                ack["clearedAt"] = ack["ackedAt"]
+                ack["clearedAt"], ack["clearedSeq"] = ack["ackedAt"], ack["ackedSeq"]
             write_json(ALERTS_ACK_PATH, ack)
         if args.clear:
             # The listener drops cleared alerts on its next save. If it isn't

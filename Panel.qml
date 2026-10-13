@@ -110,11 +110,20 @@ Panel {
   // The alert log: everything since the last Clear, newest first.
   property bool alertsView: false
   property real seenBefore: 0      // alerts newer than this are marked new
-  readonly property var logAlerts: alerts.filter(function(a) { return a.start > root.clearedAt })
+  property var seenBeforeSeq: undefined
+  property var ackedSeq: undefined
+  property var clearedSeq: undefined
+
+  // Whether an alert came after an ack or Clear: on the boot's monotonic
+  // clock when both carry it (immune to clock steps), else wall-clock time.
+  function after(alert, seq, at) {
+    return (alert.seq !== undefined && seq !== undefined) ? alert.seq > seq : alert.start > at
+  }
+  readonly property var logAlerts: alerts.filter(function(a) { return root.after(a, root.clearedSeq, root.clearedAt) })
                                          .slice().reverse()
   property real nowSec: Date.now() / 1000
   readonly property var alerts: alertsData && alertsData.alerts ? alertsData.alerts : []
-  readonly property var unackedAlerts: alerts.filter(function(a) { return a.start > root.ackedAt })
+  readonly property var unackedAlerts: alerts.filter(function(a) { return root.after(a, root.ackedSeq, root.ackedAt) })
   readonly property bool alerting: configured && unackedAlerts.length > 0
   readonly property var latestAlert: unackedAlerts.length ? unackedAlerts[unackedAlerts.length - 1] : null
   readonly property int armedCount: allCameras.filter(function(c) {
@@ -713,7 +722,8 @@ Panel {
   // An IP address or host name only: whatever is typed here reaches a
   // command line and DNS, so a mis-pasted API key must stop here.
   function plausibleHost(host) {
-    var port = host.match(/^[^\[\]]*:(\d+)\/*$/)
+    var bare = host.replace(/^https?:\/\//, "")
+    var port = (bare.split(":").length === 2 || /^\[/.test(bare)) ? bare.match(/:(\d+)\/*$/) : null
     if (port && (Number(port[1]) < 1 || Number(port[1]) > 65535)) return false
     var name = host.replace(/^https?:\/\//, "").replace(/\/+$/, "").replace(/:\d{1,5}$/, "")
     if (/^\[[0-9A-Fa-f:.]+\]$/.test(name) || /^[0-9A-Fa-f:.]+$/.test(name) && name.indexOf(":") >= 0)
@@ -871,6 +881,8 @@ Panel {
         var ack = JSON.parse(text())
         root.ackedAt = ack.ackedAt || 0
         root.clearedAt = ack.clearedAt || 0
+        root.ackedSeq = ack.ackedSeq
+        root.clearedSeq = ack.clearedSeq
       } catch (error) { }
     }
   }
@@ -923,6 +935,7 @@ Panel {
       var newest = root.latestAlert
       // Remember what was unseen, to mark it in the log, before acknowledging.
       root.seenBefore = root.ackedAt
+      root.seenBeforeSeq = root.ackedSeq
       if (newest) {
         Quickshell.execDetached([root.cli, "alert", "--ack"])
         root.alertsView = true
@@ -1793,7 +1806,7 @@ Panel {
               Rectangle {
                 id: alertRow
                 required property var modelData
-                readonly property bool isNew: modelData.start > root.seenBefore
+                readonly property bool isNew: root.after(modelData, root.seenBeforeSeq, root.seenBefore)
                 width: alertsColumn.width
                 height: Style.space(64)
                 radius: Style.cornerRadius

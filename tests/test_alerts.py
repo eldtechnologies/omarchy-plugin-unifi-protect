@@ -240,26 +240,26 @@ class AlertLog(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(h.ALERT_IMAGES_DIR)), ["new.jpg"])
         os.remove(h.ALERTS_ACK_PATH)
 
-    def test_a_clock_step_back_keeps_alerts_and_their_order(self):
-        # Cleared, then a ring a minute later; then the clock steps back ten minutes.
-        now = time.time()
-        h.write_json(h.ALERTS_ACK_PATH, {"ackedAt": now - 60, "clearedAt": now - 60})
+    def test_clear_and_seen_follow_the_monotonic_clock(self):
+        # The wall clock stepped back: this alert's wall time is "before" the
+        # Clear, but it was opened after it, and stays.
+        now, mono = time.time(), time.monotonic()
+        h.write_json(h.ALERTS_ACK_PATH, {"ackedAt": now, "clearedAt": now,
+                                         "ackedSeq": mono - 10, "clearedSeq": mono - 10})
         listener = h.AlertListener()
-        listener.alerts = [{"id": "after", "start": now, "image": None}]
-        listener.clock_offset += 600          # as if wall time just went back 600 s
+        listener.alerts = [{"id": "opened_after", "start": now - 600, "seq": mono, "image": None},
+                           {"id": "opened_before", "start": now + 600, "seq": mono - 20, "image": None}]
         listener.save()
-        self.assertEqual([a["id"] for a in listener.alerts], ["after"])     # still after the Clear
-        self.assertAlmostEqual(listener.alerts[0]["start"], now - 600, delta=2)
-        self.assertAlmostEqual(h.read_ack()["clearedAt"], now - 660, delta=2)
+        # ...and one dated in the future but opened before the Clear goes.
+        self.assertEqual([a["id"] for a in listener.alerts], ["opened_after"])
         os.remove(h.ALERTS_ACK_PATH)
 
-    def test_no_clock_step_no_shift(self):
-        # A console running ahead must not move anything (no step happened).
+    def test_alerts_without_seq_compare_wall_times(self):
         now = time.time()
-        listener = h.AlertListener()
-        listener.alerts = [{"id": "a", "start": now - 1000, "end": now - 990, "image": None}]
-        listener.align_clock(time.time())
-        self.assertEqual(listener.alerts[0]["start"], now - 1000)
+        h.write_json(h.ALERTS_ACK_PATH, {"clearedAt": now - 60})
+        self.assertTrue(h.cleared_by({"start": now - 120}, h.read_ack()))
+        self.assertFalse(h.cleared_by({"start": now - 30}, h.read_ack()))
+        os.remove(h.ALERTS_ACK_PATH)
 
     def test_day_old_alerts_expire(self):
         listener = h.AlertListener()
