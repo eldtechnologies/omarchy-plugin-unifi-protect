@@ -23,6 +23,7 @@
       "liveQuality": "medium",
       "popoutQuality": "high",
       "wallMode": "window",
+      "wallLayout": "auto",
       "refresh": "balanced",
       "framing": "fill",
       "openFavoriteLive": false,
@@ -92,6 +93,12 @@
           "overlay"
         ],
         "defaultValue": "window"
+      },
+      {
+        "key": "wallLayout",
+        "type": "string",
+        "label": "Camera wall layout (auto, row, column, a grid such as 3x3 or 2x4, 1+5, 1+7)",
+        "defaultValue": "auto"
       }
     ]
   },

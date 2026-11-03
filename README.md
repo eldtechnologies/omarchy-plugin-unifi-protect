@@ -161,7 +161,7 @@ sound to play.
 ### Camera wall
 
 **Wall** in the panel header, or `W`, shows every visible camera live. Click
-a camera or press `1`–`9` to enlarge it at high quality. ←/→ flips cameras,
+a camera or press its number to enlarge it at high quality. ←/→ flips cameras,
 `M` mutes, Esc goes back to the grid, and Esc (or `Q`) again closes
 the wall. Streams that drop reconnect on their own.
 
@@ -176,6 +176,30 @@ It opens in one of two modes, set with `wallMode`:
   keyboard until you close it. Good for a dedicated monitoring screen.
 
 `eld-unifi-protect wall --mode overlay` picks a mode for one launch.
+
+Its layout is set with `wallLayout`. In the grid, `G` cycles `auto`, `row`,
+`column`, `1x1`, `2x2`, `3x3`, `4x4`, `1+5`, `1+7` and your `wallLayout` if it
+is another one (`Shift+G` goes back); the next launch starts from
+`wallLayout` again.
+
+| Layout | Shape |
+|--------|-------|
+| `auto` (default) | On a landscape screen, the grid sized to the camera count: 2x2 up to four cameras, 3x3 up to nine, 4x4 up to sixteen, then five columns. On a portrait monitor, the grid that makes the tiles largest: a single column for up to six cameras on 9:16 |
+| `row`, `column` | Every camera in one strip, side by side or stacked |
+| `CxR`, e.g. `3x3`, `2x4`, `1x1` | A fixed grid of C columns and R rows, 1 to 6 each way |
+| `1+5`, `1+7` | One large camera in the top-left corner, the rest around it |
+
+When a fixed grid or `1+5`/`1+7` has more cameras than tiles, the rest go on
+further pages: `PgDn`/`]` and `PgUp`/`[` turn them, and the arrows move
+across. `1x1` makes the wall a one-camera-at-a-time carousel. In the grid,
+`1`–`9` enlarge the tiles on the page shown, as numbered on screen; with a
+camera enlarged, they pick cameras in order. Only the page shown is streamed.
+
+The panel's **Wall**, `W` and `omarchy-shell com.eldtechnologies.unifi-protect wall`
+follow `wallLayout`, `wallMode` and `sound`. `eld-unifi-protect wall` does
+not read the widget settings: it opens `auto` unless given `--layout`, so a
+keybinding can open its own layout, say `--layout column` for a portrait
+monitor. It toggles: pressed while the wall is open, it closes it.
 
 The wall runs as its own Quickshell process, not inside the Omarchy shell, so
 a video decoder fault can never take down the bar or the lock screen.
@@ -292,6 +316,8 @@ depend on them.
 
 ```bash
 eld-unifi-protect wall                  # toggle the camera wall
+eld-unifi-protect wall --layout column  # ... stacked, say for a portrait monitor
+omarchy-shell com.eldtechnologies.unifi-protect wall   # ... with the widget's settings
 omarchy-shell com.eldtechnologies.unifi-protect toggle
 omarchy-shell com.eldtechnologies.unifi-protect live "Front Door"
 omarchy-shell com.eldtechnologies.unifi-protect recordings "Front Door"
@@ -330,6 +356,7 @@ Widget settings live in `~/.config/omarchy/shell.json` and reload on save:
 | `popoutQuality` | `high` | Stream for the mpv window |
 | `sound` | `true` | Sound when one camera is shown (live view, enlarged wall camera, pop-out); `false` starts muted |
 | `wallMode` | `window` | Camera wall as a maximized `window` or a full-screen `overlay` |
+| `wallLayout` | `auto` | Camera wall layout: `auto`, `row`, `column`, a grid such as `3x3` or `2x4`, `1+5` or `1+7` |
 
 ```json
 { "id": "com.eldtechnologies.unifi-protect", "columns": 3, "liveQuality": "high" }

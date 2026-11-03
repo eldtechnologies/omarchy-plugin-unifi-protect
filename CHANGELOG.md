@@ -3,6 +3,24 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
+## Unreleased
+
+### Added
+
+- **Camera wall layouts:** `auto`, a single `row` or `column`, fixed grids
+  (`3x3`, `2x4`, `1x1`, ... up to 6x6) and `1+5` / `1+7` with one large
+  camera. Pick one with the `wallLayout` setting or `eld-unifi-protect wall
+  --layout`; on the wall, `G` cycles the presets. Grids and `1+N` page
+  through extra cameras (`PgDn`/`PgUp`), streaming only the page shown.
+
+### Changed
+
+- **The `auto` wall layout suits portrait monitors:** it uses fewer
+  columns there (one for up to six cameras on 9:16). Landscape screens get
+  the same grids as before.
+- **With a camera enlarged on the wall,** `1`–`9` still pick cameras in
+  order; in the grid they now pick the tiles on the page shown.
+
 ## 0.4.2 — 2026-10-13
 
 Security-focused hardening release (#30, #31).

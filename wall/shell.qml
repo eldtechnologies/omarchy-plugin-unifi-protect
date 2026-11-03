@@ -40,17 +40,117 @@ ShellRoot {
   readonly property MediaDevices mediaDevices: MediaDevices {}
 
   readonly property int count: cameras.length
-  readonly property int columns: count <= 1 ? 1 : count <= 4 ? 2 : count <= 9 ? 3 : count <= 16 ? 4 : 5
-  readonly property int rows: Math.max(1, Math.ceil(count / columns))
   readonly property var focusedCamera: focusedIndex >= 0 ? cameras[focusedIndex] : null
+
+  // ---- layouts ----
+  //
+  // The same names as the helper's --layout (WALL_LAYOUT there); keep the
+  // two in step. A layout is a grid of `cols` x `rows` cells and the tiles
+  // on it, each spanning w x h cells from (x, y). Cameras beyond the tiles
+  // go on further pages.
+  readonly property var layoutNames: ["auto", "row", "column", "1x1", "2x2", "3x3", "4x4", "1+5", "1+7"]
+  property string layoutName: "auto"
+  // What G cycles through: the presets, plus the configured layout if it
+  // is none of them (say, 2x4).
+  property var layoutCycle: layoutNames
+  // The wall's size, for "auto" to fit the screen's shape.
+  property real viewWidth: 16
+  property real viewHeight: 9
+
+  function validLayout(name) {
+    name = String(name || "").trim().toLowerCase()
+    return /^(auto|row|column|[1-6]x[1-6]|1\+[57])$/.test(name) ? name : "auto"
+  }
+
+  function uniformLayout(cols, rows) {
+    var cells = []
+    for (var i = 0; i < cols * rows; i++)
+      cells.push({ x: i % cols, y: Math.floor(i / cols), w: 1, h: 1 })
+    return { cols: cols, rows: rows, cells: cells }
+  }
+
+  // Landscape: the grid the wall always had (2x2 up to 4 cameras, 3x3 up to
+  // 9, 4x4 up to 16, then 5 columns). Portrait: the columns that make n
+  // 16:9 tiles largest, ties going to fewer empty cells, then fewer columns;
+  // a single column up to 6 cameras on a 9:16 monitor.
+  function autoColumns(n, w, h) {
+    if (n <= 1) return 1
+    w = w > 0 ? w : 16
+    h = h > 0 ? h : 9
+    if (w >= h) return n <= 4 ? 2 : n <= 9 ? 3 : n <= 16 ? 4 : 5
+    var best = 1, bestArea = -1, bestEmpty = 0
+    for (var c = 1; c <= n; c++) {
+      var r = Math.ceil(n / c)
+      var tileW = Math.min(w / c, (h / r) * 16 / 9)
+      var area = tileW * tileW * 9 / 16
+      var empty = c * r - n
+      var better = area > bestArea * 1.01
+                   || (area >= bestArea * 0.99
+                       && empty < bestEmpty)
+      if (better) { best = c; bestArea = Math.max(area, bestArea); bestEmpty = empty }
+    }
+    return best
+  }
+
+  function computeLayout(name, n, w, h) {
+    n = Math.max(1, n)
+    if (name === "row") return uniformLayout(n, 1)
+    if (name === "column") return uniformLayout(1, n)
+    if (name === "1+5")
+      return { cols: 3, rows: 3, cells: [{ x: 0, y: 0, w: 2, h: 2 },
+        { x: 2, y: 0, w: 1, h: 1 }, { x: 2, y: 1, w: 1, h: 1 },
+        { x: 0, y: 2, w: 1, h: 1 }, { x: 1, y: 2, w: 1, h: 1 }, { x: 2, y: 2, w: 1, h: 1 }] }
+    if (name === "1+7")
+      return { cols: 4, rows: 4, cells: [{ x: 0, y: 0, w: 3, h: 3 },
+        { x: 3, y: 0, w: 1, h: 1 }, { x: 3, y: 1, w: 1, h: 1 }, { x: 3, y: 2, w: 1, h: 1 },
+        { x: 0, y: 3, w: 1, h: 1 }, { x: 1, y: 3, w: 1, h: 1 }, { x: 2, y: 3, w: 1, h: 1 },
+        { x: 3, y: 3, w: 1, h: 1 }] }
+    var grid = /^([1-6])x([1-6])$/.exec(name)
+    if (grid) return uniformLayout(Number(grid[1]), Number(grid[2]))
+    var cols = autoColumns(n, w, h)
+    return uniformLayout(cols, Math.ceil(n / cols))
+  }
+
+  readonly property var layout: computeLayout(layoutName, count, viewWidth, viewHeight)
+  readonly property int pageSize: Math.max(1, layout.cells.length)
+  readonly property int pageCount: Math.max(1, Math.ceil(count / pageSize))
+  // The grid's page follows the selection, which stands still while a
+  // camera is enlarged: flipping through cameras then does not reload the
+  // grid behind it.
+  readonly property int page: Math.floor(selectedIndex / pageSize)
+  readonly property int pageStart: page * pageSize
+  // Ints for the bounds, so a resize (which can reshape "auto", always a
+  // single page) does not reload the tiles: only a different set of
+  // cameras does.
+  readonly property int pageEnd: Math.min(count, pageStart + pageSize)
+  readonly property var pageCameras: cameras.slice(pageStart, pageEnd)
+  readonly property string layoutLabel: layoutName === "auto"
+                                        ? "auto " + layout.cols + "x" + layout.rows : layoutName
+
+  function cycleLayout(step) {
+    var i = layoutCycle.indexOf(layoutName)
+    layoutName = layoutCycle[(i + step + layoutCycle.length) % layoutCycle.length]
+  }
+
+  function turnPage(step) {
+    if (pageCount <= 1) return
+    selectedIndex = ((page + step + pageCount) % pageCount) * pageSize
+  }
 
   function focusCamera(index) {
     if (index < 0 || index >= count) return
-    selectedIndex = index
     // Enlarging from the grid starts at the default; M carries over while
     // flipping between cameras.
     if (focusedIndex < 0) muted = !soundDefault
+    // A camera with no stream is not enlarged: the grid shows its error.
+    if (focusedIndex < 0 || cameras[index].error) selectedIndex = index
     focusedIndex = cameras[index].error ? -1 : index
+  }
+
+  // Back to the grid, on the page of the camera last enlarged.
+  function showGrid() {
+    if (focusedIndex >= 0) selectedIndex = focusedIndex
+    focusedIndex = -1
   }
 
   function move(dx, dy) {
@@ -60,8 +160,45 @@ ShellRoot {
       if (dx !== 0) focusCamera((focusedIndex + dx + count) % count)
       return
     }
-    var next = selectedIndex + dx + dy * columns
-    selectedIndex = Math.max(0, Math.min(count - 1, next))
+    // The nearest tile that way which lines up with this one: tiles can
+    // span several cells (1+5, 1+7), so index arithmetic would not do.
+    var cells = layout.cells
+    var local = selectedIndex - pageStart
+    var here = cells[local]
+    var best = -1, bestScore = 0
+    for (var i = 0; here && i < pageEnd - pageStart; i++) {
+      var c = cells[i]
+      if (i === local || !c) continue
+      // The gap from this tile's edge to that one's; behind it is no move.
+      var gap = dx > 0 ? c.x - (here.x + here.w) : dx < 0 ? here.x - (c.x + c.w)
+              : dy > 0 ? c.y - (here.y + here.h) : here.y - (c.y + c.h)
+      // Lining up: sharing rows for a sideways move, columns for up/down.
+      var shared = dx !== 0 ? Math.min(here.y + here.h, c.y + c.h) - Math.max(here.y, c.y)
+                            : Math.min(here.x + here.w, c.x + c.w) - Math.max(here.x, c.x)
+      if (gap < 0 || shared <= 0) continue
+      var offset = dx !== 0 ? Math.abs(c.y + c.h / 2 - here.y - here.h / 2)
+                            : Math.abs(c.x + c.w / 2 - here.x - here.w / 2)
+      var score = gap * 100 + offset
+      if (best < 0 || score < bestScore) { best = i; bestScore = score }
+    }
+    if (best >= 0) {
+      selectedIndex = pageStart + best
+    } else if (dx !== 0) {
+      // Off the end of a row: on to the next camera, across pages.
+      var step = selectedIndex + dx
+      var cell = cells[step - pageStart]
+      // ...unless the next one is a row below or above in the same page that
+      // is not the start or end of a row (a big tile's neighbours, a part
+      // filled last row): then stay.
+      if (step >= 0 && step < count
+          && (step < pageStart || step >= pageEnd
+              || (dx > 0 ? cell.x === 0 : cell.x + cell.w === layout.cols)))
+        selectedIndex = step
+    } else {
+      // Off the top or bottom: the same tile on the page before or after.
+      var next = selectedIndex + dy * pageSize
+      if (next >= 0 && page + dy < pageCount) selectedIndex = Math.min(count - 1, next)
+    }
   }
 
   FileView {
@@ -76,6 +213,9 @@ ShellRoot {
         shell.cli = data.cli || ""
         shell.gridQuality = data.gridQuality || "low"
         shell.focusQuality = data.focusQuality || "high"
+        shell.layoutName = shell.validLayout(data.layout)
+        if (shell.layoutNames.indexOf(shell.layoutName) < 0)
+          shell.layoutCycle = [shell.layoutNames[0], shell.layoutName].concat(shell.layoutNames.slice(1))
         shell.cameras = data.cameras || []
       } catch (error) {
         Qt.quit()
@@ -239,23 +379,43 @@ ShellRoot {
     anchors.fill: parent
     focus: true
 
+    Binding { target: shell; property: "viewWidth"; value: keys.width }
+    Binding { target: shell; property: "viewHeight"; value: keys.height }
+
     Keys.onPressed: function(event) {
       hintTimer.restart()
       var text = event.text.toLowerCase()
       if (event.key === Qt.Key_Escape || text === "q") {
-        if (shell.focusedIndex >= 0 && text !== "q") shell.focusedIndex = -1
+        if (shell.focusedIndex >= 0 && text !== "q") shell.showGrid()
         else Qt.quit()
       } else if (event.key === Qt.Key_Left || text === "h") shell.move(-1, 0)
       else if (event.key === Qt.Key_Right || text === "l") shell.move(1, 0)
       else if (event.key === Qt.Key_Up || text === "k") shell.move(0, -1)
       else if (event.key === Qt.Key_Down || text === "j") shell.move(0, 1)
       else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
-        if (shell.focusedIndex >= 0) shell.focusedIndex = -1
+        if (shell.focusedIndex >= 0) shell.showGrid()
         else shell.focusCamera(shell.selectedIndex)
       }
       else if (text === "m") shell.muted = !shell.muted
-      else if (text >= "1" && text <= "9") shell.focusCamera(Number(text) - 1)
-      else if (text === "0") shell.focusedIndex = -1
+      // Layout and page keys reload streams: one step per press, never a
+      // held key's repeats.
+      else if (text === "g" && shell.focusedIndex < 0) {
+        if (!event.isAutoRepeat) shell.cycleLayout(event.modifiers & Qt.ShiftModifier ? -1 : 1)
+      }
+      else if ((event.key === Qt.Key_PageDown || text === "]") && shell.focusedIndex < 0) {
+        if (!event.isAutoRepeat) shell.turnPage(1)
+      }
+      else if ((event.key === Qt.Key_PageUp || text === "[") && shell.focusedIndex < 0) {
+        if (!event.isAutoRepeat) shell.turnPage(-1)
+      }
+      else if (text >= "1" && text <= "9") {
+        // In the grid, the number on the tile, on the page shown; enlarged,
+        // the Nth camera, as the grid's own numbering is out of sight.
+        if (shell.focusedIndex >= 0) shell.focusCamera(Number(text) - 1)
+        else if (Number(text) <= shell.pageEnd - shell.pageStart)
+          shell.focusCamera(shell.pageStart + Number(text) - 1)
+      }
+      else if (text === "0") shell.showGrid()
       else return
       event.accepted = true
     }
@@ -263,24 +423,33 @@ ShellRoot {
     // ---- grid ----
     // Stays mounted while a camera is enlarged, so going back is instant
     // rather than a reconnect of every stream.
-    Grid {
+    // Only the page shown is mounted: a camera on another page costs no
+    // decoder.
+    Item {
       id: grid
       anchors.fill: parent
       visible: shell.focusedIndex < 0
-      columns: shell.columns
-      spacing: 2
+      readonly property real spacing: 2
+      // One cell plus the gap after it; a tile spans whole cells, less the
+      // last gap.
+      readonly property real cellWidth: (width + spacing) / shell.layout.cols
+      readonly property real cellHeight: (height + spacing) / shell.layout.rows
 
       Repeater {
-        model: shell.cameras
+        model: shell.pageCameras
 
         Rectangle {
           id: tile
           required property var modelData
           required property int index
-          width: (grid.width - grid.spacing * (shell.columns - 1)) / shell.columns
-          height: (grid.height - grid.spacing * (shell.rows - 1)) / shell.rows
+          readonly property int cameraIndex: shell.pageStart + index
+          readonly property var cell: shell.layout.cells[index] || { x: 0, y: 0, w: 1, h: 1 }
+          x: cell.x * grid.cellWidth
+          y: cell.y * grid.cellHeight
+          width: cell.w * grid.cellWidth - grid.spacing
+          height: cell.h * grid.cellHeight - grid.spacing
           color: "#0b0b0b"
-          border.width: index === shell.selectedIndex && hintTimer.running ? 2 : 0
+          border.width: cameraIndex === shell.selectedIndex && hintTimer.running ? 2 : 0
           border.color: "#ffffff"
 
           Stream {
@@ -325,8 +494,8 @@ ShellRoot {
           MouseArea {
             anchors.fill: parent
             hoverEnabled: true
-            onPositionChanged: { shell.selectedIndex = tile.index; hintTimer.restart() }
-            onClicked: shell.focusCamera(tile.index)
+            onPositionChanged: { shell.selectedIndex = tile.cameraIndex; hintTimer.restart() }
+            onClicked: shell.focusCamera(tile.cameraIndex)
           }
         }
       }
@@ -371,7 +540,7 @@ ShellRoot {
 
         MouseArea {
           anchors.fill: parent
-          onClicked: shell.focusedIndex = -1
+          onClicked: shell.showGrid()
         }
       }
     }
@@ -394,7 +563,11 @@ ShellRoot {
         anchors.centerIn: parent
         text: shell.focusedIndex >= 0
               ? "←/→ next camera  ·  M mute  ·  Esc or click back to grid  ·  Q close"
-              : "Click or 1–9 enlarge  ·  arrows select  ·  Enter enlarge  ·  Esc close"
+              : "Click, Enter or " + (shell.pageEnd - shell.pageStart > 1
+                                       ? "1–" + Math.min(9, shell.pageEnd - shell.pageStart) : "1")
+                + " enlarge  ·  G layout " + shell.layoutLabel
+                + (shell.pageCount > 1 ? "  ·  PgDn page " + (shell.page + 1) + "/" + shell.pageCount : "")
+                + "  ·  Esc close"
         color: "white"
         font.pixelSize: 14
       }

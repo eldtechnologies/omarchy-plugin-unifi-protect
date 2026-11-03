@@ -35,6 +35,30 @@ def camera(console, cam_id, name, mac, state="CONNECTED"):
     )
 
 
+class WallLayouts(unittest.TestCase):
+    def test_layout_names(self):
+        for name in ("auto", "row", "column", "1x1", "3x3", "2x4", "6x6", "1+5", "1+7"):
+            self.assertEqual(h.wall_layout(name), name)
+        self.assertEqual(h.wall_layout(" 3X3 "), "3x3")
+
+    def test_every_copy_of_the_pattern_agrees(self):
+        # The panel, the bar widget and the wall check names themselves.
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for name in ("Panel.qml", "BarWidget.qml", os.path.join("wall", "shell.qml")):
+            with open(os.path.join(root, name)) as handle:
+                found = re.findall(r"/\^\((auto\|.*?)\)\$/\.test", handle.read())
+            self.assertTrue(found, name)
+            for pattern in found:
+                self.assertEqual(pattern, h.WALL_LAYOUT.pattern, name)
+
+    def test_bad_layouts_are_refused(self):
+        import argparse
+        for name in ("", "0x3", "7x1", "3x3x3", "1+6", "grid", "3x3; rm", "1x1 2", "-3x3", "--mode"):
+            with self.assertRaises(argparse.ArgumentTypeError, msg=name):
+                h.wall_layout(name)
+
+
 class Cameras(unittest.TestCase):
     def test_uid_combines_console_and_camera(self):
         self.assertEqual(camera("nvr", "abc", "Gate", "AA")["uid"], "nvr_abc")

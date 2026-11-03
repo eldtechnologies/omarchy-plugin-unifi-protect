@@ -57,8 +57,27 @@ SNAP_DIR = os.path.join(RUNTIME_DIR, "snapshots")
 SNAP_INDEX = os.path.join(SNAP_DIR, "index.json")
 
 QUALITIES = ("high", "medium", "low")
+
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
+# Camera wall layouts. wall/shell.qml, Panel.qml and BarWidget.qml check
+# the same names (a test keeps them in step). "auto" sizes a grid to the
+# camera count (on a portrait monitor, to its shape too); "row" and
+# "column" are single strips; "CxR" is a fixed grid of C columns and R
+# rows; "1+5" and "1+7" put one large camera in a corner with the rest
+# around it. Fixed grids and 1+N page when there are more cameras than
+# tiles.
+WALL_LAYOUT = re.compile(r"auto|row|column|[1-6]x[1-6]|1\+[57]")
+
+
+def wall_layout(value):
+    """argparse type for --layout: one of the names above."""
+    value = value.strip().lower()
+    if not WALL_LAYOUT.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a layout: use auto, row, column, a grid such as 3x3 or 2x4 "
+            "(1 to 6 each way), 1+5 or 1+7")
+    return value
 
 
 def plugin_version():
@@ -4544,6 +4563,7 @@ def cmd_wall(args):
         "cli": os.path.realpath(__file__),
         "gridQuality": args.quality,
         "focusQuality": args.focus_quality,
+        "layout": args.layout,
     })
     quickshell = shutil.which("quickshell") or shutil.which("qs")
     if not quickshell:
@@ -4721,6 +4741,11 @@ def main():
                         "overlay: covers everything")
     p.add_argument("--sound", choices=("on", "off"), default="on",
                    help="sound for an enlarged camera (default on); tiles are always silent")
+    p.add_argument("--layout", type=wall_layout, default="auto",
+                   help="auto (default: fits the camera count, and a portrait screen's shape), "
+                        "row, column, a grid such as 3x3 or 2x4, or 1+5 / 1+7 (one large camera); "
+                        "grids and 1+N page when cameras outnumber tiles. Not read from the "
+                        "wallLayout setting; G cycles presets on the wall")
     p.set_defaults(func=cmd_wall)
     p = sub.add_parser("open", help="open Protect in the browser")
     p.add_argument("console", nargs="?")
