@@ -130,6 +130,7 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         with open(cert) as handle:
             cls.pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(handle.read())).hexdigest()
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(cert, key)
         cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeConsole)
         cls.server.socket = context.wrap_socket(cls.server.socket, server_side=True)

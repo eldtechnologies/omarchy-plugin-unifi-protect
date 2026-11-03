@@ -27,6 +27,7 @@ class FakeConsole:
 
     def __init__(self, cert, key):
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.minimum_version = ssl.TLSVersion.TLSv1_2
         self.context.load_cert_chain(cert, key)
         self.server = socket.create_server(("127.0.0.1", 0))
         self.port = self.server.getsockname()[1]

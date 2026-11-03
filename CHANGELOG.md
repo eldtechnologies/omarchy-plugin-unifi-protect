@@ -21,6 +21,12 @@ All notable changes to this plugin. The version is set in `manifest.json`;
 - **With a camera enlarged on the wall,** `1`–`9` still pick cameras in
   order; in the grid they now pick the tiles on the page shown.
 
+### Security
+
+- **Console connections require TLS 1.2 or newer themselves,** rather
+  than relying on Python's defaults. No change in behaviour: Python 3.10
+  and later already refused older versions.
+
 ## 0.4.2 — 2026-10-13
 
 Security-focused hardening release (#30, #31).

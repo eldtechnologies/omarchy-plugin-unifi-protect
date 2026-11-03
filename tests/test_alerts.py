@@ -349,6 +349,7 @@ class ListenerEndToEnd(unittest.TestCase):
 
         async def run():
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(cert, key)
             server = await asyncio.start_server(console, "127.0.0.1", 0, ssl=context)
             port = server.sockets[0].getsockname()[1]
