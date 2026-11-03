@@ -3,7 +3,7 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
-## Unreleased
+## 0.5.0 — 2026-11-04
 
 ### Added
 
@@ -12,20 +12,21 @@ All notable changes to this plugin. The version is set in `manifest.json`;
   camera. Pick one with the `wallLayout` setting or `eld-unifi-protect wall
   --layout`; on the wall, `G` cycles the presets. Grids and `1+N` page
   through extra cameras (`PgDn`/`PgUp`), streaming only the page shown.
+  (#36)
 
 ### Changed
 
 - **The `auto` wall layout suits portrait monitors:** it uses fewer
   columns there (one for up to six cameras on 9:16). Landscape screens get
-  the same grids as before.
+  the same grids as before. (#36)
 - **With a camera enlarged on the wall,** `1`–`9` still pick cameras in
-  order; in the grid they now pick the tiles on the page shown.
+  order; in the grid they now pick the tiles on the page shown. (#36)
 
 ### Security
 
 - **Console connections require TLS 1.2 or newer themselves,** rather
   than relying on Python's defaults. No change in behaviour: Python 3.10
-  and later already refused older versions.
+  and later already refused older versions. (#37)
 
 ## 0.4.2 — 2026-10-13
 
