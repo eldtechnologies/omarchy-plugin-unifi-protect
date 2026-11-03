@@ -3,6 +3,14 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
+## Unreleased
+
+### Security
+
+- **Console connections require TLS 1.2 or newer themselves,** rather
+  than relying on Python's defaults. No change in behaviour: Python 3.10
+  and later already refused older versions.
+
 ## 0.4.2 — 2026-10-13
 
 Security-focused hardening release (#30, #31).
