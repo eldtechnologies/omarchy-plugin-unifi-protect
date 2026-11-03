@@ -35,6 +35,13 @@ def camera(console, cam_id, name, mac, state="CONNECTED"):
     )
 
 
+class Tls(unittest.TestCase):
+    def test_console_connections_refuse_tls_before_1_2(self):
+        import ssl
+        self.assertEqual(h.tls_context().minimum_version, ssl.TLSVersion.TLSv1_2)
+        self.assertEqual(h.tls_context().verify_mode, ssl.CERT_REQUIRED)
+
+
 class Cameras(unittest.TestCase):
     def test_uid_combines_console_and_camera(self):
         self.assertEqual(camera("nvr", "abc", "Gate", "AA")["uid"], "nvr_abc")
