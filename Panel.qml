@@ -676,9 +676,17 @@ Panel {
   // bar; "overlay": covers everything, every workspace included.
   readonly property string wallMode: setting("wallMode", "window") === "overlay" ? "overlay" : "window"
 
+  // Grid layout; the helper's --layout names (anything else falls back to
+  // auto rather than leave the wall unopenable).
+  readonly property string wallLayout: {
+    var name = String(setting("wallLayout", "auto")).trim().toLowerCase()
+    return /^(auto|row|column|[1-6]x[1-6]|1\+[57])$/.test(name) ? name : "auto"
+  }
+
   function openWall() {
     Quickshell.execDetached([root.cli, "wall", "--mode", root.wallMode,
-                             "--sound", root.soundDefault ? "on" : "off"])
+                             "--sound", root.soundDefault ? "on" : "off",
+                             "--layout", root.wallLayout])
     root.close()
   }
 
