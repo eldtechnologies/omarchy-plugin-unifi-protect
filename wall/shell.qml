@@ -14,6 +14,12 @@ import Quickshell.Hyprland
 //
 // The CLI resolves stream URLs and writes them to $ELD_UNIFI_PROTECT_WALL; this
 // file only plays them.
+//
+// `eld-unifi-protect timeline` starts the same file as a second window of
+// its own (through a link the helper makes, with timeline: true in its
+// config): the grid above a timeline of the
+// last 24 hours. Drag it and every camera shown goes to that moment. The
+// wall itself has none of this, so a wall left on a monitor stays a wall.
 ShellRoot {
   id: shell
 
@@ -201,6 +207,246 @@ ShellRoot {
     }
   }
 
+  // ---- timeline ----
+  //
+  // One clock for every camera shown. Live until the playhead is moved;
+  // then `playhead` (Unix seconds) is the moment on screen. While it is
+  // dragged (`scrubbing`) tiles show still frames; let go, they play
+  // recordings from there in clips of `chunkSeconds`, all cut at the same
+  // moments so every tile changes clip together. The helper fetches both
+  // (`timeline-serve`), asked over a pipe.
+  property bool timeline: false
+  property string playbackQuality: "low"
+  property var consoleNames: ({})
+  property real now: Date.now() / 1000
+  property bool reviewing: false
+  property real playhead: 0
+  property bool scrubbing: false
+  property bool paused: false
+  property real anchorPlayhead: 0
+  property real anchorWall: 0
+  // Each settled move of the playhead, for tiles to line up with again.
+  property int seekSerial: 0
+  // Recordings are not played closer to now than this: the console has
+  // not written the last seconds yet.
+  readonly property real liveEdge: 15
+  readonly property real reach: 24 * 3600
+  readonly property int chunkSeconds: 60
+  readonly property real chunkStart: Math.floor(playhead / chunkSeconds) * chunkSeconds
+  // The stretch of time the lanes show: `span` seconds ending at viewEnd,
+  // or at now (and following it) while viewEnd is 0.
+  property real span: 6 * 3600
+  property real viewEnd: 0
+  readonly property real viewEndTime: viewEnd > 0 ? viewEnd : now
+  readonly property real viewStart: viewEndTime - span
+  readonly property var spans: [3600, 6 * 3600, 24 * 3600]
+  // Per camera uid: where footage exists and what was detected.
+  property var index: ({})
+  property bool indexLoaded: false
+  readonly property var laneCameras: focusedIndex >= 0 && focusedCamera ? [focusedCamera] : pageCameras
+
+  readonly property var kindColors: ({
+    person: "#ffb454", face: "#ffb454", vehicle: "#59c2ff", licensePlate: "#59c2ff",
+    animal: "#aad94c", package: "#d2a6ff", ring: "#ff6f91", audio: "#95e6cb", motion: "#5f7488"
+  })
+
+  function clockText(seconds, withDay) {
+    return Qt.formatDateTime(new Date(seconds * 1000), withDay ? "ddd HH:mm:ss" : "HH:mm:ss")
+  }
+
+  function spanText(seconds) {
+    return seconds >= 3600 ? Math.round(seconds / 360) / 10 + " h" : Math.round(seconds / 60) + " min"
+  }
+
+  function seekTo(time, settled) {
+    var current = Date.now() / 1000
+    if (time >= current - liveEdge) {
+      // Let go at the right-hand end: back to live.
+      if (settled) { goLive(); return }
+      time = current - liveEdge
+    }
+    playhead = Math.max(current - reach + 60, time)
+    // Before `reviewing`: tiles created by it must not fetch a clip for a
+    // playhead that is still being dragged.
+    if (!settled) scrubbing = true
+    reviewing = true
+    if (settled) settle()
+  }
+
+  function settle() {
+    settleTimer.stop()
+    scrubbing = false
+    anchorPlayhead = playhead
+    anchorWall = Date.now()
+    keepInView()
+    seekSerial++
+  }
+
+  function stepBy(seconds) {
+    if (!reviewing && seconds > 0) return
+    seekTo((reviewing ? playhead : Date.now() / 1000 - liveEdge) + seconds, false)
+    keepInView()
+    settleTimer.restart()
+  }
+
+  function goLive() {
+    settleTimer.stop()
+    reviewing = false
+    scrubbing = false
+    paused = false
+    viewEnd = 0
+  }
+
+  function togglePause() {
+    if (!reviewing) {
+      // Freeze what was just on screen.
+      playhead = Date.now() / 1000 - liveEdge - 5
+      reviewing = true
+      paused = true
+      settle()
+      return
+    }
+    paused = !paused
+    if (!paused) {
+      anchorPlayhead = playhead
+      anchorWall = Date.now()
+    }
+  }
+
+  function setViewEnd(end) {
+    viewEnd = end >= now - 1 ? 0 : Math.max(end, now - reach + span)
+  }
+
+  function keepInView() {
+    if (reviewing && (playhead < viewStart || playhead > viewEndTime)) setViewEnd(playhead + span / 2)
+  }
+
+  // Zoom to `seconds` across, the moment at `pivot` staying where it is.
+  function setSpan(seconds, pivot) {
+    seconds = Math.max(600, Math.min(reach, seconds))
+    var end = pivot + (viewEndTime - pivot) / span * seconds
+    span = seconds
+    setViewEnd(end)
+  }
+
+  function zoomStep(step) {
+    var nearest = 0
+    for (var i = 1; i < spans.length; i++)
+      if (Math.abs(spans[i] - span) < Math.abs(spans[nearest] - span)) nearest = i
+    var next = Math.max(0, Math.min(spans.length - 1, nearest + step))
+    var pivot = reviewing ? playhead : now
+    setSpan(spans[next], pivot)
+    // The playhead in the middle, where there is room to move both ways.
+    if (reviewing) setViewEnd(playhead + spans[next] / 2)
+  }
+
+  // The detection before or after the playhead, on any camera shown.
+  function jumpEvent(step) {
+    var from = reviewing ? playhead : now
+    var best = null
+    for (var c = 0; c < laneCameras.length; c++) {
+      var info = index[laneCameras[c].uid]
+      var events = info && info.events ? info.events : []
+      for (var i = 0; i < events.length; i++) {
+        if (events[i].kind === "motion") continue
+        var start = events[i].start - 3
+        if (step < 0 ? start < from - 5 : start > from + 1)
+          if (best === null || (step < 0 ? start > best : start < best)) best = start
+      }
+    }
+    if (best !== null) seekTo(best, true)
+  }
+
+  // ---- the helper, for stills, clips and the lanes ----
+  property bool backendReady: false
+  property var pendingReplies: ({})
+  property int nextRequest: 1
+
+  function ask(request, callback) {
+    if (!backendReady) return
+    request.id = nextRequest++
+    pendingReplies[request.id] = callback
+    backend.write(JSON.stringify(request) + "\n")
+  }
+
+  function backendReply(line) {
+    try {
+      var reply = JSON.parse(line)
+      var callback = pendingReplies[reply.id]
+      delete pendingReplies[reply.id]
+      if (callback) callback(reply)
+    } catch (error) {
+      // A tile that asked is gone (another page), or the line was not ours.
+    }
+  }
+
+  function loadIndex() {
+    var uids = []
+    for (var i = 0; i < cameras.length; i++) uids.push(cameras[i].uid)
+    ask({ op: "index", uids: uids }, function(reply) {
+      if (!reply.ok) return
+      shell.index = reply.cameras || {}
+      shell.indexLoaded = true
+    })
+  }
+
+  Process {
+    id: backend
+    command: [shell.cli, "timeline-serve"]
+    running: shell.timeline && shell.cli !== ""
+    stdinEnabled: true
+    stdout: SplitParser { onRead: function(line) { shell.backendReply(line) } }
+    onStarted: {
+      shell.backendReady = true
+      shell.loadIndex()
+    }
+    onExited: {
+      shell.backendReady = false
+      shell.pendingReplies = ({})
+      if (shell.timeline) backendRestart.restart()
+    }
+  }
+
+  Timer {
+    id: backendRestart
+    interval: 3000
+    onTriggered: backend.running = true
+  }
+
+  // New detections for the lanes.
+  Timer {
+    interval: 60000
+    repeat: true
+    running: shell.timeline && shell.backendReady
+    onTriggered: shell.loadIndex()
+  }
+
+  Timer {
+    interval: 1000
+    repeat: true
+    running: shell.timeline
+    onTriggered: shell.now = Date.now() / 1000
+  }
+
+  // The clock recordings play by.
+  Timer {
+    interval: 200
+    repeat: true
+    running: shell.reviewing && !shell.paused && !shell.scrubbing
+    onTriggered: {
+      var time = shell.anchorPlayhead + (Date.now() - shell.anchorWall) / 1000
+      if (time > Date.now() / 1000 - shell.liveEdge + 3) shell.goLive()
+      else shell.playhead = time
+    }
+  }
+
+  // Arrow keys step the playhead; tiles fetch stills until the keys rest.
+  Timer {
+    id: settleTimer
+    interval: 350
+    onTriggered: shell.settle()
+  }
+
   FileView {
     path: Quickshell.env("ELD_UNIFI_PROTECT_WALL") || ""
     printErrors: false
@@ -216,7 +462,11 @@ ShellRoot {
         shell.layoutName = shell.validLayout(data.layout)
         if (shell.layoutNames.indexOf(shell.layoutName) < 0)
           shell.layoutCycle = [shell.layoutNames[0], shell.layoutName].concat(shell.layoutNames.slice(1))
+        shell.timeline = data.timeline === true
+        shell.playbackQuality = data.playbackQuality || "low"
+        shell.consoleNames = data.consoles || {}
         shell.cameras = data.cameras || []
+        if (shell.timeline && typeof data.at === "number") shell.seekTo(data.at, true)
       } catch (error) {
         Qt.quit()
       }
@@ -373,18 +623,569 @@ ShellRoot {
     }
   }
 
+  // A camera's recording at the shell's playhead: stills while it is
+  // dragged, then the clip around it.
+  component Playback: Item {
+    id: playback
+    property string uid: ""
+    property string quality: "low"
+    // Names this view's stills apart from another view of the same camera.
+    property string slot: "grid"
+    property bool playAudio: false
+    // Only views on screen fetch anything.
+    property bool active: true
+    readonly property var info: shell.index[uid] || null
+    readonly property bool needsLogin: !!(info && info.needsLogin)
+    property string stillPath: ""
+    property real stillAt: -1
+    property bool stillBusy: false
+    // { path, start, end, chunk }: what the player holds.
+    property var clip: null
+    property bool positioned: false
+    property real askedChunk: -1
+    property real failedChunk: -1
+    property real fetchedAhead: -1
+    property int serial: 0
+    // "", "nofootage", or what went wrong.
+    property string problem: ""
+
+    function refresh() {
+      if (!active || !shell.reviewing || !shell.backendReady || needsLogin) return
+      if (shell.scrubbing) {
+        player.pause()
+        wantStill()
+      } else {
+        wantClip()
+        fetchAhead()
+      }
+    }
+
+    // One request at a time: the next asks for wherever the playhead is by
+    // then, so a slow console is never asked for frames already passed.
+    function wantStill() {
+      if (stillBusy) return
+      var at = shell.playhead
+      if (stillAt >= 0 && Math.abs(at - stillAt) < 0.5) return
+      stillBusy = true
+      shell.ask({ op: "still", uid: uid, at: at, quality: "low", slot: slot }, function(reply) {
+        playback.stillBusy = false
+        playback.stillAt = at
+        if (reply.ok) {
+          playback.stillPath = reply.path
+          playback.problem = ""
+        } else if (shell.scrubbing) {
+          playback.stillPath = ""
+          playback.problem = reply.noFootage ? "nofootage" : (reply.error || "no picture")
+        }
+        if (shell.scrubbing && playback.active) playback.wantStill()
+      })
+    }
+
+    function wantClip() {
+      var chunk = shell.chunkStart
+      if (clip !== null && clip.chunk === chunk) { resync(); return }
+      if (askedChunk === chunk || failedChunk === chunk) return
+      var end = Math.min(chunk + shell.chunkSeconds, Math.floor(Date.now() / 1000) - 8)
+      if (end - chunk < 2) return
+      askedChunk = chunk
+      var mine = ++serial
+      shell.ask({ op: "clip", uid: uid, start: chunk, end: end, quality: quality }, function(reply) {
+        if (mine !== playback.serial) return
+        playback.askedChunk = -1
+        if (!reply.ok) {
+          playback.failedChunk = chunk
+          playback.clip = null
+          player.stop()
+          playback.problem = reply.noFootage ? "nofootage" : (reply.error || "no recording")
+          return
+        }
+        playback.problem = ""
+        playback.failedChunk = -1
+        playback.positioned = false
+        playback.clip = { path: reply.path, start: reply.start, end: reply.end, chunk: chunk }
+        player.source = "file://" + reply.path
+        if (shell.paused || shell.scrubbing) player.pause()
+        else player.play()
+      })
+    }
+
+    // Back in step with the shell's clock, after a move within the clip
+    // or a stall.
+    function resync() {
+      if (clip === null || !positioned) return
+      var want = (shell.playhead - clip.start) * 1000
+      if (want > player.duration + 500 && clip.end < clip.chunk + shell.chunkSeconds - 1) {
+        // A clip cut short at "now" has run out: there is more by now.
+        clip = null
+        wantClip()
+        return
+      }
+      if (Math.abs(player.position - want) > 1500)
+        player.setPosition(Math.max(0, Math.min(player.duration - 50, want)))
+      if (shell.paused) player.pause()
+      else if (player.playbackState !== MediaPlayer.PlayingState && want < player.duration - 200) player.play()
+    }
+
+    // The next clip, fetched before this one ends.
+    function fetchAhead() {
+      var next = shell.chunkStart + shell.chunkSeconds
+      if (shell.paused || fetchedAhead === next) return
+      if (shell.playhead - shell.chunkStart < shell.chunkSeconds - 20) return
+      if (next + shell.chunkSeconds > Date.now() / 1000 - 8) return
+      fetchedAhead = next
+      shell.ask({ op: "clip", uid: uid, start: next, end: next + shell.chunkSeconds, quality: quality },
+                function(reply) {})
+    }
+
+    onActiveChanged: {
+      if (active) { refresh(); return }
+      serial++
+      askedChunk = -1
+      clip = null
+      player.stop()
+    }
+    onNeedsLoginChanged: refresh()
+    Component.onCompleted: refresh()
+
+    Connections {
+      target: shell
+      function onPlayheadChanged() { if (shell.scrubbing) playback.refresh() }
+      function onScrubbingChanged() { playback.refresh() }
+      function onSeekSerialChanged() { playback.failedChunk = -1; playback.refresh() }
+      function onChunkStartChanged() { if (!shell.scrubbing) playback.refresh() }
+      function onPausedChanged() { playback.refresh() }
+      function onBackendReadyChanged() {
+        // A restarted helper answers nothing it was asked before.
+        playback.stillBusy = false
+        playback.askedChunk = -1
+        playback.refresh()
+      }
+      function onNowChanged() { if (!shell.scrubbing) playback.refresh() }
+    }
+
+    VideoOutput {
+      id: video
+      anchors.fill: parent
+      fillMode: VideoOutput.PreserveAspectFit
+      visible: playback.clip !== null
+    }
+
+    // The frame under the playhead, until the clip from there plays.
+    Image {
+      anchors.fill: parent
+      visible: playback.stillPath !== "" && playback.problem === ""
+               && (shell.scrubbing || playback.clip === null || !playback.positioned)
+      source: playback.stillPath !== "" ? "file://" + playback.stillPath : ""
+      fillMode: Image.PreserveAspectFit
+      cache: false
+    }
+
+    AudioOutput {
+      id: audio
+      device: shell.mediaDevices.defaultAudioOutput
+      muted: shell.muted
+    }
+
+    MediaPlayer {
+      id: player
+      videoOutput: video
+      audioOutput: playback.playAudio ? audio : null
+      activeAudioTrack: playback.playAudio ? 0 : -1
+      onErrorOccurred: function(error, errorString) {
+        playback.problem = errorString || "cannot play the recording"
+      }
+      onMediaStatusChanged: {
+        if (playback.clip === null || playback.positioned) return
+        if (mediaStatus !== MediaPlayer.LoadedMedia && mediaStatus !== MediaPlayer.BufferedMedia) return
+        playback.positioned = true
+        var want = (shell.playhead - playback.clip.start) * 1000
+        if (want > 300) player.setPosition(Math.max(0, Math.min(player.duration - 50, want)))
+      }
+    }
+
+    Text {
+      textFormat: Text.PlainText
+      anchors.centerIn: parent
+      width: parent.width - 24
+      horizontalAlignment: Text.AlignHCenter
+      wrapMode: Text.WordWrap
+      visible: text !== ""
+      text: playback.needsLogin
+            ? "Sign in to see recordings\neld-unifi-protect login " + (playback.info.console || "")
+            : playback.problem === "nofootage" ? "No recording at " + shell.clockText(shell.playhead, false)
+            : playback.problem !== "" ? playback.problem
+            : playback.clip === null && playback.stillPath === "" ? "Loading…" : ""
+      color: playback.problem !== "" && playback.problem !== "nofootage" ? "#ff7777" : "#cccccc"
+      font.pixelSize: 16
+    }
+  }
+
+  // ---- the timeline strip ----
+  //
+  // A lane per camera shown: footage as a solid band, hatched where there
+  // is none, detections as coloured marks. Click or drag to move the
+  // playhead; the wheel zooms around the pointer, Shift+wheel pans.
+  component TimelineStrip: Rectangle {
+    id: timelineStrip
+    color: "#101112"
+    readonly property var lanes: shell.laneCameras
+    // The strip is one height whatever it shows: the grid above must not
+    // change shape (and so its page of cameras) with the number of lanes.
+    readonly property real lanesArea: 150
+    readonly property real laneHeight: Math.max(6, Math.min(32, Math.floor(lanesArea / Math.max(1, lanes.length)) - 2))
+    readonly property real gutter: 200
+    readonly property real trackX: gutter
+    readonly property real trackWidth: Math.max(100, width - gutter - 16)
+    readonly property real lanesHeight: lanes.length * (laneHeight + 2)
+    readonly property real playheadTime: shell.reviewing ? shell.playhead : shell.now
+    implicitHeight: 44 + lanesArea + 24 + 26
+
+    function timeAt(x) { return shell.viewStart + x / trackWidth * shell.span }
+    function xAt(time) { return (time - shell.viewStart) / shell.span * trackWidth }
+
+    // ---- where we are ----
+    Text {
+      id: clock
+      textFormat: Text.PlainText
+      x: 16
+      y: 8
+      text: shell.reviewing ? shell.clockText(shell.playhead, true) : "LIVE"
+      color: shell.reviewing ? "white" : "#ff5555"
+      font.pixelSize: 22
+      font.bold: true
+    }
+
+    Text {
+      textFormat: Text.PlainText
+      anchors.left: clock.right
+      anchors.leftMargin: 14
+      anchors.baseline: clock.baseline
+      text: (shell.paused ? "paused  ·  " : shell.scrubbing ? "" : shell.reviewing ? "recorded  ·  " : "")
+            + shell.spanText(shell.span) + " shown"
+            + (shell.indexLoaded ? "" : "  ·  loading detections…")
+      color: "#9aa0a6"
+      font.pixelSize: 14
+    }
+
+    Row {
+      anchors.right: liveButton.left
+      anchors.rightMargin: 18
+      anchors.verticalCenter: liveButton.verticalCenter
+      spacing: 14
+      Repeater {
+        model: [["person", "Person"], ["vehicle", "Vehicle"], ["animal", "Animal"],
+                ["package", "Package"], ["ring", "Doorbell"], ["motion", "Motion"]]
+        Row {
+          required property var modelData
+          spacing: 5
+          Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            width: 10; height: 10; radius: 2
+            color: shell.kindColors[modelData[0]]
+          }
+          Text {
+            textFormat: Text.PlainText
+            text: modelData[1]
+            color: "#9aa0a6"
+            font.pixelSize: 12
+          }
+        }
+      }
+    }
+
+    Rectangle {
+      id: liveButton
+      anchors.right: parent.right
+      anchors.rightMargin: 16
+      y: 8
+      width: liveLabel.implicitWidth + 24
+      height: 28
+      radius: 14
+      color: shell.reviewing ? (liveArea.containsMouse ? "#3a3d40" : "#26282a") : "#5a1f1f"
+      Text {
+        id: liveLabel
+        textFormat: Text.PlainText
+        anchors.centerIn: parent
+        text: shell.reviewing ? "Go live" : "● Live"
+        color: "white"
+        font.pixelSize: 14
+        font.bold: true
+      }
+      MouseArea {
+        id: liveArea
+        anchors.fill: parent
+        hoverEnabled: true
+        onClicked: shell.goLive()
+      }
+    }
+
+    // ---- lanes ----
+    Column {
+      id: laneColumn
+      x: 0
+      y: 44
+      width: parent.width
+      spacing: 2
+
+      Repeater {
+        model: timelineStrip.lanes
+
+        Item {
+          id: lane
+          required property var modelData
+          required property int index
+          readonly property var info: shell.index[modelData.uid] || null
+          readonly property bool selected: shell.focusedIndex < 0
+                                           && shell.pageStart + index === shell.selectedIndex
+          width: laneColumn.width
+          height: timelineStrip.laneHeight
+
+          Text {
+            textFormat: Text.PlainText
+            x: 16
+            width: timelineStrip.gutter - 28
+            anchors.verticalCenter: parent.verticalCenter
+            horizontalAlignment: Text.AlignRight
+            elide: Text.ElideRight
+            text: lane.modelData.name
+            color: lane.selected ? "white" : "#9aa0a6"
+            font.pixelSize: Math.max(9, Math.min(13, timelineStrip.laneHeight - 3))
+            font.bold: lane.selected
+          }
+
+          Canvas {
+            id: band
+            x: timelineStrip.trackX
+            width: timelineStrip.trackWidth
+            height: parent.height
+
+            readonly property var info: lane.info
+            readonly property real viewStart: shell.viewStart
+            readonly property real span: shell.span
+            onInfoChanged: requestPaint()
+            onViewStartChanged: requestPaint()
+            onSpanChanged: requestPaint()
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
+
+            onPaint: {
+              var ctx = getContext("2d")
+              var w = width, h = height
+              var start = shell.viewStart, span = shell.span, now = shell.now
+              function x(time) { return (time - start) / span * w }
+              ctx.clearRect(0, 0, w, h)
+              // No footage, until shown otherwise: dark, hatched.
+              ctx.fillStyle = "#17181a"
+              ctx.fillRect(0, 0, w, h)
+              ctx.strokeStyle = "#2b2d30"
+              ctx.lineWidth = 1
+              ctx.beginPath()
+              for (var d = -h; d < w; d += 7) {
+                ctx.moveTo(d, h)
+                ctx.lineTo(d + h, 0)
+              }
+              ctx.stroke()
+              if (!info || info.needsLogin || info.error) return
+              var events = info.events || []
+              var edge = Math.min(w, x(now))
+              var pad = 10
+              ctx.fillStyle = "#2c4152"
+              if (info.coverage === "always") {
+                var from = Math.max(0, x(info.from || 0))
+                if (edge > from) ctx.fillRect(from, 0, edge - from, h)
+              } else if (info.coverage === "unknown") {
+                // A schedule, say: there may be footage anywhere.
+                ctx.fillStyle = "#22292f"
+                ctx.fillRect(0, 0, edge, h)
+              } else if (info.coverage === "events") {
+                for (var i = 0; i < events.length; i++) {
+                  var a = x(events[i].start - pad), b = x((events[i].end || now) + pad)
+                  if (b < 0 || a > w) continue
+                  ctx.fillRect(a, 0, Math.max(1.5, b - a), h)
+                }
+              }
+              // Motion first, so detections draw over it.
+              for (var pass = 0; pass < 2; pass++) {
+                for (var j = events.length - 1; j >= 0; j--) {
+                  var event = events[j]
+                  if ((event.kind === "motion") !== (pass === 0)) continue
+                  var left = x(event.start), right = x(event.end || now)
+                  if (right < 0 || left > w) continue
+                  ctx.fillStyle = shell.kindColors[event.kind] || shell.kindColors.motion
+                  if (pass === 0) ctx.fillRect(left, h * 0.55, Math.max(1.5, right - left), h * 0.45)
+                  else ctx.fillRect(left, 0, Math.max(2.5, right - left), h)
+                }
+              }
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            x: timelineStrip.trackX + 8
+            anchors.verticalCenter: parent.verticalCenter
+            visible: !!(lane.info && (lane.info.needsLogin || lane.info.error))
+            text: !lane.info ? ""
+                  : lane.info.needsLogin
+                    ? "Sign in to see recordings: eld-unifi-protect login " + (lane.info.console || "")
+                    : (lane.info.error || "")
+            color: lane.info && lane.info.error ? "#ff7777" : "#9aa0a6"
+            font.pixelSize: Math.max(9, Math.min(12, timelineStrip.laneHeight - 3))
+          }
+        }
+      }
+    }
+
+    // ---- hours ----
+    Canvas {
+      id: axis
+      x: timelineStrip.trackX
+      y: laneColumn.y + timelineStrip.lanesHeight
+      width: timelineStrip.trackWidth
+      height: 24
+      readonly property real viewStart: shell.viewStart
+      readonly property real span: shell.span
+      onViewStartChanged: requestPaint()
+      onSpanChanged: requestPaint()
+      onWidthChanged: requestPaint()
+
+      onPaint: {
+        var ctx = getContext("2d")
+        ctx.clearRect(0, 0, width, height)
+        var steps = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600]
+        var step = steps[steps.length - 1]
+        for (var i = 0; i < steps.length; i++)
+          if (shell.span / steps[i] <= width / 90) { step = steps[i]; break }
+        // Marks on the local hour, whatever the time zone's offset.
+        var offset = new Date(shell.viewStart * 1000).getTimezoneOffset() * 60
+        var first = Math.ceil((shell.viewStart - offset) / step) * step + offset
+        ctx.fillStyle = "#9aa0a6"
+        ctx.strokeStyle = "#4a4d50"
+        ctx.font = "12px sans-serif"
+        ctx.textAlign = "center"
+        ctx.beginPath()
+        for (var time = first; time <= shell.viewEndTime; time += step) {
+          var x = (time - shell.viewStart) / shell.span * width
+          ctx.moveTo(x, 0)
+          ctx.lineTo(x, 5)
+          if (x > 18 && x < width - 18)
+            ctx.fillText(Qt.formatDateTime(new Date(time * 1000), "HH:mm"), x, 18)
+        }
+        ctx.stroke()
+      }
+    }
+
+    // ---- the pointer ----
+    Rectangle {
+      visible: trackArea.containsMouse && !trackArea.pressed
+      x: timelineStrip.trackX + trackArea.mouseX
+      y: laneColumn.y
+      width: 1
+      height: timelineStrip.lanesHeight
+      color: "#80ffffff"
+    }
+
+    Rectangle {
+      visible: trackArea.containsMouse && !trackArea.pressed
+      x: Math.max(timelineStrip.trackX, Math.min(timelineStrip.trackX + timelineStrip.trackWidth - width,
+                                                  timelineStrip.trackX + trackArea.mouseX - width / 2))
+      y: laneColumn.y - height - 2
+      width: hoverLabel.implicitWidth + 12
+      height: hoverLabel.implicitHeight + 4
+      radius: 4
+      color: "#26282a"
+      Text {
+        id: hoverLabel
+        textFormat: Text.PlainText
+        anchors.centerIn: parent
+        text: shell.clockText(timelineStrip.timeAt(trackArea.mouseX), false)
+        color: "white"
+        font.pixelSize: 12
+      }
+    }
+
+    // ---- the playhead ----
+    Rectangle {
+      readonly property real at: timelineStrip.xAt(timelineStrip.playheadTime)
+      visible: at >= -1 && at <= timelineStrip.trackWidth + 1
+      x: timelineStrip.trackX + Math.max(0, Math.min(timelineStrip.trackWidth - width, at - width / 2))
+      y: laneColumn.y - 4
+      width: 2
+      height: timelineStrip.lanesHeight + 8
+      color: shell.reviewing ? "white" : "#ff5555"
+    }
+
+    MouseArea {
+      id: trackArea
+      x: timelineStrip.trackX
+      y: laneColumn.y - 6
+      width: timelineStrip.trackWidth
+      height: timelineStrip.lanesHeight + 30
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      function time(mouse) {
+        return timelineStrip.timeAt(Math.max(0, Math.min(width, mouse.x)))
+      }
+      onPressed: function(mouse) { shell.seekTo(time(mouse), false) }
+      onPositionChanged: function(mouse) { if (pressed) shell.seekTo(time(mouse), false) }
+      onReleased: function(mouse) { shell.seekTo(time(mouse), true) }
+      onCanceled: shell.settle()
+      onWheel: function(wheel) {
+        var notches = wheel.angleDelta.y / 120
+        if (wheel.modifiers & Qt.ShiftModifier) shell.setViewEnd(shell.viewEndTime - notches * shell.span / 8)
+        else shell.setSpan(shell.span * Math.pow(0.8, notches), timelineStrip.timeAt(wheel.x))
+      }
+    }
+
+    Text {
+      textFormat: Text.PlainText
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.bottom: parent.bottom
+      anchors.bottomMargin: 6
+      text: "Drag or ←/→ 10 s (Shift 1 min)  ·  , . detections  ·  Space pause  ·  + − or wheel zoom"
+            + "  ·  End live  ·  Enter enlarge  ·  H/L camera"
+            + (shell.focusedIndex >= 0 ? "  ·  M mute" : "  ·  G layout")
+            + (shell.focusedIndex < 0 && shell.pageCount > 1
+               ? "  ·  PgDn page " + (shell.page + 1) + "/" + shell.pageCount : "")
+            + "  ·  Q close"
+      color: "#6f757b"
+      font.pixelSize: 12
+    }
+  }
+
   // ---- contents, shared by both window modes ----
   component WallView: Item {
     id: keys
     anchors.fill: parent
     focus: true
 
-    Binding { target: shell; property: "viewWidth"; value: keys.width }
-    Binding { target: shell; property: "viewHeight"; value: keys.height }
+    Binding { target: shell; property: "viewWidth"; value: stage.width }
+    Binding { target: shell; property: "viewHeight"; value: stage.height }
+
+    // The timeline window's own keys; true if the key was one of them.
+    // Left and Right move through time there, so H and L (and the mouse)
+    // move between cameras.
+    function timelineKey(event, text) {
+      var shift = event.modifiers & Qt.ShiftModifier
+      if (event.key === Qt.Key_Left) shell.stepBy(shift ? -60 : -10)
+      else if (event.key === Qt.Key_Right) shell.stepBy(shift ? 60 : 10)
+      else if (text === "," || text === "<") shell.jumpEvent(-1)
+      else if (text === "." || text === ">") shell.jumpEvent(1)
+      else if (text === "+" || text === "=") shell.zoomStep(-1)
+      else if (text === "-") shell.zoomStep(1)
+      else if (event.key === Qt.Key_Space) shell.togglePause()
+      else if (event.key === Qt.Key_End || event.key === Qt.Key_Backspace) shell.goLive()
+      else if (event.key === Qt.Key_Escape && shell.focusedIndex < 0 && shell.reviewing) shell.goLive()
+      else return false
+      return true
+    }
 
     Keys.onPressed: function(event) {
       hintTimer.restart()
       var text = event.text.toLowerCase()
+      if (shell.timeline && timelineKey(event, text)) {
+        event.accepted = true
+        return
+      }
       if (event.key === Qt.Key_Escape || text === "q") {
         if (shell.focusedIndex >= 0 && text !== "q") shell.showGrid()
         else Qt.quit()
@@ -420,129 +1221,180 @@ ShellRoot {
       event.accepted = true
     }
 
-    // ---- grid ----
-    // Stays mounted while a camera is enlarged, so going back is instant
-    // rather than a reconnect of every stream.
-    // Only the page shown is mounted: a camera on another page costs no
-    // decoder.
+    // The cameras; the timeline window keeps its strip below them.
     Item {
-      id: grid
-      anchors.fill: parent
-      visible: shell.focusedIndex < 0
-      readonly property real spacing: 2
-      // One cell plus the gap after it; a tile spans whole cells, less the
-      // last gap.
-      readonly property real cellWidth: (width + spacing) / shell.layout.cols
-      readonly property real cellHeight: (height + spacing) / shell.layout.rows
+      id: stage
+      anchors.top: parent.top
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.bottom: shell.timeline ? strip.top : parent.bottom
 
-      Repeater {
-        model: shell.pageCameras
+      // ---- grid ----
+      // Stays mounted while a camera is enlarged, so going back is instant
+      // rather than a reconnect of every stream.
+      // Only the page shown is mounted: a camera on another page costs no
+      // decoder.
+      Item {
+        id: grid
+        anchors.fill: parent
+        visible: shell.focusedIndex < 0
+        readonly property real spacing: 2
+        // One cell plus the gap after it; a tile spans whole cells, less the
+        // last gap.
+        readonly property real cellWidth: (width + spacing) / shell.layout.cols
+        readonly property real cellHeight: (height + spacing) / shell.layout.rows
 
-        Rectangle {
-          id: tile
-          required property var modelData
-          required property int index
-          readonly property int cameraIndex: shell.pageStart + index
-          readonly property var cell: shell.layout.cells[index] || { x: 0, y: 0, w: 1, h: 1 }
-          x: cell.x * grid.cellWidth
-          y: cell.y * grid.cellHeight
-          width: cell.w * grid.cellWidth - grid.spacing
-          height: cell.h * grid.cellHeight - grid.spacing
-          color: "#0b0b0b"
-          border.width: cameraIndex === shell.selectedIndex && hintTimer.running ? 2 : 0
-          border.color: "#ffffff"
+        Repeater {
+          model: shell.pageCameras
 
-          Stream {
+          Rectangle {
+            id: tile
+            required property var modelData
+            required property int index
+            readonly property int cameraIndex: shell.pageStart + index
+            readonly property var cell: shell.layout.cells[index] || { x: 0, y: 0, w: 1, h: 1 }
+            x: cell.x * grid.cellWidth
+            y: cell.y * grid.cellHeight
+            width: cell.w * grid.cellWidth - grid.spacing
+            height: cell.h * grid.cellHeight - grid.spacing
+            color: "#0b0b0b"
+            border.width: cameraIndex === shell.selectedIndex && hintTimer.running ? 2 : 0
+            border.color: "#ffffff"
+
+            // Live, or (in the timeline window) the recording at the
+            // playhead. Going back to live reconnects the stream.
+            Loader {
+              anchors.fill: parent
+              anchors.margins: tile.border.width
+              active: !shell.reviewing
+              sourceComponent: Stream {
+                url: tile.modelData.grid || ""
+                uid: tile.modelData.uid || ""
+                quality: shell.gridQuality
+                snapshot: shell.snapshotDir ? "file://" + shell.snapshotDir + "/" + tile.modelData.uid + ".jpg" : ""
+              }
+            }
+
+            Loader {
+              anchors.fill: parent
+              anchors.margins: tile.border.width
+              active: shell.reviewing
+              sourceComponent: Playback {
+                uid: tile.modelData.uid || ""
+                quality: shell.playbackQuality
+                slot: "grid"
+                active: grid.visible
+              }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              anchors.centerIn: parent
+              visible: !!tile.modelData.error
+              text: tile.modelData.error || ""
+              color: "#ff7777"
+              font.pixelSize: 16
+            }
+
+            Rectangle {
+              anchors.left: parent.left
+              anchors.bottom: parent.bottom
+              anchors.margins: 10
+              width: label.implicitWidth + 16
+              height: label.implicitHeight + 8
+              radius: 4
+              color: Qt.rgba(0, 0, 0, 0.55)
+
+              Text {
+                id: label
+                textFormat: Text.PlainText
+                anchors.centerIn: parent
+                text: (tile.index < 9 ? (tile.index + 1) + "  " : "") + tile.modelData.name
+                      + (shell.multiConsole ? "  ·  " + tile.modelData.consoleName : "")
+                color: "white"
+                font.pixelSize: 14
+                font.bold: true
+              }
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              onPositionChanged: { shell.selectedIndex = tile.cameraIndex; hintTimer.restart() }
+              onClicked: shell.focusCamera(tile.cameraIndex)
+            }
+          }
+        }
+      }
+
+      // ---- one camera, full screen, at the higher quality ----
+      Loader {
+        anchors.fill: parent
+        active: shell.focusedIndex >= 0
+        sourceComponent: Item {
+          Loader {
             anchors.fill: parent
-            anchors.margins: tile.border.width
-            url: tile.modelData.grid || ""
-            uid: tile.modelData.uid || ""
-            quality: shell.gridQuality
-            snapshot: shell.snapshotDir ? "file://" + shell.snapshotDir + "/" + tile.modelData.uid + ".jpg" : ""
+            active: !shell.reviewing
+            sourceComponent: Stream {
+              url: shell.focusedCamera ? shell.focusedCamera.focus || shell.focusedCamera.grid : ""
+              uid: shell.focusedCamera ? shell.focusedCamera.uid : ""
+              quality: shell.focusedCamera && shell.focusedCamera.focus ? shell.focusQuality : shell.gridQuality
+              snapshot: shell.focusedCamera && shell.snapshotDir
+                        ? "file://" + shell.snapshotDir + "/" + shell.focusedCamera.uid + ".jpg" : ""
+              playAudio: true
+            }
           }
 
-          Text {
-            textFormat: Text.PlainText
-            anchors.centerIn: parent
-            visible: !!tile.modelData.error
-            text: tile.modelData.error || ""
-            color: "#ff7777"
-            font.pixelSize: 16
+          Loader {
+            anchors.fill: parent
+            active: shell.reviewing
+            sourceComponent: Playback {
+              uid: shell.focusedCamera ? shell.focusedCamera.uid : ""
+              quality: shell.focusQuality
+              slot: "focus"
+              playAudio: true
+            }
           }
 
           Rectangle {
             anchors.left: parent.left
-            anchors.bottom: parent.bottom
-            anchors.margins: 10
-            width: label.implicitWidth + 16
-            height: label.implicitHeight + 8
-            radius: 4
+            anchors.top: parent.top
+            anchors.margins: 20
+            width: focusLabel.implicitWidth + 24
+            height: focusLabel.implicitHeight + 12
+            radius: 6
             color: Qt.rgba(0, 0, 0, 0.55)
 
             Text {
-              id: label
+              id: focusLabel
               textFormat: Text.PlainText
               anchors.centerIn: parent
-              text: (tile.index < 9 ? (tile.index + 1) + "  " : "") + tile.modelData.name
-                    + (shell.multiConsole ? "  ·  " + tile.modelData.consoleName : "")
+              text: (shell.reviewing ? "REC " + shell.clockText(shell.playhead, false) + "  ·  " : "● ")
+                    + (shell.focusedCamera ? shell.focusedCamera.name : "")
+                    + (shell.multiConsole && shell.focusedCamera ? "  ·  " + shell.focusedCamera.consoleName : "")
+                    + (shell.muted ? "  ·  muted" : "")
               color: "white"
-              font.pixelSize: 14
+              font.pixelSize: 18
               font.bold: true
             }
           }
 
           MouseArea {
             anchors.fill: parent
-            hoverEnabled: true
-            onPositionChanged: { shell.selectedIndex = tile.cameraIndex; hintTimer.restart() }
-            onClicked: shell.focusCamera(tile.cameraIndex)
+            onClicked: shell.showGrid()
           }
         }
       }
     }
 
-    // ---- one camera, full screen, at the higher quality ----
     Loader {
-      anchors.fill: parent
-      active: shell.focusedIndex >= 0
-      sourceComponent: Item {
-        Stream {
-          anchors.fill: parent
-          url: shell.focusedCamera ? shell.focusedCamera.focus || shell.focusedCamera.grid : ""
-          uid: shell.focusedCamera ? shell.focusedCamera.uid : ""
-          quality: shell.focusedCamera && shell.focusedCamera.focus ? shell.focusQuality : shell.gridQuality
-          snapshot: shell.focusedCamera && shell.snapshotDir
-                    ? "file://" + shell.snapshotDir + "/" + shell.focusedCamera.uid + ".jpg" : ""
-          playAudio: true
-        }
-
-        Rectangle {
-          anchors.left: parent.left
-          anchors.top: parent.top
-          anchors.margins: 20
-          width: focusLabel.implicitWidth + 24
-          height: focusLabel.implicitHeight + 12
-          radius: 6
-          color: Qt.rgba(0, 0, 0, 0.55)
-
-          Text {
-            id: focusLabel
-            textFormat: Text.PlainText
-            anchors.centerIn: parent
-            text: "● " + (shell.focusedCamera ? shell.focusedCamera.name : "")
-                  + (shell.multiConsole && shell.focusedCamera ? "  ·  " + shell.focusedCamera.consoleName : "")
-                  + (shell.muted ? "  ·  muted" : "")
-            color: "white"
-            font.pixelSize: 18
-            font.bold: true
-          }
-        }
-
-        MouseArea {
-          anchors.fill: parent
-          onClicked: shell.showGrid()
-        }
-      }
+      id: strip
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      active: shell.timeline
+      height: item ? item.implicitHeight : 0
+      sourceComponent: TimelineStrip {}
     }
 
     // ---- key hints ----
@@ -554,6 +1406,8 @@ ShellRoot {
       height: hints.implicitHeight + 14
       radius: height / 2
       color: Qt.rgba(0, 0, 0, 0.7)
+      // The timeline window lists its keys in the strip instead.
+      visible: !shell.timeline
       opacity: hintTimer.running ? 1 : 0
       Behavior on opacity { NumberAnimation { duration: 300 } }
 
@@ -594,7 +1448,7 @@ ShellRoot {
 
     FloatingWindow {
       // The Hyprland rule matches this title; keep the two in step.
-      title: "UniFi Protect Wall"
+      title: shell.timeline ? "UniFi Protect Timeline" : "UniFi Protect Wall"
       color: "black"
       implicitWidth: 1600
       implicitHeight: 900
@@ -617,7 +1471,7 @@ ShellRoot {
       exclusionMode: ExclusionMode.Ignore
       WlrLayershell.layer: WlrLayer.Overlay
       WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
-      WlrLayershell.namespace: "eld-unifi-protect-wall"
+      WlrLayershell.namespace: shell.timeline ? "eld-unifi-protect-timeline" : "eld-unifi-protect-wall"
       color: "black"
 
       WallView { anchors.fill: parent }

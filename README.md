@@ -2,7 +2,8 @@
 
 Your UniFi Protect cameras in the Omarchy bar: a grid of auto-refreshing
 snapshots, live video with sound right in the panel, a camera wall with every
-camera live at once, and a pop-out player. Works with several consoles at
+camera live at once, a timeline to scrub every camera back through the last
+day, and a pop-out player. Works with several consoles at
 once, such as a gateway and a dedicated NVR, and is set up from the panel
 itself. Arm a camera to be alerted when it sees a person, a vehicle or a
 doorbell ring, and play back what each camera recorded. Video travels
@@ -132,6 +133,7 @@ eld-unifi-protect remove nvr
 | Grid | Arrows / hjkl | Move the selection |
 | Grid | `1`–`9` | Live view of camera N |
 | Grid | `W` | Camera wall |
+| Grid | `T` | Timeline |
 | Grid | Hover a tile | Bell to arm alerts, ★ favourite, eye to hide, pop-out button |
 | Grid / live | `P` | Pop out to mpv |
 | Live | ← / → | Previous / next camera |
@@ -142,6 +144,7 @@ eld-unifi-protect remove nvr
 | Recordings | ↑ / ↓, Enter | Choose a detection, play it |
 | Recordings | Space, ← / → | Pause, seek 5 s |
 | Recordings | `P` | The clip in mpv, seekable |
+| Recordings | `T` | The timeline at that moment, every camera |
 | Recordings | Esc | Back to live (or to the alert log) |
 | Grid | `A` | Alert log |
 | Panel footer | Click the version | Release notes for that version |
@@ -149,8 +152,8 @@ eld-unifi-protect remove nvr
 ### Sound
 
 Sound plays whenever exactly one camera is on screen: the panel's live view,
-a recording playing back, an enlarged camera on the wall, and the pop-out
-player. It goes to your system's default output and follows it, so
+a recording playing back, an enlarged camera on the wall or the timeline,
+and the pop-out player. It goes to your system's default output and follows it, so
 headphones connected after login are picked up. The grid and the
 wall's tiles are always silent (they don't even decode audio). `M` mutes;
 the choice carries over while you flip between cameras, and opening a camera
@@ -203,6 +206,55 @@ monitor. It toggles: pressed while the wall is open, it closes it.
 
 The wall runs as its own Quickshell process, not inside the Omarchy shell, so
 a video decoder fault can never take down the bar or the lock screen.
+
+### Timeline
+
+**Timeline** in the panel header, or `T`, opens the camera grid above a
+timeline of the last 24 hours, with a lane for each camera shown. It is a
+window of its own, apart from the wall: a wall left running on a monitor
+stays a plain live wall, and both can be open at once. It plays recordings,
+so it needs the [recordings](#recordings) sign-in; without one on any
+console, the button takes you to the sign-in instead.
+
+It starts live. Click or drag anywhere on the timeline and every camera on
+screen goes to that moment: still frames while you drag, then the
+recordings from there, playing on in step. Drag to the right-hand end, press
+`End` or click **Go live** to return to live.
+
+| Key | Effect |
+|-----|--------|
+| ← / → | Back / forward 10 s (`Shift`: 1 min) |
+| `,` / `.` | Previous / next detection on the cameras shown |
+| Space | Pause / play |
+| `+` / `-`, wheel | Zoom: 1, 6 or 24 hours (the wheel zooms freely, down to 10 minutes; `Shift`+wheel pans) |
+| `End`, Backspace | Back to live |
+| Enter, click, `1`–`9` | Enlarge a camera (high quality, with sound); again for the grid |
+| `H` `J` `K` `L`, ↑ / ↓ | Move between cameras |
+| `G`, `PgDn` / `PgUp` | Layout and pages, as on the wall |
+| Esc | The grid, then live, then close; `Q` closes |
+
+In each lane, a solid band is footage and a hatched one is none: a camera
+that records detections only shows islands of footage, and a camera on a
+console you are not signed in to says so. Coloured marks are detections
+(person, vehicle, animal, package, doorbell); motion is a fainter mark
+along the bottom. A camera with nothing recorded at the playhead says "No
+recording" while the others play on.
+
+Recordings play in one-minute clips at low quality in the grid
+(`--playback-quality`) and at the enlarged quality for an enlarged camera;
+there is a short blink as each minute hands over to the next. The last 15
+seconds are not played back: the console has not written them yet. Clips
+and stills are kept in memory (the runtime directory), at most 80 clips or
+500 MB, and are gone when the window closes.
+
+```bash
+eld-unifi-protect timeline                   # toggle it
+eld-unifi-protect timeline --at 1791811452   # open at a moment (see `recordings`)
+```
+
+It follows `wallMode`, `wallLayout` and `sound` when opened from the panel,
+and takes the wall's `--mode`, `--layout`, `--quality`, `--focus-quality` and
+`--sound` on the command line.
 
 ### Favourite camera
 
@@ -318,6 +370,8 @@ depend on them.
 eld-unifi-protect wall                  # toggle the camera wall
 eld-unifi-protect wall --layout column  # ... stacked, say for a portrait monitor
 omarchy-shell com.eldtechnologies.unifi-protect wall   # ... with the widget's settings
+eld-unifi-protect timeline              # toggle the timeline
+omarchy-shell com.eldtechnologies.unifi-protect timeline   # ... with the widget's settings
 omarchy-shell com.eldtechnologies.unifi-protect toggle
 omarchy-shell com.eldtechnologies.unifi-protect live "Front Door"
 omarchy-shell com.eldtechnologies.unifi-protect recordings "Front Door"
@@ -370,7 +424,7 @@ The plugin's own files:
 | `~/.config/eld-unifi-protect/config.json` | Consoles, pinned certificates and recordings usernames; API keys and passwords only if there is no keyring (mode 0600) |
 | `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras, favourite, armed cameras, read-only setting (no secrets) |
 | `~/.local/state/eld-unifi-protect/state.json` | Last camera list |
-| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their pictures, recordings sessions, thumbnails and clips (tmpfs, gone on reboot; your notification history may keep its own copy of alert pictures) |
+| `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their pictures, recordings sessions, thumbnails, clips and the timeline's stills and clips (tmpfs, gone on reboot; your notification history may keep its own copy of alert pictures) |
 | `~/.local/state/eld-unifi-protect/` | Last camera list, rejected recordings logins, streams the plugin switched on |
 
 ## How it works

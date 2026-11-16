@@ -690,6 +690,40 @@ Panel {
     root.close()
   }
 
+  // ---- timeline ----
+  //
+  // The camera grid over a timeline of recordings, in a window of its own
+  // (never the wall's). Recordings need a sign-in, so without one on any
+  // console the button leads to the sign-in form instead.
+  readonly property bool anyRecordings: {
+    for (var i = 0; i < consoles.length; i++) if (consoles[i].recordings === true) return true
+    return false
+  }
+
+  // at: the moment to open at (Unix seconds); none for live.
+  function openTimeline(at) {
+    if (!root.anyRecordings) {
+      root.openRecordings(root.liveCamera || root.cameras[root.selectedIndex], null, "live")
+      return
+    }
+    // The moment goes in the environment, as event times do for clips.
+    Quickshell.execDetached({
+      command: [root.cli, "timeline", "--mode", root.wallMode,
+                "--sound", root.soundDefault ? "on" : "off", "--layout", root.wallLayout],
+      environment: at ? root.eventEnvironment(at, 0) : ({})
+    })
+    root.closeLive()
+    root.close()
+  }
+
+  // The timeline at what the recordings view is showing.
+  function openTimelineHere() {
+    var at = 0
+    if (root.playingClip) at = root.playingClip.start + player.position / 1000
+    else if (root.selectedRecording) at = root.selectedRecording.start - 3
+    root.openTimeline(at)
+  }
+
   // ---- setup, inside the panel ----
   //
   // Two steps, each a call to the helper: setup-probe fetches the console's
@@ -1170,6 +1204,8 @@ Panel {
         else if (key === "r" && root.liveMode)
           root.recordingsView ? root.backFromRecordings() : root.openRecordings(root.liveCamera, null, "live")
         else if (key === "w") root.openWall()
+        else if (key === "t" && root.configured && !root.alertsView)
+          root.recordingsView ? root.openTimelineHere() : root.openTimeline(0)
         else if (key === "a" && !root.liveMode && root.configured) root.alertsView = !root.alertsView
         else if (key === "p") {
           var target = root.liveMode ? root.liveCamera : root.cameras[root.selectedIndex]
@@ -1234,6 +1270,13 @@ Panel {
             }
 
             ActionButton {
+              visible: root.recordingsView && !root.recordingsNeedLogin
+              label: "Timeline"
+              outlined: true
+              onTriggered: root.openTimelineHere()
+            }
+
+            ActionButton {
               visible: root.liveMode
               label: "Back"
               outlined: true
@@ -1268,6 +1311,13 @@ Panel {
               label: "Wall"
               outlined: true
               onTriggered: root.openWall()
+            }
+
+            ActionButton {
+              visible: !root.liveMode && !root.settingUp && !root.alertsView && root.configured && root.shownCameras.length > 0
+              label: "Timeline"
+              outlined: true
+              onTriggered: root.openTimeline(0)
             }
 
             ActionButton {
@@ -1449,7 +1499,7 @@ Panel {
             textFormat: Text.PlainText
             horizontalAlignment: Text.AlignHCenter
             text: root.recordingsView
-                  ? "↑/↓ choose  ·  Enter play  ·  Space pause  ·  ←/→ 5 s  ·  M mute  ·  P pop out  ·  Esc "
+                  ? "↑/↓ choose  ·  Enter play  ·  Space pause  ·  ←/→ 5 s  ·  M mute  ·  P pop out  ·  T timeline  ·  Esc "
                     + (root.recordingsReturn === "alerts" ? "alerts" : "live")
                   : "←/→ switch camera  ·  1–9 jump  ·  M mute  ·  R recordings  ·  P or double-click pop out  ·  Esc back"
             color: root.dim
@@ -2247,7 +2297,7 @@ Panel {
               textFormat: Text.PlainText
               visible: root.configured && root.cameras.length > 0
               width: parent.width
-              text: "Click or Enter for live  ·  P pop out  ·  W wall  ·  "
+              text: "Click or Enter for live  ·  P pop out  ·  W wall  ·  T timeline  ·  "
                   + root.consoles.map(function(c) { return c.name }).join(", ")
               color: root.dim
               font.family: root.fontFamily

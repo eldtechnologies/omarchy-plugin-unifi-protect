@@ -3,6 +3,20 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
+## Unreleased
+
+### Added
+
+- **Timeline:** the camera grid above a timeline of the last 24 hours, in
+  a window of its own (**Timeline** in the panel, `T`, or
+  `eld-unifi-protect timeline`). Drag the timeline and every camera shown
+  goes to that moment: still frames while dragging, then the recordings
+  from there, in step. Each camera's lane shows where footage exists,
+  where there is none, and what was detected; `,` and `.` jump between
+  detections, `+`/`-` or the wheel zoom from 24 hours down to minutes.
+  `T` in a camera's recordings opens it at that moment. It needs the
+  recordings sign-in; the wall is unchanged and needs none.
+
 ## 0.5.0 — 2026-11-04
 
 ### Added

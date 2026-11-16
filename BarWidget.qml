@@ -95,6 +95,16 @@ BarWidget {
     function live(name: string): void {
       if (panelLoader.item) panelLoader.item.openLiveByName(name)
     }
+    // The camera grid over a timeline of recordings, in its own window;
+    // calling again closes it.
+    function timeline(): void {
+      var layout = String(root.setting("wallLayout", "auto")).trim().toLowerCase()
+      Quickshell.execDetached([decodeURIComponent(String(Qt.resolvedUrl("bin/eld-unifi-protect"))
+                                 .replace("file://", "")), "timeline", "--mode",
+                               root.setting("wallMode", "window") === "overlay" ? "overlay" : "window",
+                               "--sound", root.setting("sound", true) !== false ? "on" : "off",
+                               "--layout", /^(auto|row|column|[1-6]x[1-6]|1\+[57])$/.test(layout) ? layout : "auto"])
+    }
     // The same camera's recorded detections, newest playing.
     function recordings(name: string): void {
       if (panelLoader.item) panelLoader.item.openRecordingsByName(name)

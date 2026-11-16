@@ -110,8 +110,27 @@ class FakeConsole(http.server.BaseHTTPRequestHandler):
             return self.reply(200, json.dumps(events).encode())
         if url.path.endswith("/thumbnail"):
             return self.reply(200, JPEG, [("Content-Type", "image/jpeg")])
+        if url.path == "/proxy/protect/api/cameras":
+            oldest = int((time.time() - 86400 * 30) * 1000)
+            cameras = [
+                {"id": CAMERA, "recordingSettings": {"mode": "always"},
+                 "stats": {"video": {"recordingStart": oldest}}},
+                {"id": "cam2", "recordingSettings": {"mode": "detections"}, "stats": {"video": {}}},
+                {"id": "cam3", "recordingSettings": {"mode": "never"}},
+                {"id": "cam4", "recordingSettings": {"mode": "schedule"}},
+                {"id": "../etc", "recordingSettings": {"mode": "always"}},
+                "nonsense",
+            ]
+            return self.reply(200, json.dumps(cameras).encode())
+        if url.path.endswith("/recording-snapshot"):
+            self.server.last_still = query
+            if "/gone/" in url.path:
+                return self.reply(404)
+            return self.reply(200, JPEG, [("Content-Type", "image/jpeg")])
         if url.path == "/proxy/protect/api/video/export":
             self.server.last_export = query
+            if query.get("camera") == ["gone"]:
+                return self.reply(404)
             if query.get("camera") == ["empty"]:
                 return self.reply(200, b'{"error":"no recording"}')
             return self.reply(200, MP4, [("Content-Type", "video/mp4")])
@@ -152,6 +171,7 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
             if os.path.exists(path):
                 os.remove(path)
         shutil.rmtree(h.CLIPS_DIR, ignore_errors=True)
+        shutil.rmtree(h.TIMELINE_DIR, ignore_errors=True)
         self.console = {"id": "nvr", "name": "NVR", "host": f"127.0.0.1:{self.server.server_port}",
                         "certSha256": self.pin, "apiKey": "k", "loginUser": "viewer", "loginPassword": "right"}
         self.config = {"consoles": [self.console]}
@@ -347,6 +367,191 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         with self.assertRaisesRegex(h.ProtectError, "no video"):
             h.fetch_clip(self.config, "nvr_empty", start, start + 5, "low")
         self.assertEqual([n for n in os.listdir(h.CLIPS_DIR)], [])
+
+    # ---- timeline ----
+
+    def test_timeline_index_says_where_footage_is(self):
+        other = {"id": "gw", "name": "Gateway", "host": "127.0.0.1:1", "certSha256": self.pin, "apiKey": "k"}
+        config = {"consoles": [self.console, other]}
+        uids = [f"nvr_{CAMERA}", "nvr_cam2", "nvr_cam3", "nvr_cam4", "nvr_unknown", "gw_cam9",
+                "nowhere_cam1", "nvr_../etc"]
+        index = h.timeline_index(config, uids)["cameras"]
+        self.assertEqual({uid: c.get("coverage") for uid, c in index.items()},
+                         {f"nvr_{CAMERA}": "always", "nvr_cam2": "events", "nvr_cam3": "never",
+                          "nvr_cam4": "unknown", "nvr_unknown": "unknown", "gw_cam9": None})
+        self.assertAlmostEqual(index[f"nvr_{CAMERA}"]["from"], time.time() - 86400 * 30, delta=5)
+        self.assertIsNone(index["nvr_cam2"]["from"])
+        # Motion too: on a camera that records detections only, it is footage.
+        self.assertIn("motion", self.server.last_query["types"])
+        self.assertEqual([e["kind"] for e in index[f"nvr_{CAMERA}"]["events"]], ["vehicle", "ring"])
+        self.assertEqual(set(index[f"nvr_{CAMERA}"]["events"][0]), {"kind", "start", "end"})
+        # No sign-in on that console: said so, and nothing asked of it.
+        self.assertTrue(index["gw_cam9"]["needsLogin"])
+        self.assertEqual(index["gw_cam9"]["console"], "gw")
+
+    def test_timeline_index_with_a_rejected_login(self):
+        FakeConsole.password = "changed"
+        index = h.timeline_index(self.config, [f"nvr_{CAMERA}"])["cameras"]
+        self.assertTrue(index[f"nvr_{CAMERA}"]["needsLogin"])
+        self.assertIn("rejected", index[f"nvr_{CAMERA}"]["loginError"])
+        self.assertEqual(FakeConsole.logins, 1)
+
+    def timeline_server(self):
+        out = io.StringIO()
+        return h.TimelineServer(self.config, out), out
+
+    def replies(self, out):
+        return {r["id"]: r for r in map(json.loads, out.getvalue().splitlines())}
+
+    def test_timeline_stills(self):
+        server, out = self.timeline_server()
+        at = time.time() - 3600
+        paths = []
+        for n in range(4):
+            server.handle({"id": n, "op": "still", "uid": f"nvr_{CAMERA}", "at": at + n,
+                           "quality": "low", "slot": "grid"})
+            paths.append(self.replies(out)[n]["path"])
+        self.assertEqual(self.server.last_still["channel"], ["2"])
+        self.assertEqual(int(self.server.last_still["ts"][0]), int((at + 3) * 1000))
+        # A new file each time (the window swaps pictures); only the last two stay.
+        self.assertEqual(len(set(paths)), 4)
+        self.assertEqual([os.path.exists(p) for p in paths], [False, False, True, True])
+        with open(paths[-1], "rb") as handle:
+            self.assertEqual(handle.read(), JPEG)
+        self.assertEqual(os.stat(paths[-1]).st_mode & 0o777, 0o600)
+        self.assertTrue(paths[-1].startswith(h.TIMELINE_DIR + os.sep))
+        server.handle({"id": "gone", "op": "still", "uid": "nvr_gone", "at": at, "quality": "low", "slot": "grid"})
+        self.assertTrue(self.replies(out)["gone"]["noFootage"])
+        for bad in ({"slot": "../x"}, {"quality": "best"}, {"at": "soon"}, {"at": float("nan")},
+                    {"at": True}, {"uid": "nvr_../etc"}, {"uid": None}):
+            request = dict({"id": "bad", "op": "still", "uid": f"nvr_{CAMERA}", "at": at,
+                            "quality": "low", "slot": "grid"}, **bad)
+            server.handle(request)
+            reply = self.replies(out)["bad"]
+            self.assertFalse(reply["ok"], bad)
+            self.assertNotIn("noFootage", reply, bad)
+
+    def test_timeline_clips(self):
+        server, out = self.timeline_server()
+        start = (time.time() - 3600) // 60 * 60
+        request = {"id": 1, "op": "clip", "uid": f"nvr_{CAMERA}", "start": start, "end": start + 60,
+                   "quality": "low"}
+        server.handle(request)
+        reply = self.replies(out)[1]
+        self.assertEqual((reply["ok"], reply["start"], reply["end"]), (True, start, start + 60))
+        self.assertEqual(self.server.last_export["channel"], ["2"])
+        self.assertEqual(int(self.server.last_export["start"][0]), int(start * 1000))
+        with open(reply["path"], "rb") as handle:
+            self.assertEqual(handle.read(), MP4)
+        self.assertEqual(os.stat(reply["path"]).st_mode & 0o777, 0o600)
+        # The same minute again (played, and fetched ahead): one export.
+        exports = sum(1 for _, p in FakeConsole.log if p.endswith("/export"))
+        server.handle(dict(request, id=2))
+        self.assertEqual(self.replies(out)[2]["path"], reply["path"])
+        self.assertEqual(sum(1 for _, p in FakeConsole.log if p.endswith("/export")), exports)
+        # No footage is an answer of its own, whichever way the console says it.
+        for camera in ("gone", "empty"):
+            server.handle(dict(request, id=camera, uid=f"nvr_{camera}"))
+            self.assertTrue(self.replies(out)[camera]["noFootage"], camera)
+        server.handle(dict(request, id="future", start=time.time() + 600, end=time.time() + 660))
+        self.assertTrue(self.replies(out)["future"]["noFootage"])
+        for bad in ({"end": start}, {"end": start + 86400}, {"quality": "best"}, {"start": "x"}):
+            server.handle(dict(request, id="bad", **bad))
+            self.assertFalse(self.replies(out)["bad"]["ok"], bad)
+            self.assertNotIn("noFootage", self.replies(out)["bad"], bad)
+        self.assertEqual(sorted(os.listdir(os.path.join(h.TIMELINE_DIR, "clips"))),
+                         [os.path.basename(reply["path"])])
+
+    def test_timeline_without_a_login_asks_for_one(self):
+        del self.console["loginUser"], self.console["loginPassword"]
+        server, out = self.timeline_server()
+        server.handle({"id": 1, "op": "still", "uid": f"nvr_{CAMERA}", "at": time.time() - 60,
+                       "quality": "low", "slot": "grid"})
+        self.assertTrue(self.replies(out)[1]["needsLogin"])
+        self.assertEqual(FakeConsole.logins, 0)
+
+    def test_timeline_serve_answers_each_line(self):
+        server, out = self.timeline_server()
+        start = (time.time() - 3600) // 60 * 60
+        server.serve([
+            "not json\n", "[1, 2]\n", json.dumps({"id": 1, "op": "nonsense"}) + "\n",
+            json.dumps({"id": 2, "op": "index", "uids": [f"nvr_{CAMERA}", 7]}) + "\n",
+            json.dumps({"id": 3, "op": "clip", "uid": f"nvr_{CAMERA}", "start": start, "end": start + 60,
+                        "quality": "low"}) + "\n",
+            "x" * 70000 + "\n",
+        ])
+        replies = self.replies(out)
+        self.assertEqual(sorted(replies), [1, 2, 3])
+        self.assertFalse(replies[1]["ok"])
+        self.assertEqual(list(replies[2]["cameras"]), [f"nvr_{CAMERA}"])
+        self.assertTrue(replies[3]["ok"])
+        # One sign-in for all of it.
+        self.assertEqual(FakeConsole.logins, 1)
+
+    def test_old_timeline_clips_are_pruned(self):
+        folder = os.path.join(h.TIMELINE_DIR, "clips")
+        os.makedirs(folder)
+        for n in range(6):
+            path = os.path.join(folder, f"{n}.mp4")
+            with open(path, "wb") as handle:
+                handle.write(b"x" * 10)
+            os.utime(path, (1000 + n, 1000 + n))
+        with mock.patch.object(h, "TIMELINE_CLIPS_KEEP", 3):
+            h.prune_timeline_clips(keep_path=os.path.join(folder, "0.mp4"))
+        self.assertEqual(sorted(os.listdir(folder)), ["0.mp4", "3.mp4", "4.mp4", "5.mp4"])
+
+
+class TimelineRules(unittest.TestCase):
+    def test_the_moment_can_come_from_the_environment(self):
+        # The panel keeps times off the command line.
+        args = argparse.Namespace(at=None)
+        with mock.patch.object(h, "open_wall") as opened, \
+                mock.patch.dict(os.environ, {"ELD_UNIFI_PROTECT_EVENT": json.dumps({"start": 1234.5, "end": None})}):
+            h.cmd_timeline(args)
+        opened.assert_called_once_with(args, timeline=True)
+        self.assertEqual(args.at, 1234.5)
+        for bad in ("nonsense", "{}", json.dumps({"start": "soon"})):
+            with mock.patch.object(h, "open_wall"), \
+                    mock.patch.dict(os.environ, {"ELD_UNIFI_PROTECT_EVENT": bad}):
+                with self.assertRaisesRegex(h.ProtectError, "--at"):
+                    h.cmd_timeline(argparse.Namespace(at=None))
+        with mock.patch.object(h, "open_wall"):
+            with self.assertRaisesRegex(h.ProtectError, "Unix seconds"):
+                h.cmd_timeline(argparse.Namespace(at=float("inf")))
+
+    def test_the_timeline_is_not_the_wall(self):
+        # Two windows of one Quickshell config, told apart by how they were
+        # started: closing one must never close the other.
+        self.assertNotEqual(h.WALL_ARGV, h.TIMELINE_ARGV)
+        # One file, reached through two folders: two configs to Quickshell.
+        for _ in range(2):      # again over the link already there
+            h.link_timeline_shell()
+        self.assertTrue(os.path.samefile(os.path.join(h.TIMELINE_QML_DIR, "shell.qml"),
+                                         os.path.join(h.WALL_DIR, "shell.qml")))
+        self.assertEqual(os.listdir(h.TIMELINE_QML_DIR), ["shell.qml"])
+        self.assertNotEqual(os.path.realpath(h.TIMELINE_QML_DIR), os.path.realpath(h.WALL_DIR))
+        self.assertNotEqual(h.WALL_PID, h.TIMELINE_PID)
+        self.assertNotEqual(h.WALL_CONFIG, h.TIMELINE_CONFIG)
+        os.makedirs(h.RUNTIME_DIR, mode=0o700, exist_ok=True)
+        with open(h.TIMELINE_PID, "w") as handle:
+            handle.write(f"{os.getpid()} {h.process_start_time(os.getpid())}")
+        try:
+            self.assertIsNone(h.running_wall(h.TIMELINE_PID, h.TIMELINE_ARGV))   # this is no Quickshell
+            self.assertIsNone(h.running_wall())
+        finally:
+            os.remove(h.TIMELINE_PID)
+
+    def test_demo_cameras_that_record_detections_only_have_gaps(self):
+        session = h.DemoSession({"id": "nvr", "demo": True})
+        modes = session.recording_modes()
+        self.assertEqual(modes[h.demo_camera_id("garden")]["coverage"], "events")
+        self.assertEqual(modes[h.demo_camera_id("driveway")]["coverage"], "always")
+        now = time.time()
+        with self.assertRaises(h.NoFootage):
+            session.footage(h.demo_camera_id("garden"), now - 70, now - 65)
+        session.footage(h.demo_camera_id("driveway"), now - 70, now - 65)
+        event = session.events(h.demo_camera_id("garden"), now - 86400, now)[0]
+        session.footage(h.demo_camera_id("garden"), event["start"], event["start"] + 2)
 
 
 class ClipRules(unittest.TestCase):
