@@ -516,7 +516,7 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         for n in range(4):
             threads.append(threading.Thread(target=server.handle, args=(dict(request, id=n),)))
             threads[-1].start()
-            time.sleep(0.05)       # the third arrives after the first has failed
+            time.sleep(0.05)       # the fourth arrives after the first has failed
         for thread in threads:
             thread.join()
         self.assertEqual(state["peak"], 1)

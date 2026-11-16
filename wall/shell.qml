@@ -268,8 +268,10 @@ ShellRoot {
       time = current - liveEdge
     }
     // Before the playhead moves and before `reviewing`: tiles must not
-    // fetch a clip for a playhead that is still being dragged.
+    // fetch a clip for a playhead that is still being dragged, and what
+    // they ask for a settled move must carry that move's number.
     if (!settled) scrubbing = true
+    else seekSerial++
     playhead = Math.max(current - reach + 60, time)
     reviewing = true
     if (settled) settle()
@@ -280,11 +282,12 @@ ShellRoot {
     // Stepped or dragged up to the end: that is live. (The end has moved
     // on a little since the playhead was put there.)
     if (playhead >= Date.now() / 1000 - liveEdge - 5) { goLive(); return }
+    // The move's number first: tiles ask for clips as scrubbing ends.
+    seekSerial++
     scrubbing = false
     anchorPlayhead = playhead
     anchorWall = Date.now()
     keepInView()
-    seekSerial++
   }
 
   function stepBy(seconds) {
@@ -417,10 +420,12 @@ ShellRoot {
     onStarted: {
       shell.backendStarted = Date.now()
       shell.backendReady = true
+      backendSettled.restart()
       shell.loadIndex()
     }
     onExited: {
       shell.backendReady = false
+      backendSettled.stop()
       shell.pendingReplies = ({})
       // One that stops as soon as it starts is tried less and less often,
       // and the strip says so.
@@ -437,6 +442,13 @@ ShellRoot {
     id: backendRestart
     interval: 3000
     onTriggered: backend.running = true
+  }
+
+  // One that has stayed up is no longer one that keeps stopping.
+  Timer {
+    id: backendSettled
+    interval: 10000
+    onTriggered: shell.backendFailures = 0
   }
 
   // New detections for the lanes.
@@ -467,9 +479,12 @@ ShellRoot {
     onTriggered: {
       var time = shell.anchorPlayhead + (Date.now() - shell.anchorWall) / 1000
       if (time > Date.now() / 1000 - shell.liveEdge + 3) { shell.goLive(); return }
+      var before = shell.playhead
       shell.playhead = time
       // Played off the right-hand end of the stretch shown: turn the page.
-      if (shell.viewEnd > 0 && time > shell.viewEndTime) shell.setViewEnd(time + shell.span * 0.8)
+      // Only as it crosses: a view moved elsewhere on purpose stays there.
+      if (shell.viewEnd > 0 && before <= shell.viewEndTime && time > shell.viewEndTime)
+        shell.setViewEnd(time + shell.span * 0.8)
     }
   }
 
@@ -670,9 +685,12 @@ ShellRoot {
     readonly property var info: shell.index[uid] || null
     readonly property bool needsLogin: !!(info && info.needsLogin)
     property string stillPath: ""
+    // Where the still on screen was taken, and where one was last asked for.
     property real stillAt: -1
+    property real stillAsked: -1
     property bool stillBusy: false
-    // { path, start, end, chunk }: what the player holds.
+    // { path, start, end, chunk, seek }: what the player holds, and the
+    // move of the playhead it was fetched for.
     property var clip: null
     property bool positioned: false
     property real askedChunk: -1
@@ -687,12 +705,13 @@ ShellRoot {
     // the next, the old clip's last frame stays up for that moment.
     readonly property bool clipCurrent: clip !== null && clip.chunk === shell.chunkStart
     readonly property bool clipUsable: clipCurrent
-                                       || (clip !== null && clip.chunk === shell.chunkStart - shell.chunkSeconds)
+                                       || (clip !== null && clip.seek === shell.seekSerial
+                                           && clip.chunk === shell.chunkStart - shell.chunkSeconds)
     // A still is worth showing only close to where it was taken.
     readonly property bool stillFresh: stillPath !== "" && Math.abs(stillAt - shell.playhead) < 4
 
     function refresh() {
-      if (!active || !shell.reviewing || !shell.backendReady || needsLogin) return
+      if (!active || uid === "" || !shell.reviewing || !shell.backendReady || needsLogin) return
       if (shell.scrubbing) {
         player.pause()
         wantStill()
@@ -701,7 +720,11 @@ ShellRoot {
         // there until the clip comes (unless there is none to come).
         if (!clipUsable) {
           if (clip !== null) player.pause()
-          if (failedChunk !== shell.chunkStart) wantStill()
+          if (failedChunk !== shell.chunkStart) {
+            // What went wrong in the minute left behind says nothing of this one.
+            problem = ""
+            wantStill()
+          }
         }
         wantClip(false)
         fetchAhead()
@@ -722,6 +745,8 @@ ShellRoot {
       fetchedAhead = -1
       stillPath = ""
       stillAt = -1
+      stillAsked = -1
+      refetchedAt = 0
       problem = ""
       player.stop()
       player.source = ""
@@ -736,20 +761,24 @@ ShellRoot {
     function wantStill() {
       if (stillBusy) return
       var at = shell.playhead
-      if (stillAt >= 0 && Math.abs(at - stillAt) < 0.5) return
+      if (stillAsked >= 0 && Math.abs(at - stillAsked) < 0.5) return
+      stillAsked = at
       stillBusy = true
       var mine = stillSerial
       shell.ask({ op: "still", uid: uid, at: at, quality: "low", slot: slot }, function(reply) {
         if (mine !== playback.stillSerial) return     // for the camera shown before
         playback.stillBusy = false
-        playback.stillAt = at
         if (reply.ok) {
           playback.stillPath = reply.path
+          playback.stillAt = at
           // Not over a clip's own failure, which came after the drag.
           if (shell.scrubbing) playback.problem = ""
-        } else if (shell.scrubbing) {
+        } else {
+          // No picture from here: the one from elsewhere must not stand in.
           playback.stillPath = ""
-          playback.problem = reply.noFootage ? "nofootage" : (reply.error || "no picture")
+          playback.stillAt = -1
+          if (shell.scrubbing)
+            playback.problem = reply.noFootage ? "nofootage" : (reply.error || "no picture")
         }
         if (shell.scrubbing && playback.active) playback.wantStill()
       })
@@ -786,7 +815,8 @@ ShellRoot {
         playback.problem = ""
         playback.failedChunk = -1
         playback.positioned = false
-        playback.clip = { path: reply.path, start: reply.start, end: reply.end, chunk: chunk }
+        playback.clip = { path: reply.path, start: reply.start, end: reply.end, chunk: chunk,
+                          seek: shell.seekSerial }
         // The same file again (back from an enlarged camera within the
         // minute) would not load anew, and so never be lined up.
         if (String(player.source) === "file://" + reply.path) {
