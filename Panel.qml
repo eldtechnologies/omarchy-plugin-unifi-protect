@@ -724,6 +724,9 @@ Panel {
     root.openTimeline(at)
   }
 
+  // "Add console" and the like, tucked behind the cog in the header.
+  property bool settingsOpen: false
+
   // ---- setup, inside the panel ----
   //
   // Two steps, each a call to the helper: setup-probe fetches the console's
@@ -1320,18 +1323,36 @@ Panel {
               onTriggered: root.openTimeline(0)
             }
 
-            ActionButton {
+            // A link, not a button: it leaves for the browser.
+            Text {
+              id: protectLink
               visible: !root.liveMode && !root.settingUp && !root.alertsView && root.configured
-              label: "Add console"
-              outlined: true
-              onTriggered: root.addConsole()
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              leftPadding: Style.space(4)
+              rightPadding: Style.space(2)
+              text: "Protect ↗"
+              color: protectArea.containsMouse ? root.foreground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.underline: protectArea.containsMouse
+
+              MouseArea {
+                id: protectArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openConsole()
+              }
             }
 
             ActionButton {
               visible: !root.liveMode && !root.settingUp && !root.alertsView && root.configured
-              label: "Protect"
+              iconText: "󰒓"
+              tooltipText: "Settings"
               outlined: true
-              onTriggered: root.openConsole()
+              active: root.settingsOpen
+              onTriggered: root.settingsOpen = !root.settingsOpen
             }
           }
         }
@@ -1979,6 +2000,31 @@ Panel {
             id: content
             width: bodyScroll.width
             spacing: Style.space(10)
+
+            // ---- settings, behind the cog ----
+            Row {
+              visible: root.settingsOpen && root.configured
+              width: parent.width
+              spacing: Style.space(8)
+
+              Text {
+                textFormat: Text.PlainText
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.consoles.length + (root.consoles.length === 1 ? " console" : " consoles")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              ActionButton {
+                label: "Add console"
+                outlined: true
+                onTriggered: {
+                  root.settingsOpen = false
+                  root.addConsole()
+                }
+              }
+            }
 
             Text {
               visible: root.setupDone !== ""

@@ -17,6 +17,12 @@ All notable changes to this plugin. The version is set in `manifest.json`;
   `T` in a camera's recordings opens it at that moment. It needs the
   recordings sign-in; the wall is unchanged and needs none.
 
+### Changed
+
+- **Panel header:** **Add console** is behind a settings cog, and
+  **Protect** is a link marked as opening the browser rather than a
+  button.
+
 ## 0.5.0 — 2026-11-04
 
 ### Added

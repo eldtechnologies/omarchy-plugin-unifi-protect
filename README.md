@@ -72,7 +72,8 @@ eld-unifi-protect setup
 
 ### Connecting a console
 
-Setup runs inside the panel (**Run setup**, or **Add console** later); the
+Setup runs inside the panel (**Run setup**, or **Add console** behind the
+cog in the header later); the
 same steps are available in a terminal with `eld-unifi-protect setup`. It asks
 for the console's address, shows the fingerprint of its TLS certificate for
 you to confirm, then asks for an API key. Pinning trusts the certificate
@@ -107,7 +108,7 @@ rejected (HTTP 401), create one on the console as above instead.
 ### Several consoles
 
 Each UniFi console runs its own Protect with its own API key; a gateway's key
-does not work on an NVR. Run setup once per console, or click **Add console**
+does not work on an NVR. Run setup once per console, or click the cog and **Add console**
 in the panel. All cameras land in one grid, labelled with their console.
 
 A camera moved from one console to another stays listed on the old one as
