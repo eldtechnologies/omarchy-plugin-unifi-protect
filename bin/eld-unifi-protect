@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
@@ -92,6 +93,14 @@ def plugin_version():
 
 class ProtectError(Exception):
     pass
+
+
+class NotFound(ProtectError):
+    """The console answered 404."""
+
+
+class NoFootage(ProtectError):
+    """The console holds no recording for the time asked for."""
 
 
 class LoginRejected(ProtectError):
@@ -2113,6 +2122,14 @@ def cmd_stop(args):
             stopped.append("camera wall")
         except ProcessLookupError:
             pass
+    pid = running_wall(TIMELINE_PID, TIMELINE_ARGV)
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped.append("timeline")
+        except ProcessLookupError:
+            pass
+    shutil.rmtree(TIMELINE_DIR, ignore_errors=True)
     info = read_relay_info()
     if relay_alive(info) and stop_process(info["pid"], info["started"], b"relay"):
         stopped.append("stream relay")
@@ -2240,6 +2257,8 @@ DEMO_CAMERAS = [
     ("nvr", "side-path", "Side Path", "G6 Instant"),
 ]
 DEMO_ARMED = ("Front Door", "Driveway")
+# Cameras that record detections only, to show gaps in the timeline.
+DEMO_EVENTS_ONLY = ("garden", "side-path")
 # (minutes ago, camera, kind, seconds long or None for ongoing)
 DEMO_ALERTS = [(240, "Gate", "vehicle", 22), (95, "Garden", "animal", 41),
                (38, "Front Door", "ring", 9), (14, "Driveway", "vehicle", 17),
@@ -2349,7 +2368,7 @@ def cmd_demo(args):
                 os.remove(path)
             except FileNotFoundError:
                 pass
-        for folder in (DEMO_DIR, ALERT_IMAGES_DIR, SNAP_DIR, RECORDINGS_DIR, CLIPS_DIR):
+        for folder in (DEMO_DIR, ALERT_IMAGES_DIR, SNAP_DIR, RECORDINGS_DIR, CLIPS_DIR, TIMELINE_DIR):
             shutil.rmtree(folder, ignore_errors=True)
         # Your own alert log and pictures, set aside by `demo on`, come back.
         for name in DEMO_SET_ASIDE:
@@ -2671,6 +2690,10 @@ THUMBNAILS_BUDGET = 16 * 1024 * 1024   # per camera listing
 RECORDINGS_KEEP_CAMERAS = 8   # cameras whose thumbnails stay in memory
 CLIP_DEADLINE = 900        # seconds for a whole export, even a slow 600 MB one
 CLIP_CHANNELS = {"high": 0, "medium": 1, "low": 2}
+STILL_MAX_BYTES = 4 * 1024 * 1024
+# Protect's recording modes, as the timeline draws them.
+RECORDING_MODES = {"always": "always", "never": "never", "detections": "events",
+                   "motion": "events", "smartDetect": "events"}
 RECORDING_KINDS = ("person", "vehicle", "animal", "package", "face", "licensePlate")
 
 
@@ -3061,8 +3084,8 @@ class ProtectSession:
                 raise ProtectError("this account may not view recordings; give it a Protect role "
                                    "that can (View Only or higher)")
             if response.status == 404:
-                raise ProtectError("not found: the recordings endpoint may have changed in this "
-                                   "Protect version")
+                raise NotFound("not found: the recordings endpoint may have changed in this "
+                               "Protect version")
             raise ProtectError(f"HTTP {response.status} from console: {detail}")
         raise ProtectError("the console keeps refusing the session")
 
@@ -3109,12 +3132,54 @@ class ProtectSession:
             raise ProtectError("console sent no thumbnail")
         return data
 
+    def still(self, camera_id, at, quality):
+        """One frame of the recording at a time (seconds), as a JPEG."""
+        try:
+            data = self.get(f"/cameras/{camera_id}/recording-snapshot", params={
+                "ts": int(at * 1000), "w": 640, "channel": CLIP_CHANNELS[quality]},
+                limit=STILL_MAX_BYTES)
+        except NotFound:
+            # What the console answers for a time it has no footage of.
+            raise NoFootage("the console has no picture for that time")
+        if not is_complete_jpeg(data):
+            raise NoFootage("the console sent no picture for that time")
+        return data
+
+    def recording_modes(self):
+        """How each camera records: {camera id: {"coverage", "from"}}.
+
+        coverage is "always", "events" (around motion and detections only),
+        "never" or "unknown" (a schedule, say); from is the oldest footage
+        the console holds, in seconds, or None.
+        """
+        try:
+            raw = json.loads(self.get("/cameras", limit=32 * 1024 * 1024))
+        except (ValueError, RecursionError):
+            raise ProtectError("console sent an unreadable camera list")
+        modes = {}
+        for camera in raw if isinstance(raw, list) else []:
+            if not isinstance(camera, dict) or not CAMERA_ID.fullmatch(str(camera.get("id") or "")):
+                continue
+            settings = camera.get("recordingSettings")
+            mode = settings.get("mode") if isinstance(settings, dict) else None
+            mode = mode if isinstance(mode, str) else None
+            stats = camera.get("stats")
+            video = stats.get("video") if isinstance(stats, dict) else None
+            oldest = event_time(video.get("recordingStart")) if isinstance(video, dict) else None
+            modes[camera["id"]] = {"coverage": RECORDING_MODES.get(mode, "unknown"), "from": oldest}
+        return modes
+
     def export(self, camera_id, start, end, quality, path):
         """Write the recording between two times (seconds) to path as MP4."""
-        conn, response = self.open("/video/export", params={
-            "camera": camera_id, "start": int(start * 1000), "end": int(end * 1000),
-            "channel": CLIP_CHANNELS[quality]}, timeout=120, deadline=CLIP_DEADLINE)
-        partial = f"{path}.{os.getpid()}.part"
+        try:
+            conn, response = self.open("/video/export", params={
+                "camera": camera_id, "start": int(start * 1000), "end": int(end * 1000),
+                "channel": CLIP_CHANNELS[quality]}, timeout=120, deadline=CLIP_DEADLINE)
+        except NotFound:
+            # What the console answers for a time it has no footage of.
+            raise NoFootage("the console has no video for that time; is the camera recording it?")
+        # Its own name: two exports to one path must not share a file.
+        partial = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.part"
         written = 0
         try:
             with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as out:
@@ -3132,8 +3197,8 @@ class ProtectSession:
                 raise ProtectError("the console stopped sending the clip partway; try again")
             # An MP4 starts with an "ftyp" box; anything else is an error page.
             if written < 1024 or head[4:8] != b"ftyp":
-                raise ProtectError("the console sent no video for that time; "
-                                   "is the camera recording it?")
+                raise NoFootage("the console sent no video for that time; "
+                                "is the camera recording it?")
             os.replace(partial, path)
         except http.client.HTTPException:
             raise ProtectError("the console stopped sending the clip partway; try again")
@@ -3160,17 +3225,42 @@ class DemoSession:
         slug = next((s for _, s, _, _ in DEMO_CAMERAS if demo_camera_id(s) == camera_id), "")
         rng = random.Random(slug)
         kinds = ["person", "vehicle", "person", "animal", "ring" if slug == "front-door" else "person"]
-        events, at = [], until - rng.uniform(120, 900)
+        # Counted back from the top of the hour, so that the events stay
+        # where they are from one listing to the next.
+        events, at = [], until - until % 3600 - rng.uniform(120, 900)
         while at > since and len(events) < 14:
             length = rng.uniform(6, 48)
             events.append({"id": f"demo{len(events)}{(camera_id or '')[:8]}", "kind": rng.choice(kinds),
                            "start": at, "end": at + length, "score": rng.randint(70, 98)})
             at -= rng.uniform(900, 7200)
         if motion:
-            events.append({"id": f"demom{(camera_id or '')[:8]}", "kind": "motion", "start": until - 1800,
-                           "end": until - 1790, "score": None})
+            events.append({"id": f"demom{(camera_id or '')[:8]}", "kind": "motion",
+                           "start": until - until % 3600 - 1800,
+                           "end": until - until % 3600 - 1790, "score": None})
             events.sort(key=lambda e: e["start"], reverse=True)
         return events
+
+    def still(self, camera_id, at, quality):
+        with open(os.path.join(DEMO_DIR, f"{camera_id}.jpg"), "rb") as handle:
+            return handle.read()
+
+    def recording_modes(self):
+        return {demo_camera_id(slug): {"coverage": "events" if slug in DEMO_EVENTS_ONLY else "always",
+                                       "from": time.time() - 30 * 86400}
+                for _, slug, _, _ in DEMO_CAMERAS}
+
+    def footage(self, camera_id, start, end):
+        """Cameras that record detections only have footage around those.
+
+        For the timeline, to show its gaps; `clip` plays any demo event.
+        """
+        if camera_id not in [demo_camera_id(s) for s in DEMO_EVENTS_ONLY]:
+            return
+        now = time.time()
+        for event in self.events(camera_id, now - 86400, now, motion=True):
+            if event["start"] - TIMELINE_EVENT_PAD < end and (event["end"] or now) + TIMELINE_EVENT_PAD > start:
+                return
+        raise NoFootage("the console sent no video for that time; is the camera recording it?")
 
     def thumbnail(self, event_id):
         camera = next(demo_camera_id(s) for _, s, _, _ in DEMO_CAMERAS if demo_camera_id(s)[:8] in event_id)
@@ -3281,6 +3371,367 @@ def fetch_clip(config, uid, start, end, quality):
         ProtectSession(console, config).export(camera_id, clip_start, clip_end, quality, path)
     prune_clips(keep_path=path)
     return {"path": path, "start": clip_start, "end": clip_end}
+
+
+# ---- timeline ----
+#
+# The timeline window scrubs through recordings: still frames while the
+# playhead is dragged, then clips a minute long from where it is let go. It
+# asks for them over a pipe (`timeline-serve`), since a helper process per
+# picture would spend longer starting up than fetching.
+TIMELINE_DIR = os.path.join(RUNTIME_DIR, "timeline")
+TIMELINE_HOURS = 24
+TIMELINE_EVENTS = 1000          # per camera
+TIMELINE_EVENT_PAD = 10         # seconds a detections-only camera records either side
+TIMELINE_CLIP_SECONDS = 600     # the longest stretch one request may export
+TIMELINE_CLIPS_KEEP = 80
+TIMELINE_CLIPS_MAX_BYTES = 500 * 1024 * 1024   # clips live in RAM (the runtime dir)
+TIMELINE_SLOT = re.compile(r"[a-z]{1,8}")
+
+
+def timeline_target(config, uid):
+    """The console and camera id behind a uid; a ProtectError for any other."""
+    console_id, _, camera_id = str(uid).partition("_")
+    console = next((c for c in config["consoles"] if c["id"] == console_id), None)
+    if console is None or not CAMERA_ID.fullmatch(camera_id):
+        raise ProtectError(f"no camera {uid!r}")
+    return console, camera_id
+
+
+def timeline_index(config, uids, hours=TIMELINE_HOURS, session_for=None):
+    """Per camera: where footage exists and what was detected, for the lanes.
+
+    session_for gives the signed-in session of a console; the server passes
+    its own, so that everything it fetches shares one sign-in per console.
+    """
+    session_for = session_for or (lambda console: ProtectSession(console, config))
+    now = time.time()
+    by_console = {}
+    for uid in uids:
+        try:
+            console, camera_id = timeline_target(config, uid)
+        except ProtectError:
+            continue
+        by_console.setdefault(console["id"], (console, []))[1].append((uid, camera_id))
+    cameras = {}
+
+    def one_console(entry):
+        console, wanted = entry
+        if not has_login(console):
+            return {uid: {"needsLogin": True, "console": console["id"], "events": []} for uid, _ in wanted}
+        try:
+            session = session_for(console)
+            modes = session.recording_modes()
+
+            def one_camera(pair):
+                uid, camera_id = pair
+                mode = modes.get(camera_id) or {"coverage": "unknown", "from": None}
+                events = session.events(camera_id, now - hours * 3600, now, motion=True,
+                                        limit=TIMELINE_EVENTS)
+                return uid, dict(mode, console=console["id"],
+                                 events=[{"kind": e["kind"], "start": e["start"], "end": e["end"]}
+                                         for e in events])
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                return dict(pool.map(one_camera, wanted))
+        except LoginRejected as error:
+            return {uid: {"needsLogin": True, "loginError": str(error), "console": console["id"],
+                          "events": []} for uid, _ in wanted}
+        except ProtectError as error:
+            return {uid: {"error": str(error), "console": console["id"], "events": []}
+                    for uid, _ in wanted}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for result in pool.map(one_console, by_console.values()):
+            cameras.update(result)
+    return {"cameras": cameras, "at": now, "hours": hours}
+
+
+def timeline_clip_path(folder, uid, start, end, quality):
+    key = hashlib.sha256(f"{uid}|{start:.3f}|{end:.3f}|{quality}".encode()).hexdigest()[:24]
+    return os.path.join(folder, "clips", f"{key}.mp4")
+
+
+def prune_timeline_clips(folder, keep_path=None):
+    """Least recently used clips go once there are too many or they fill too much RAM."""
+    folder = os.path.join(folder, "clips")
+    entries = []
+    for name in os.listdir(folder) if os.path.isdir(folder) else []:
+        path = os.path.join(folder, name)
+        try:
+            stat = os.stat(path)
+            if name.endswith(".part"):
+                if stat.st_mtime < time.time() - 600:
+                    os.remove(path)
+            elif name.endswith(".mp4"):
+                entries.append((stat.st_mtime, stat.st_size, path))
+        except FileNotFoundError:
+            pass
+    total = 0
+    for index, (_, size, path) in enumerate(sorted(entries, reverse=True)):
+        total += size
+        if path != keep_path and (index >= TIMELINE_CLIPS_KEEP or total > TIMELINE_CLIPS_MAX_BYTES):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+
+def sweep_timeline_dirs():
+    """Remove what timeline servers that are gone left behind.
+
+    Each server keeps its files in a folder named for its pid, so one that
+    is still winding down can never delete a newer one's.
+    """
+    for name in os.listdir(TIMELINE_DIR) if os.path.isdir(TIMELINE_DIR) else []:
+        if name.isdigit() and int(name) != os.getpid() and os.path.exists(f"/proc/{name}"):
+            continue
+        shutil.rmtree(os.path.join(TIMELINE_DIR, name), ignore_errors=True)
+
+
+class TimelineServer:
+    """Answers the timeline window: one JSON request per line, one reply each.
+
+    {"id", "op": "index", "uids": [...]}
+    {"id", "op": "still", "uid", "at", "quality", "slot"}
+    {"id", "op": "clip", "uid", "start", "end", "quality", "serial"}
+
+    Replies carry the id and "ok"; a failure says why in "error", with
+    "noFootage", "needsLogin" or "superseded" set when that is the reason.
+    serial counts the window's moves of the playhead: a clip asked for
+    before a later move is not exported once its turn comes (superseded),
+    so a slow console is not kept busy with clips nobody will watch.
+    """
+
+    SESSION_RETRY = 30      # seconds before a session that failed to sign in is tried anew
+
+    def __init__(self, config, out=None, folder=None):
+        self.config = config
+        self.config_stamp = self.stamp()
+        self.out = out or sys.stdout
+        self.folder = folder or os.path.join(TIMELINE_DIR, str(os.getpid()))
+        self.out_lock = threading.Lock()
+        self.lock = threading.Lock()
+        self.sessions = {}      # console id -> (session, made at)
+        self.clip_locks = {}    # path -> [lock, users]
+        self.stills = {}        # (uid, slot) -> paths, oldest first
+        self.counter = 0
+        self.serial = 0
+
+    @staticmethod
+    def stamp():
+        try:
+            return os.stat(CONFIG_PATH).st_mtime_ns
+        except OSError:
+            return None
+
+    def session(self, console_id):
+        """The console's session, shared by every request; (console, session).
+
+        The window stays open for hours. A sign-in that failed because the
+        console was away is tried again after a while, and a login added or
+        replaced meanwhile (the config file changes) is picked up.
+        """
+        with self.lock:
+            stamp = self.stamp()
+            if stamp != self.config_stamp:
+                fresh = None if demo_on() else load_config()
+                if fresh:
+                    self.config, self.config_stamp = fresh, stamp
+                    self.sessions.clear()
+                    _key_cache.clear()
+            console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
+            if console is None:
+                raise ProtectError("no such console")
+            if not has_login(console):
+                raise LoginRejected("no login for recordings on this console")
+            session, made = self.sessions.get(console_id, (None, 0))
+            failed = session is not None and getattr(session, "login_error", None)
+            if session is None or (failed and time.monotonic() - made > self.SESSION_RETRY):
+                session = ProtectSession(console, self.config)
+                self.sessions[console_id] = (session, time.monotonic())
+            return console, session
+
+    def make(self, folder):
+        """A private folder inside this server's own (private too)."""
+        for path in (self.folder, folder):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+
+    def reply(self, request_id, **fields):
+        try:
+            with self.out_lock:
+                self.out.write(json.dumps(dict(fields, id=request_id)) + "\n")
+                self.out.flush()
+        except (OSError, ValueError):
+            pass    # the window is gone
+
+    def handle(self, request):
+        request_id = request.get("id") if isinstance(request, dict) else None
+        try:
+            op = request.get("op")
+            if op == "index":
+                uids = [u for u in request.get("uids") or [] if isinstance(u, str)][:64]
+                result = timeline_index(self.config, uids,
+                                        session_for=lambda console: self.session(console["id"])[1])
+            elif op == "still":
+                result = self.still(request)
+            elif op == "clip":
+                result = self.clip(request)
+            else:
+                raise ProtectError("unknown request")
+            self.reply(request_id, ok=True, **result)
+        except NoFootage as error:
+            self.reply(request_id, ok=False, noFootage=True, error=str(error))
+        except LoginRejected as error:
+            self.reply(request_id, ok=False, needsLogin=True, error=str(error))
+        except Superseded:
+            self.reply(request_id, ok=False, superseded=True, error="superseded")
+        except ProtectError as error:
+            self.reply(request_id, ok=False, error=str(error))
+        except Exception:     # one bad answer from a console must not end the server
+            self.reply(request_id, ok=False, error="console sent something unexpected")
+
+    @staticmethod
+    def number(request, name):
+        value = request.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ProtectError(f"{name} must be a number")
+        return float(value)
+
+    @staticmethod
+    def quality(request):
+        quality = request.get("quality")
+        if quality not in QUALITIES:
+            raise ProtectError("no such quality")
+        return quality
+
+    def target(self, request):
+        """(camera id, session) for the request's uid."""
+        console, camera_id = timeline_target(self.config, request.get("uid"))
+        return camera_id, self.session(console["id"])[1]
+
+    def note_serial(self, request):
+        """Remember the newest move of the playhead any request has told of."""
+        serial = request.get("serial") if isinstance(request, dict) else None
+        if isinstance(serial, int) and not isinstance(serial, bool):
+            with self.lock:
+                self.serial = max(self.serial, serial)
+
+    def still(self, request):
+        at, quality = self.number(request, "at"), self.quality(request)
+        slot = request.get("slot")
+        if not isinstance(slot, str) or not TIMELINE_SLOT.fullmatch(slot):
+            raise ProtectError("no such slot")
+        camera_id, session = self.target(request)
+        if hasattr(session, "footage"):     # demo mode's gaps
+            session.footage(camera_id, at, at)
+        data = session.still(camera_id, at, quality)
+        folder = os.path.join(self.folder, "stills")
+        self.make(folder)
+        with self.lock:
+            self.counter += 1
+            name = hashlib.sha256(f"{request['uid']}|{slot}".encode()).hexdigest()[:16]
+            path = os.path.join(folder, f"{name}-{self.counter}.jpg")
+        write_atomic(path, data)
+        with self.lock:
+            kept = self.stills.setdefault((request["uid"], slot), [])
+            kept.append(path)
+            # The window may still be showing the one before this.
+            stale, kept[:] = kept[:-2], kept[-2:]
+        for old in stale:
+            try:
+                os.remove(old)
+            except FileNotFoundError:
+                pass
+        return {"path": path, "at": at}
+
+    def clip(self, request):
+        start, end, quality = self.number(request, "start"), self.number(request, "end"), self.quality(request)
+        if not 1 <= end - start <= TIMELINE_CLIP_SECONDS:
+            raise ProtectError("no such stretch of time")
+        if end > time.time() + 60:
+            raise NoFootage("that time has not happened yet")
+        camera_id, session = self.target(request)
+        serial = request.get("serial")
+        path = timeline_clip_path(self.folder, request["uid"], start, end, quality)
+        # Asked for twice (played, and fetched ahead): exported once. The
+        # lock stays for as long as anyone holds or waits for it.
+        with self.lock:
+            entry = self.clip_locks.setdefault(path, [threading.Lock(), 0])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                if os.path.exists(path):
+                    os.utime(path)
+                else:
+                    with self.lock:
+                        if isinstance(serial, int) and not isinstance(serial, bool) and serial < self.serial:
+                            raise Superseded()
+                    if hasattr(session, "footage"):     # demo mode's gaps
+                        session.footage(camera_id, start, end)
+                    self.make(os.path.dirname(path))
+                    session.export(camera_id, start, end, quality, path)
+        finally:
+            with self.lock:
+                entry[1] -= 1
+                if entry[1] == 0 and self.clip_locks.get(path) is entry:
+                    del self.clip_locks[path]
+        prune_timeline_clips(self.folder, keep_path=path)
+        return {"path": path, "start": start, "end": end}
+
+    def serve(self, lines, wait=False):
+        """Answer until the window closes its end; then drop what is queued
+        (or, for tests, wait for all of it)."""
+        # Clips apart from the rest: a console slow to export must not hold
+        # up the stills that follow the pointer.
+        clips = ThreadPoolExecutor(max_workers=6)
+        others = ThreadPoolExecutor(max_workers=4)
+        try:
+            for line in lines:
+                if len(line) > 64 * 1024:
+                    continue
+                try:
+                    request = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(request, dict):
+                    self.note_serial(request)
+                    (clips if request.get("op") == "clip" else others).submit(self.handle, request)
+        finally:
+            for pool in (clips, others):
+                pool.shutdown(wait=wait, cancel_futures=not wait)
+
+    def cleanup(self):
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+
+class Superseded(Exception):
+    """A clip asked for before the playhead moved again."""
+
+
+def cmd_timeline_serve(args):
+    """Fetch stills and clips for the timeline window; ends when it closes stdin."""
+    config = require_config()
+    os.makedirs(TIMELINE_DIR, mode=0o700, exist_ok=True)
+    sweep_timeline_dirs()
+    server = TimelineServer(config)
+
+    def leave(code):
+        # Without waiting for exports under way: the window is gone, and a
+        # newer one may be starting. Only this server's own folder goes.
+        server.cleanup()
+        os._exit(code)
+
+    signal.signal(signal.SIGTERM, lambda *_: leave(143))
+    try:
+        server.serve(sys.stdin)
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    except Exception:
+        # Said on stderr, where `timeline-serve` run by hand shows it.
+        traceback.print_exc()
+        leave(1)
+    leave(0)
 
 
 def mpv_clip_command(player, sound=True):
@@ -4087,6 +4538,7 @@ def cmd_login(args):
 def forget_recordings(console_id):
     """Delete what was fetched from a console; clips are not labelled by console."""
     shutil.rmtree(CLIPS_DIR, ignore_errors=True)
+    shutil.rmtree(TIMELINE_DIR, ignore_errors=True)
     for name in os.listdir(RECORDINGS_DIR) if os.path.isdir(RECORDINGS_DIR) else []:
         if name.startswith(console_id + "_"):
             shutil.rmtree(os.path.join(RECORDINGS_DIR, name), ignore_errors=True)
@@ -4462,6 +4914,17 @@ def cmd_hide_offline(args):
 WALL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "wall")
 WALL_CONFIG = os.path.join(RUNTIME_DIR, "wall.json")
 WALL_PID = os.path.join(RUNTIME_DIR, "wall.pid")
+# The timeline is the same Quickshell config in another window of its own.
+# It is started from a folder of its own, holding only a link to the wall's
+# shell.qml, which makes it a different config to Quickshell: the wall and
+# the timeline can be open side by side, and --no-duplicate still stops a
+# second copy of either. The folder is made at launch in the runtime
+# directory (Omarchy allows no links inside a plugin).
+TIMELINE_QML_DIR = os.path.join(RUNTIME_DIR, "timeline-shell")
+TIMELINE_CONFIG = os.path.join(RUNTIME_DIR, "timeline.json")
+TIMELINE_PID = os.path.join(RUNTIME_DIR, "timeline.pid")
+WALL_ARGV = ["--no-duplicate", "--path", WALL_DIR]
+TIMELINE_ARGV = ["--no-duplicate", "--path", TIMELINE_QML_DIR]
 
 
 def process_start_time(pid):
@@ -4471,21 +4934,23 @@ def process_start_time(pid):
         return int(handle.read().rsplit(")", 1)[1].split()[19])
 
 
-def running_wall():
+def running_wall(pid_path=None, arguments=None):
     """The wall's pid, only if that process is still exactly our wall.
+
+    Given the timeline's pid file and arguments, the same for the timeline.
 
     wall.pid outlives the wall, and pids get reused: a stale one must never
     make the toggle kill some other process (such as the Omarchy shell).
     """
     try:
-        with open(WALL_PID) as handle:
+        with open(pid_path or WALL_PID) as handle:
             values = [int(v) for v in handle.read().split()]
         # "pid started"; a bare pid is from before 0.4.2, still checked by
         # its exact command line.
         pid, started = values if len(values) == 2 else (values[0], None)
         with open(f"/proc/{pid}/cmdline", "rb") as handle:
             argv = handle.read().split(b"\0")[:-1]
-        if (argv[1:] == [b"--no-duplicate", b"--path", WALL_DIR.encode()]
+        if (argv[1:] == [a.encode() for a in arguments or WALL_ARGV]
                 and os.path.basename(argv[0]) in (b"quickshell", b"qs")
                 and started in (None, process_start_time(pid))):
             return pid
@@ -4497,9 +4962,10 @@ def running_wall():
 # The wall window's title, matched by the Hyprland rule below. wall/shell.qml
 # sets the same title; keep the two in step.
 WALL_WINDOW_TITLE = "UniFi Protect Wall"
+TIMELINE_WINDOW_TITLE = "UniFi Protect Timeline"
 
 
-def register_wall_window_rule():
+def register_wall_window_rule(title=WALL_WINDOW_TITLE, name="wall"):
     """Ask Hyprland to maximize the wall window when it opens.
 
     A rule that matches only the wall's title, registered at runtime: it
@@ -4511,9 +4977,9 @@ def register_wall_window_rule():
     opens, just not maximized.
     """
     rule = (
-        "if not _G.eld_unifi_protect_wall_rule then "
-        "_G.eld_unifi_protect_wall_rule = hl.window_rule({ "
-        f"match = {{ title = '^{WALL_WINDOW_TITLE}$' }}, maximize = true }}) "
+        f"if not _G.eld_unifi_protect_{name}_rule then "
+        f"_G.eld_unifi_protect_{name}_rule = hl.window_rule({{ "
+        f"match = {{ title = '^{title}$' }}, maximize = true }}) "
         "end"
     )
     hyprctl = shutil.which("hyprctl")
@@ -4528,7 +4994,68 @@ def cmd_wall(args):
 
     Running it again while it is up closes it, so one keybinding toggles it.
     """
-    pid = running_wall()
+    open_wall(args, timeline=False)
+
+
+def cmd_timeline(args):
+    """The camera grid with a timeline to scrub through recordings.
+
+    A window of its own, apart from the wall. Running it again closes it;
+    with --at it opens (or reopens) at that moment instead.
+    """
+    if args.at is None and os.environ.get("ELD_UNIFI_PROTECT_EVENT"):
+        # The panel passes the moment in the environment (private to this
+        # user), not on the command line, as it does for `clip`.
+        try:
+            args.at = float(json.loads(os.environ["ELD_UNIFI_PROTECT_EVENT"])["start"])
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+            raise ProtectError("give --at for the moment to open at")
+    if args.at is not None and not math.isfinite(args.at):
+        raise ProtectError("--at must be a time in Unix seconds")
+    try:
+        open_wall(args, timeline=True)
+    except ProtectError as error:
+        # Started from the panel or a keybinding, nobody reads stderr.
+        if not sys.stderr.isatty():
+            notifier = shutil.which("notify-send")
+            if notifier:
+                subprocess.run([notifier, "-a", "UniFi Protect", "--", "Timeline",
+                                clean_text(str(error), "could not open", 300)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=5, check=False)
+        raise
+
+
+def link_timeline_shell():
+    """Make the timeline's config folder: a link to the wall's shell.qml."""
+    os.makedirs(TIMELINE_QML_DIR, mode=0o700, exist_ok=True)
+    link = os.path.join(TIMELINE_QML_DIR, "shell.qml")
+    fresh = f"{link}.{os.getpid()}.tmp"
+    try:
+        os.symlink(os.path.join(WALL_DIR, "shell.qml"), fresh)
+        os.replace(fresh, link)     # over whatever was there, a link or not
+    finally:
+        if os.path.lexists(fresh):
+            os.remove(fresh)
+
+
+def open_wall(args, timeline):
+    pid_path, arguments = (TIMELINE_PID, TIMELINE_ARGV) if timeline else (WALL_PID, WALL_ARGV)
+    at = getattr(args, "at", None)
+    pid = running_wall(pid_path, arguments)
+    if pid and at is not None and not args.close:
+        # Open at another moment: a fresh window, once the old one is gone.
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 5
+        while running_wall(pid_path, arguments) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if running_wall(pid_path, arguments):
+            # A second one would exit at once, leaving this one unreachable.
+            raise ProtectError("the timeline is slow to close; try again")
+        pid = None
     if args.close:
         if pid:
             try:
@@ -4550,6 +5077,9 @@ def cmd_wall(args):
     cameras = [c for c in state.get("cameras", []) if c.get("online") and not c.get("hidden")]
     if not cameras:
         raise ProtectError("no cameras online")
+    if timeline and not any(has_login(c) for c in config["consoles"]):
+        raise ProtectError("the timeline plays recordings, which need a sign-in; "
+                           "run `eld-unifi-protect login` first")
     clients = {c["id"]: Protect(c, config) for c in config["consoles"]}
     qualities = list(dict.fromkeys([args.quality, args.focus_quality]))
 
@@ -4566,7 +5096,8 @@ def cmd_wall(args):
         tiles = list(pool.map(resolve, cameras))
 
     # The URLs embed per-camera access tokens: keep the file private.
-    write_json(WALL_CONFIG, {
+    wall_config = TIMELINE_CONFIG if timeline else WALL_CONFIG
+    write_json(wall_config, {
         "cameras": tiles,
         "snapshotDir": SNAP_DIR,
         "multiConsole": len(config["consoles"]) > 1,
@@ -4577,23 +5108,34 @@ def cmd_wall(args):
         "gridQuality": args.quality,
         "focusQuality": args.focus_quality,
         "layout": args.layout,
+        # The timeline: recordings beside live, and where to start.
+        "timeline": timeline,
+        "at": at,
+        "playbackQuality": getattr(args, "playback_quality", "low"),
+        "consoles": {c["id"]: c["name"] for c in config["consoles"]},
     })
     quickshell = shutil.which("quickshell") or shutil.which("qs")
     if not quickshell:
         raise ProtectError("quickshell is not installed")
+    if timeline:
+        link_timeline_shell()
     if args.mode == "window":
-        register_wall_window_rule()
-    env = dict(os.environ, ELD_UNIFI_PROTECT_WALL=WALL_CONFIG,
+        if timeline:
+            register_wall_window_rule(TIMELINE_WINDOW_TITLE, "timeline")
+        else:
+            register_wall_window_rule()
+    env = dict(os.environ, ELD_UNIFI_PROTECT_WALL=wall_config,
                ELD_UNIFI_PROTECT_WALL_MODE=args.mode)
+    env.pop("ELD_UNIFI_PROTECT_EVENT", None)
     process = subprocess.Popen(
-        [quickshell, "--no-duplicate", "--path", WALL_DIR],
+        [quickshell] + arguments,
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    write_atomic(WALL_PID, f"{process.pid} {process_start_time(process.pid)}")
+    write_atomic(pid_path, f"{process.pid} {process_start_time(process.pid)}")
 
 
 def private_dir_problem(path):
@@ -4760,6 +5302,25 @@ def main():
                         "grids and 1+N page when cameras outnumber tiles. Not read from the "
                         "wallLayout setting; G cycles presets on the wall")
     p.set_defaults(func=cmd_wall)
+
+    p = sub.add_parser("timeline", help="toggle the camera grid with a timeline of recordings")
+    p.add_argument("--at", type=float, help="open at this moment, Unix seconds (see `recordings`)")
+    p.add_argument("--quality", choices=QUALITIES, default="medium", help="live stream for grid tiles")
+    p.add_argument("--focus-quality", choices=QUALITIES, default="high",
+                   help="stream and recordings for an enlarged camera")
+    p.add_argument("--playback-quality", choices=QUALITIES, default="low",
+                   help="recordings in grid tiles")
+    p.add_argument("--no-toggle", action="store_true", help="do nothing if already open")
+    p.add_argument("--close", action="store_true", help="close it if open; never open it")
+    p.add_argument("--mode", choices=("window", "overlay"), default="window",
+                   help="window: maximized, stays on its workspace. overlay: covers everything")
+    p.add_argument("--sound", choices=("on", "off"), default="on",
+                   help="sound for an enlarged camera, live or recorded")
+    p.add_argument("--layout", type=wall_layout, default="auto", help="as for `wall`")
+    p.set_defaults(func=cmd_timeline)
+
+    p = sub.add_parser("timeline-serve", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_timeline_serve)
     p = sub.add_parser("open", help="open Protect in the browser")
     p.add_argument("console", nargs="?")
     p.set_defaults(func=cmd_open)
