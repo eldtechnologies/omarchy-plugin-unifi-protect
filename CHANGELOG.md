@@ -13,7 +13,8 @@ All notable changes to this plugin. The version is set in `manifest.json`;
   goes to that moment: still frames while dragging, then the recordings
   from there, in step. Each camera's lane shows where footage exists,
   where there is none, and what was detected; `,` and `.` jump between
-  detections, `+`/`-` or the wheel zoom from 24 hours down to minutes.
+  detections, `+`/`-` zoom between 1, 6 and 24 hours and the wheel down
+  to minutes.
   `T` in a camera's recordings opens it at that moment. It needs the
   recordings sign-in; the wall is unchanged and needs none.
 

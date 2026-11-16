@@ -700,28 +700,37 @@ Panel {
     return false
   }
 
-  // at: the moment to open at (Unix seconds); none for live.
-  function openTimeline(at) {
-    if (!root.anyRecordings) {
-      root.openRecordings(root.liveCamera || root.cameras[root.selectedIndex], null, "live")
+  // at: the moment to open at (Unix seconds); none for live. Without a
+  // moment it toggles, as the wall does, unless keepOpen.
+  function openTimeline(at, keepOpen) {
+    // A recordings list on screen is a sign-in that worked, even before
+    // the next poll says so.
+    var signedIn = root.anyRecordings
+                   || (root.recordingsView && root.recordingsLoaded && !root.recordingsNeedLogin)
+    if (!signedIn) {
+      root.openRecordings(root.liveCamera || root.cameras[root.selectedIndex] || root.cameras[0],
+                          null, "live")
       return
     }
+    var command = [root.cli, "timeline", "--mode", root.wallMode,
+                   "--sound", root.soundDefault ? "on" : "off", "--layout", root.wallLayout]
+    if (!at && keepOpen) command.push("--no-toggle")
     // The moment goes in the environment, as event times do for clips.
     Quickshell.execDetached({
-      command: [root.cli, "timeline", "--mode", root.wallMode,
-                "--sound", root.soundDefault ? "on" : "off", "--layout", root.wallLayout],
+      command: command,
       environment: at ? root.eventEnvironment(at, 0) : ({})
     })
     root.closeLive()
     root.close()
   }
 
-  // The timeline at what the recordings view is showing.
+  // The timeline at what the recordings view is showing; with nothing
+  // chosen there, the timeline as it is (never closing one that is open).
   function openTimelineHere() {
     var at = 0
     if (root.playingClip) at = root.playingClip.start + player.position / 1000
     else if (root.selectedRecording) at = root.selectedRecording.start - 3
-    root.openTimeline(at)
+    root.openTimeline(at, true)
   }
 
   // "Add console" and the like, tucked behind the cog in the header.
@@ -1005,6 +1014,7 @@ Panel {
       root.closeLive()
       root.showHidden = false
       root.alertsView = false
+      root.settingsOpen = false
       if (root.settingUp) root.cancelSetup()
     }
   }
@@ -1207,7 +1217,7 @@ Panel {
         else if (key === "r" && root.liveMode)
           root.recordingsView ? root.backFromRecordings() : root.openRecordings(root.liveCamera, null, "live")
         else if (key === "w") root.openWall()
-        else if (key === "t" && root.configured && !root.alertsView)
+        else if (key === "t" && root.configured && !root.alertsView && root.shownCameras.length > 0)
           root.recordingsView ? root.openTimelineHere() : root.openTimeline(0)
         else if (key === "a" && !root.liveMode && root.configured) root.alertsView = !root.alertsView
         else if (key === "p") {
@@ -1522,7 +1532,7 @@ Panel {
             text: root.recordingsView
                   ? "↑/↓ choose  ·  Enter play  ·  Space pause  ·  ←/→ 5 s  ·  M mute  ·  P pop out  ·  T timeline  ·  Esc "
                     + (root.recordingsReturn === "alerts" ? "alerts" : "live")
-                  : "←/→ switch camera  ·  1–9 jump  ·  M mute  ·  R recordings  ·  P or double-click pop out  ·  Esc back"
+                  : "←/→ switch camera  ·  1–9 jump  ·  M mute  ·  R recordings  ·  T timeline  ·  P or double-click pop out  ·  Esc back"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

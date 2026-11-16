@@ -228,8 +228,10 @@ ShellRoot {
   // Each settled move of the playhead, for tiles to line up with again.
   property int seekSerial: 0
   // Recordings are not played closer to now than this: the console has
-  // not written the last seconds yet.
-  readonly property real liveEdge: 15
+  // not written the last seconds yet (clips are cut `recordLag` short of
+  // now), and a clip that close would run out as soon as it started.
+  readonly property real liveEdge: 30
+  readonly property real recordLag: 8
   readonly property real reach: 24 * 3600
   readonly property int chunkSeconds: 60
   readonly property real chunkStart: Math.floor(playhead / chunkSeconds) * chunkSeconds
@@ -265,16 +267,19 @@ ShellRoot {
       if (settled) { goLive(); return }
       time = current - liveEdge
     }
-    playhead = Math.max(current - reach + 60, time)
-    // Before `reviewing`: tiles created by it must not fetch a clip for a
-    // playhead that is still being dragged.
+    // Before the playhead moves and before `reviewing`: tiles must not
+    // fetch a clip for a playhead that is still being dragged.
     if (!settled) scrubbing = true
+    playhead = Math.max(current - reach + 60, time)
     reviewing = true
     if (settled) settle()
   }
 
   function settle() {
     settleTimer.stop()
+    // Stepped or dragged up to the end: that is live. (The end has moved
+    // on a little since the playhead was put there.)
+    if (playhead >= Date.now() / 1000 - liveEdge - 5) { goLive(); return }
     scrubbing = false
     anchorPlayhead = playhead
     anchorWall = Date.now()
@@ -286,6 +291,15 @@ ShellRoot {
     if (!reviewing && seconds > 0) return
     seekTo((reviewing ? playhead : Date.now() / 1000 - liveEdge) + seconds, false)
     keepInView()
+    // Settled when the key is let go (stepReleased); this is for a release
+    // that never arrives, say because the window lost the keyboard.
+    settleTimer.interval = 1500
+    settleTimer.restart()
+  }
+
+  function stepReleased() {
+    if (!scrubbing || !settleTimer.running) return
+    settleTimer.interval = 150
     settleTimer.restart()
   }
 
@@ -300,7 +314,7 @@ ShellRoot {
   function togglePause() {
     if (!reviewing) {
       // Freeze what was just on screen.
-      playhead = Date.now() / 1000 - liveEdge - 5
+      playhead = Date.now() / 1000 - liveEdge - 10
       reviewing = true
       paused = true
       settle()
@@ -314,7 +328,8 @@ ShellRoot {
   }
 
   function setViewEnd(end) {
-    viewEnd = end >= now - 1 ? 0 : Math.max(end, now - reach + span)
+    end = Math.max(end, now - reach + span)
+    viewEnd = end >= now - 1 ? 0 : end
   }
 
   function keepInView() {
@@ -330,14 +345,16 @@ ShellRoot {
   }
 
   function zoomStep(step) {
-    var nearest = 0
-    for (var i = 1; i < spans.length; i++)
-      if (Math.abs(spans[i] - span) < Math.abs(spans[nearest] - span)) nearest = i
-    var next = Math.max(0, Math.min(spans.length - 1, nearest + step))
-    var pivot = reviewing ? playhead : now
-    setSpan(spans[next], pivot)
+    // The next preset that way from wherever the wheel left the span.
+    var next = span
+    for (var i = 0; i < spans.length; i++) {
+      var preset = spans[step < 0 ? spans.length - 1 - i : i]
+      if (step < 0 ? preset < span - 1 : preset > span + 1) { next = preset; break }
+    }
+    if (next === span) return
+    setSpan(next, reviewing ? playhead : now)
     // The playhead in the middle, where there is room to move both ways.
-    if (reviewing) setViewEnd(playhead + spans[next] / 2)
+    if (reviewing) setViewEnd(playhead + next / 2)
   }
 
   // The detection before or after the playhead, on any camera shown.
@@ -350,6 +367,7 @@ ShellRoot {
       for (var i = 0; i < events.length; i++) {
         if (events[i].kind === "motion") continue
         var start = events[i].start - 3
+        if (start < now - reach + 60) continue      // older than can be shown
         if (step < 0 ? start < from - 5 : start > from + 1)
           if (best === null || (step < 0 ? start > best : start < best)) best = start
       }
@@ -397,15 +415,23 @@ ShellRoot {
     stdinEnabled: true
     stdout: SplitParser { onRead: function(line) { shell.backendReply(line) } }
     onStarted: {
+      shell.backendStarted = Date.now()
       shell.backendReady = true
       shell.loadIndex()
     }
     onExited: {
       shell.backendReady = false
       shell.pendingReplies = ({})
+      // One that stops as soon as it starts is tried less and less often,
+      // and the strip says so.
+      shell.backendFailures = Date.now() - shell.backendStarted < 10000 ? shell.backendFailures + 1 : 0
+      backendRestart.interval = Math.min(60000, 3000 * Math.pow(2, Math.min(5, shell.backendFailures)))
       if (shell.timeline) backendRestart.restart()
     }
   }
+
+  property real backendStarted: 0
+  property int backendFailures: 0
 
   Timer {
     id: backendRestart
@@ -425,7 +451,12 @@ ShellRoot {
     interval: 1000
     repeat: true
     running: shell.timeline
-    onTriggered: shell.now = Date.now() / 1000
+    onTriggered: {
+      shell.now = Date.now() / 1000
+      // A view held on a stretch of the past moves with the 24 hours.
+      if (shell.viewEnd > 0 && shell.viewEnd < shell.now - shell.reach + shell.span)
+        shell.setViewEnd(shell.viewEnd)
+    }
   }
 
   // The clock recordings play by.
@@ -435,15 +466,17 @@ ShellRoot {
     running: shell.reviewing && !shell.paused && !shell.scrubbing
     onTriggered: {
       var time = shell.anchorPlayhead + (Date.now() - shell.anchorWall) / 1000
-      if (time > Date.now() / 1000 - shell.liveEdge + 3) shell.goLive()
-      else shell.playhead = time
+      if (time > Date.now() / 1000 - shell.liveEdge + 3) { shell.goLive(); return }
+      shell.playhead = time
+      // Played off the right-hand end of the stretch shown: turn the page.
+      if (shell.viewEnd > 0 && time > shell.viewEndTime) shell.setViewEnd(time + shell.span * 0.8)
     }
   }
 
   // Arrow keys step the playhead; tiles fetch stills until the keys rest.
   Timer {
     id: settleTimer
-    interval: 350
+    interval: 150
     onTriggered: shell.settle()
   }
 
@@ -645,9 +678,18 @@ ShellRoot {
     property real askedChunk: -1
     property real failedChunk: -1
     property real fetchedAhead: -1
+    property real refetchedAt: 0
     property int serial: 0
     // "", "nofootage", or what went wrong.
     property string problem: ""
+    // The clip is the one for the minute the playhead is in. After a jump
+    // it is not, until the new one arrives; when a minute simply runs into
+    // the next, the old clip's last frame stays up for that moment.
+    readonly property bool clipCurrent: clip !== null && clip.chunk === shell.chunkStart
+    readonly property bool clipUsable: clipCurrent
+                                       || (clip !== null && clip.chunk === shell.chunkStart - shell.chunkSeconds)
+    // A still is worth showing only close to where it was taken.
+    readonly property bool stillFresh: stillPath !== "" && Math.abs(stillAt - shell.playhead) < 4
 
     function refresh() {
       if (!active || !shell.reviewing || !shell.backendReady || needsLogin) return
@@ -655,10 +697,39 @@ ShellRoot {
         player.pause()
         wantStill()
       } else {
-        wantClip()
+        // A jump elsewhere: stop what was playing, and show a frame from
+        // there until the clip comes (unless there is none to come).
+        if (!clipUsable) {
+          if (clip !== null) player.pause()
+          if (failedChunk !== shell.chunkStart) wantStill()
+        }
+        wantClip(false)
         fetchAhead()
       }
     }
+
+    // Another camera in this view (the enlarged one flips): start afresh.
+    property bool ready: false
+    function reset() {
+      if (!ready) return
+      serial++
+      stillSerial++
+      stillBusy = false
+      clip = null
+      positioned = false
+      askedChunk = -1
+      failedChunk = -1
+      fetchedAhead = -1
+      stillPath = ""
+      stillAt = -1
+      problem = ""
+      player.stop()
+      player.source = ""
+      refresh()
+    }
+    onUidChanged: reset()
+    onQualityChanged: reset()
+    property int stillSerial: 0
 
     // One request at a time: the next asks for wherever the playhead is by
     // then, so a slow console is never asked for frames already passed.
@@ -667,12 +738,15 @@ ShellRoot {
       var at = shell.playhead
       if (stillAt >= 0 && Math.abs(at - stillAt) < 0.5) return
       stillBusy = true
+      var mine = stillSerial
       shell.ask({ op: "still", uid: uid, at: at, quality: "low", slot: slot }, function(reply) {
+        if (mine !== playback.stillSerial) return     // for the camera shown before
         playback.stillBusy = false
         playback.stillAt = at
         if (reply.ok) {
           playback.stillPath = reply.path
-          playback.problem = ""
+          // Not over a clip's own failure, which came after the drag.
+          if (shell.scrubbing) playback.problem = ""
         } else if (shell.scrubbing) {
           playback.stillPath = ""
           playback.problem = reply.noFootage ? "nofootage" : (reply.error || "no picture")
@@ -681,17 +755,27 @@ ShellRoot {
       })
     }
 
-    function wantClip() {
+    // again: fetch this minute's clip anew although one is held (it was
+    // cut short at "now", and there is more by now).
+    function wantClip(again) {
       var chunk = shell.chunkStart
-      if (clip !== null && clip.chunk === chunk) { resync(); return }
+      if (!again && clip !== null && clip.chunk === chunk) { resync(); return }
       if (askedChunk === chunk || failedChunk === chunk) return
-      var end = Math.min(chunk + shell.chunkSeconds, Math.floor(Date.now() / 1000) - 8)
+      var end = Math.min(chunk + shell.chunkSeconds, Math.floor(Date.now() / 1000) - shell.recordLag)
       if (end - chunk < 2) return
       askedChunk = chunk
       var mine = ++serial
-      shell.ask({ op: "clip", uid: uid, start: chunk, end: end, quality: quality }, function(reply) {
+      // seekSerial lets the helper skip this export if the playhead has
+      // moved on by the time its turn comes.
+      shell.ask({ op: "clip", uid: uid, start: chunk, end: end, quality: quality,
+                  serial: shell.seekSerial }, function(reply) {
         if (mine !== playback.serial) return
         playback.askedChunk = -1
+        if (reply.superseded) {
+          // Skipped for a later move that stayed within this clip: ask again.
+          playback.refresh()
+          return
+        }
         if (!reply.ok) {
           playback.failedChunk = chunk
           playback.clip = null
@@ -703,6 +787,12 @@ ShellRoot {
         playback.failedChunk = -1
         playback.positioned = false
         playback.clip = { path: reply.path, start: reply.start, end: reply.end, chunk: chunk }
+        // The same file again (back from an enlarged camera within the
+        // minute) would not load anew, and so never be lined up.
+        if (String(player.source) === "file://" + reply.path) {
+          player.stop()
+          player.source = ""
+        }
         player.source = "file://" + reply.path
         if (shell.paused || shell.scrubbing) player.pause()
         else player.play()
@@ -716,8 +806,12 @@ ShellRoot {
       var want = (shell.playhead - clip.start) * 1000
       if (want > player.duration + 500 && clip.end < clip.chunk + shell.chunkSeconds - 1) {
         // A clip cut short at "now" has run out: there is more by now.
-        clip = null
-        wantClip()
+        // Its last frame stays up meanwhile, and a console that sends
+        // less than asked is not asked again and again.
+        if (Date.now() - refetchedAt > 4000) {
+          refetchedAt = Date.now()
+          wantClip(true)
+        }
         return
       }
       if (Math.abs(player.position - want) > 1500)
@@ -731,10 +825,10 @@ ShellRoot {
       var next = shell.chunkStart + shell.chunkSeconds
       if (shell.paused || fetchedAhead === next) return
       if (shell.playhead - shell.chunkStart < shell.chunkSeconds - 20) return
-      if (next + shell.chunkSeconds > Date.now() / 1000 - 8) return
+      if (next + shell.chunkSeconds > Date.now() / 1000 - shell.recordLag) return
       fetchedAhead = next
-      shell.ask({ op: "clip", uid: uid, start: next, end: next + shell.chunkSeconds, quality: quality },
-                function(reply) {})
+      shell.ask({ op: "clip", uid: uid, start: next, end: next + shell.chunkSeconds, quality: quality,
+                  serial: shell.seekSerial }, function(reply) {})
     }
 
     onActiveChanged: {
@@ -745,7 +839,10 @@ ShellRoot {
       player.stop()
     }
     onNeedsLoginChanged: refresh()
-    Component.onCompleted: refresh()
+    Component.onCompleted: {
+      ready = true
+      refresh()
+    }
 
     Connections {
       target: shell
@@ -755,9 +852,11 @@ ShellRoot {
       function onChunkStartChanged() { if (!shell.scrubbing) playback.refresh() }
       function onPausedChanged() { playback.refresh() }
       function onBackendReadyChanged() {
-        // A restarted helper answers nothing it was asked before.
+        // A restarted helper answers nothing it was asked before, and what
+        // failed as it went down may work now.
         playback.stillBusy = false
         playback.askedChunk = -1
+        playback.failedChunk = -1
         playback.refresh()
       }
       function onNowChanged() { if (!shell.scrubbing) playback.refresh() }
@@ -767,14 +866,17 @@ ShellRoot {
       id: video
       anchors.fill: parent
       fillMode: VideoOutput.PreserveAspectFit
-      visible: playback.clip !== null
+      visible: playback.clipUsable
     }
 
     // The frame under the playhead, until the clip from there plays.
     Image {
       anchors.fill: parent
+      // While dragging, the latest frame there is; afterwards only one
+      // from about where the playhead is, never an old one flashing back.
       visible: playback.stillPath !== "" && playback.problem === ""
-               && (shell.scrubbing || playback.clip === null || !playback.positioned)
+               && (shell.scrubbing
+                   || (playback.stillFresh && (!playback.clipCurrent || !playback.positioned)))
       source: playback.stillPath !== "" ? "file://" + playback.stillPath : ""
       fillMode: Image.PreserveAspectFit
       cache: false
@@ -795,6 +897,10 @@ ShellRoot {
         playback.problem = errorString || "cannot play the recording"
       }
       onMediaStatusChanged: {
+        if (mediaStatus === MediaPlayer.InvalidMedia && playback.clip !== null) {
+          playback.problem = "cannot play the recording"
+          return
+        }
         if (playback.clip === null || playback.positioned) return
         if (mediaStatus !== MediaPlayer.LoadedMedia && mediaStatus !== MediaPlayer.BufferedMedia) return
         playback.positioned = true
@@ -814,7 +920,7 @@ ShellRoot {
             ? "Sign in to see recordings\neld-unifi-protect login " + (playback.info.console || "")
             : playback.problem === "nofootage" ? "No recording at " + shell.clockText(shell.playhead, false)
             : playback.problem !== "" ? playback.problem
-            : playback.clip === null && playback.stillPath === "" ? "Loading…" : ""
+            : !playback.clipUsable && !playback.stillFresh ? "Loading…" : ""
       color: playback.problem !== "" && playback.problem !== "nofootage" ? "#ff7777" : "#cccccc"
       font.pixelSize: 16
     }
@@ -832,11 +938,15 @@ ShellRoot {
     // The strip is one height whatever it shows: the grid above must not
     // change shape (and so its page of cameras) with the number of lanes.
     readonly property real lanesArea: 150
-    readonly property real laneHeight: Math.max(6, Math.min(32, Math.floor(lanesArea / Math.max(1, lanes.length)) - 2))
+    // Every lane fits, however many cameras the page holds (36 at most);
+    // thin lanes lose their gap and then their name.
+    readonly property real lanePitch: Math.floor(lanesArea / Math.max(1, lanes.length))
+    readonly property real laneGap: lanePitch >= 8 ? 2 : 1
+    readonly property real laneHeight: Math.max(2, Math.min(32, lanePitch - laneGap))
     readonly property real gutter: 200
     readonly property real trackX: gutter
     readonly property real trackWidth: Math.max(100, width - gutter - 16)
-    readonly property real lanesHeight: lanes.length * (laneHeight + 2)
+    readonly property real lanesHeight: lanes.length * (laneHeight + laneGap)
     readonly property real playheadTime: shell.reviewing ? shell.playhead : shell.now
     implicitHeight: 44 + lanesArea + 24 + 26
 
@@ -862,12 +972,16 @@ ShellRoot {
       anchors.baseline: clock.baseline
       text: (shell.paused ? "paused  ·  " : shell.scrubbing ? "" : shell.reviewing ? "recorded  ·  " : "")
             + shell.spanText(shell.span) + " shown"
-            + (shell.indexLoaded ? "" : "  ·  loading detections…")
-      color: "#9aa0a6"
+            + (shell.backendFailures >= 3 ? "  ·  the recordings helper keeps stopping; "
+                                            + "run `eld-unifi-protect timeline-serve` to see why"
+               : shell.indexLoaded ? "" : "  ·  loading detections…")
+      color: shell.backendFailures >= 3 ? "#ff7777" : "#9aa0a6"
       font.pixelSize: 14
     }
 
     Row {
+      // Room for it only in a wide window.
+      visible: timelineStrip.width >= 1200
       anchors.right: liveButton.left
       anchors.rightMargin: 18
       anchors.verticalCenter: liveButton.verticalCenter
@@ -925,7 +1039,7 @@ ShellRoot {
       x: 0
       y: 44
       width: parent.width
-      spacing: 2
+      spacing: timelineStrip.laneGap
 
       Repeater {
         model: timelineStrip.lanes
@@ -947,6 +1061,7 @@ ShellRoot {
             anchors.verticalCenter: parent.verticalCenter
             horizontalAlignment: Text.AlignRight
             elide: Text.ElideRight
+            visible: timelineStrip.laneHeight >= 9
             text: lane.modelData.name
             color: lane.selected ? "white" : "#9aa0a6"
             font.pixelSize: Math.max(9, Math.min(13, timelineStrip.laneHeight - 3))
@@ -1024,6 +1139,7 @@ ShellRoot {
             x: timelineStrip.trackX + 8
             anchors.verticalCenter: parent.verticalCenter
             visible: !!(lane.info && (lane.info.needsLogin || lane.info.error))
+                     && timelineStrip.laneHeight >= 9
             text: !lane.info ? ""
                   : lane.info.needsLogin
                     ? "Sign in to see recordings: eld-unifi-protect login " + (lane.info.console || "")
@@ -1141,6 +1257,8 @@ ShellRoot {
       anchors.horizontalCenter: parent.horizontalCenter
       anchors.bottom: parent.bottom
       anchors.bottomMargin: 6
+      width: Math.min(implicitWidth, parent.width - 32)
+      elide: Text.ElideRight
       text: "Drag or ←/→ 10 s (Shift 1 min)  ·  , . detections  ·  Space pause  ·  + − or wheel zoom"
             + "  ·  End live  ·  Enter enlarge  ·  H/L camera"
             + (shell.focusedIndex >= 0 ? "  ·  M mute" : "  ·  G layout")
@@ -1166,17 +1284,25 @@ ShellRoot {
     // move between cameras.
     function timelineKey(event, text) {
       var shift = event.modifiers & Qt.ShiftModifier
+      // A held key repeats only for stepping through time; each of the
+      // others would fetch for every tile on every repeat.
+      var once = !event.isAutoRepeat
       if (event.key === Qt.Key_Left) shell.stepBy(shift ? -60 : -10)
       else if (event.key === Qt.Key_Right) shell.stepBy(shift ? 60 : 10)
-      else if (text === "," || text === "<") shell.jumpEvent(-1)
-      else if (text === "." || text === ">") shell.jumpEvent(1)
-      else if (text === "+" || text === "=") shell.zoomStep(-1)
-      else if (text === "-") shell.zoomStep(1)
-      else if (event.key === Qt.Key_Space) shell.togglePause()
+      else if (text === "," || text === "<") { if (once) shell.jumpEvent(-1) }
+      else if (text === "." || text === ">") { if (once) shell.jumpEvent(1) }
+      else if (text === "+" || text === "=") { if (once) shell.zoomStep(-1) }
+      else if (text === "-") { if (once) shell.zoomStep(1) }
+      else if (event.key === Qt.Key_Space) { if (once) shell.togglePause() }
       else if (event.key === Qt.Key_End || event.key === Qt.Key_Backspace) shell.goLive()
       else if (event.key === Qt.Key_Escape && shell.focusedIndex < 0 && shell.reviewing) shell.goLive()
       else return false
       return true
+    }
+
+    Keys.onReleased: function(event) {
+      if (shell.timeline && !event.isAutoRepeat
+          && (event.key === Qt.Key_Left || event.key === Qt.Key_Right)) shell.stepReleased()
     }
 
     Keys.onPressed: function(event) {

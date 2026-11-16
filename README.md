@@ -134,7 +134,7 @@ eld-unifi-protect remove nvr
 | Grid | Arrows / hjkl | Move the selection |
 | Grid | `1`–`9` | Live view of camera N |
 | Grid | `W` | Camera wall |
-| Grid | `T` | Timeline |
+| Grid / live | `T` | Timeline |
 | Grid | Hover a tile | Bell to arm alerts, ★ favourite, eye to hide, pop-out button |
 | Grid / live | `P` | Pop out to mpv |
 | Live | ← / → | Previous / next camera |
@@ -215,7 +215,8 @@ timeline of the last 24 hours, with a lane for each camera shown. It is a
 window of its own, apart from the wall: a wall left running on a monitor
 stays a plain live wall, and both can be open at once. It plays recordings,
 so it needs the [recordings](#recordings) sign-in; without one on any
-console, the button takes you to the sign-in instead.
+console, the panel's button takes you to the sign-in instead (the command
+says so and opens nothing).
 
 It starts live. Click or drag anywhere on the timeline and every camera on
 screen goes to that moment: still frames while you drag, then the
@@ -243,8 +244,9 @@ recording" while the others play on.
 
 Recordings play in one-minute clips at low quality in the grid
 (`--playback-quality`) and at the enlarged quality for an enlarged camera;
-there is a short blink as each minute hands over to the next. The last 15
-seconds are not played back: the console has not written them yet. Clips
+there is a short blink as each minute hands over to the next. The last 30
+seconds are not played back: the console has not written all of them yet,
+and stepping or dragging up to them goes back to live. Clips
 and stills are kept in memory (the runtime directory), at most 80 clips or
 500 MB, and are gone when the window closes.
 
@@ -254,8 +256,12 @@ eld-unifi-protect timeline --at 1791811452   # open at a moment (see `recordings
 ```
 
 It follows `wallMode`, `wallLayout` and `sound` when opened from the panel,
-and takes the wall's `--mode`, `--layout`, `--quality`, `--focus-quality` and
-`--sound` on the command line.
+and takes the wall's `--mode`, `--layout`, `--quality`, `--focus-quality`,
+`--sound`, `--no-toggle` and `--close` on the command line, with
+`--playback-quality` for recordings in the grid. It toggles like the wall;
+with `--at` it opens at that moment even if it was open already. In
+`window` mode it gets its own Hyprland rule, matched by its title, "UniFi
+Protect Timeline".
 
 ### Favourite camera
 
@@ -454,7 +460,10 @@ streams.
   minute. Snapshots are fetched only while the panel is open on the grid.
   While a camera is armed, the helper also keeps one connection open to that
   console's event stream (`/subscribe/events`, same pinned TLS), plus one
-  snapshot per alert.
+  snapshot per alert. The timeline, while its window is open, asks for
+  the last 24 hours of events per camera once a minute, a still frame per
+  camera shown several times a second while you drag, and one clip per
+  camera shown for each minute played.
 - **TLS:** consoles use self-signed certificates. Setup pins each console's
   certificate fingerprint, and every API request checks it before the key is
   sent. If a console's certificate legitimately changes (firmware update,
