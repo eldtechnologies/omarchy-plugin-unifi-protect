@@ -3,7 +3,7 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
-## Unreleased
+## 0.6.1 — 2026-11-18
 
 ### Security
 
@@ -12,7 +12,7 @@ All notable changes to this plugin. The version is set in `manifest.json`;
   each time it changes, so a very large or stalled selection in another
   app could freeze the shell. The setup and sign-in fields are now
   writable only while their form is on screen and they have the keyboard
-  or the pointer. Reported in the marketplace review.
+  or the pointer. Reported in the marketplace review. (#41)
 
 ## 0.6.0 — 2026-11-18
 
