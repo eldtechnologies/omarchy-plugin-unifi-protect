@@ -3,7 +3,7 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
-## Unreleased
+## 0.6.0 — 2026-11-18
 
 ### Added
 

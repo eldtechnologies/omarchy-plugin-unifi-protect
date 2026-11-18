@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "com.eldtechnologies.unifi-protect",
   "name": "UniFi Protect",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": "ELD Technologies",
   "license": "MIT",
-  "description": "Your UniFi Protect cameras in the Omarchy bar: snapshot grid, live video with sound, a camera wall, alerts, and playback of recorded detections, across several consoles.",
+  "description": "Your UniFi Protect cameras in the Omarchy bar: snapshot grid, live video with sound, a camera wall, a timeline to scrub every camera through the last day, alerts, and playback of recorded detections, across several consoles.",
   "kinds": [
     "bar-widget"
   ],
@@ -81,13 +81,13 @@
       {
         "key": "sound",
         "type": "boolean",
-        "label": "Sound when one camera is shown (live view, enlarged wall camera, pop-out)",
+        "label": "Sound when one camera is shown (live view, enlarged wall or timeline camera, pop-out)",
         "defaultValue": true
       },
       {
         "key": "wallMode",
         "type": "enum",
-        "label": "Camera wall",
+        "label": "Camera wall and timeline",
         "options": [
           "window",
           "overlay"
@@ -97,7 +97,7 @@
       {
         "key": "wallLayout",
         "type": "string",
-        "label": "Camera wall layout (auto, row, column, a grid such as 3x3 or 2x4, 1+5, 1+7)",
+        "label": "Camera wall and timeline layout (auto, row, column, a grid such as 3x3 or 2x4, 1+5, 1+7)",
         "defaultValue": "auto"
       }
     ]

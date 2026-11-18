@@ -82,6 +82,7 @@ demo_started=0
 cleanup() {
   "${ipc[@]}" close >/dev/null 2>&1 || true
   "$cli" wall --close >/dev/null 2>&1 || true
+  "$cli" timeline --close >/dev/null 2>&1 || true
   goto "$home_ws" || true
   # Only end demo mode if this script turned it on.
   if [[ $demo_started == 1 ]]; then "$cli" demo off >/dev/null || true; fi
@@ -145,9 +146,15 @@ echo "camera wall"
 magick "$work/wall.png" -resize '1600x>' "$work/out-wall.png"
 magick "$work/wall.png" -resize '1600x900^' -gravity center -extent 1600x900 "$work/out-preview.png"
 
+echo "timeline"
+# A while back, so the cameras show recordings and the lanes their gaps.
+"$cli" timeline --mode window --at "$(python3 -c 'import time; print(int(time.time()) - 2400)')" >/dev/null
+sleep 12; shot "$work/timeline.png"; "$cli" timeline --close >/dev/null; sleep 1
+magick "$work/timeline.png" -resize '1600x>' "$work/out-timeline.png"
+
 # Every shot passed its checks: only now write into the repository.
 # Photo-heavy views as JPEG (a fraction of the size), the text-heavy log as PNG.
-for name in panel-grid panel-live panel-recordings wall; do
+for name in panel-grid panel-live panel-recordings wall timeline; do
   magick "$work/out-$name.png" -quality 88 "$out/$name.jpg"
   echo "  $out/$name.jpg"
 done

@@ -15,7 +15,7 @@ colour when an armed camera has seen something, turns that colour when a
 camera is offline, and gets a small dot when a console could not be reached
 on the last poll.
 
-Version 0.5.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
+Version 0.6.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologies
 
 ![The camera wall: six cameras live, maximized, with the Omarchy bar above](docs/screenshots/wall.jpg)
 
@@ -33,6 +33,10 @@ Version 0.5.0 · [Changelog](CHANGELOG.md) · MIT licensed · by ELD Technologie
 | Live view | Recordings |
 |---|---|
 | ![Live view of the Front Door camera in the panel](docs/screenshots/panel-live.jpg) | ![Recordings of the Front Door camera: a doorbell ring playing back with a REC badge and a seek bar, above a list of detections with thumbnails](docs/screenshots/panel-recordings.jpg) |
+
+| Timeline |
+|---|
+| ![The timeline: six cameras at a moment 40 minutes ago, two with no recording then, above a lane per camera showing footage, gaps and detections](docs/screenshots/timeline.jpg) |
 
 *The camera pictures in these screenshots are AI-generated for demo purposes; they show no real place or person. The screenshots themselves are of the real plugin, running in [demo mode](#developing).*
 
@@ -415,9 +419,9 @@ Widget settings live in `~/.config/omarchy/shell.json` and reload on save:
 | `columns` | `2` | Grid columns |
 | `liveQuality` | `medium` | Stream for the in-panel live view |
 | `popoutQuality` | `high` | Stream for the mpv window |
-| `sound` | `true` | Sound when one camera is shown (live view, enlarged wall camera, pop-out); `false` starts muted |
-| `wallMode` | `window` | Camera wall as a maximized `window` or a full-screen `overlay` |
-| `wallLayout` | `auto` | Camera wall layout: `auto`, `row`, `column`, a grid such as `3x3` or `2x4`, `1+5` or `1+7` |
+| `sound` | `true` | Sound when one camera is shown (live view, enlarged wall or timeline camera, pop-out); `false` starts muted |
+| `wallMode` | `window` | Camera wall and timeline as a maximized `window` or a full-screen `overlay` |
+| `wallLayout` | `auto` | Camera wall and timeline layout: `auto`, `row`, `column`, a grid such as `3x3` or `2x4`, `1+5` or `1+7` |
 
 ```json
 { "id": "com.eldtechnologies.unifi-protect", "columns": 3, "liveQuality": "high" }
