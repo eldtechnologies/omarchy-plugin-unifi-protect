@@ -755,6 +755,17 @@ Panel {
   property string setupDone: ""
   readonly property bool settingUp: setupStep !== ""
 
+  // A text field is writable only while its form is on screen and it has
+  // the keyboard or the pointer. Qt before 6.12.1 has every writable text
+  // field read the whole clipboard, synchronously, each time the clipboard
+  // changes (QTBUG-149610), and this panel lives as long as the shell: a
+  // huge or stalled selection in another app must not reach fields nobody
+  // is using. (Hover counts so that a click lands where it was aimed: Qt
+  // moves the cursor to the end when a field becomes writable.)
+  function fieldWritable(field, shown) {
+    return root.opened && shown && (field.activeFocus || field.hovered)
+  }
+
   function openSetup() {
     root.closeLive()
     root.setupError = ""
@@ -1653,6 +1664,7 @@ Panel {
 
             TextField {
               id: loginUserField
+            readOnly: !root.fieldWritable(this, root.recordingsView && root.recordingsNeedLogin)
               width: parent.width
               placeholderText: "Username"
               foreground: root.foreground
@@ -1664,6 +1676,7 @@ Panel {
 
             TextField {
               id: loginPasswordField
+            readOnly: !root.fieldWritable(this, root.recordingsView && root.recordingsNeedLogin)
               width: parent.width
               password: true
               placeholderText: "Password"
@@ -1725,6 +1738,7 @@ Panel {
 
           TextField {
             id: addressField
+          readOnly: !root.fieldWritable(this, root.setupStep === "address")
             visible: root.setupStep === "address"
             width: parent.width
             placeholderText: "192.168.1.1"
@@ -1777,6 +1791,7 @@ Panel {
 
           TextField {
             id: keyField
+          readOnly: !root.fieldWritable(this, root.setupStep === "key")
             visible: root.setupStep === "key"
             width: parent.width
             password: true
@@ -1791,6 +1806,7 @@ Panel {
 
           TextField {
             id: nameField
+          readOnly: !root.fieldWritable(this, root.setupStep === "key")
             visible: root.setupStep === "key"
             width: parent.width
             placeholderText: "Name, e.g. NVR"
