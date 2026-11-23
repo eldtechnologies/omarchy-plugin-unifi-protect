@@ -237,6 +237,36 @@ class RelayRewriting(unittest.TestCase):
         self.assertEqual(s.to_client("Content-Base: rtsps://192.168.1.240:7441"),
                          "Content-Base: rtsp://127.0.0.1:4000/tok/nvr")
 
+    def test_a_console_cannot_make_the_player_read_a_message_differently(self):
+        # FFmpeg takes a header line starting with "$" for an interleaved
+        # packet and skips past the lines after it, Content-Length among
+        # them; the body would then be read as the next reply, a redirect.
+        s = self.session()
+        s.route("rtsp://127.0.0.1:4000/tok/nvr/R1")
+        hidden = b"RTSP/1.0 302 Found\r\nCSeq: 2\r\nLocation: rt\rsp://198.51.100.7:8554/x\r\n\r\n"
+        for name in ("$A\x01\x01" + "F" * 200, "$", "", "X Y", "X\tY", "Sess\x01ion", "Café"):
+            self.assertFalse(s.keeps_player_here("RTSP/1.0 200 OK", [("CSeq", "1"), (name, "")], b""), name)
+        self.assertTrue(s.keeps_player_here("RTSP/1.0 200 OK", [("CSeq", "1"), ("Content-Type", "application/sdp"),
+                                                               ("X-Accept-Dynamic-Rate", "1")], b"v=0\r\n"))
+        # And a URL the player would see once it drops the CRs is a URL.
+        self.assertFalse(s.keeps_player_here("RTSP/1.0 200 OK", [("CSeq", "1")], hidden))
+        for body in (b"a=control:rt\rsp://evil/x", b"a=control:r\0tsp://evil/x", b"sat\r\rip:evil"):
+            self.assertFalse(s.keeps_player_here("RTSP/1.0 200 OK", [], body), body)
+
+        async def relayed(data):
+            reader = asyncio.StreamReader()
+            reader.feed_data(data)
+            reader.feed_eof()
+            sent = []
+            s.upstream_reader = reader
+            s.client_writer = mock.Mock(write=sent.append, drain=mock.AsyncMock())
+            s.close = lambda: None
+            await s.pump_upstream()
+            return b"".join(sent)
+        crafted = (b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n$A\x01\x01" + b"F" * 220 + b"\r\nContent-Length: "
+                   + str(len(hidden)).encode() + b"\r\n\r\n" + hidden)
+        self.assertEqual(asyncio.run(relayed(crafted)), b"RTSP/1.0 502 Bad Gateway\r\nCSeq: 1\r\n\r\n")
+
     def test_bare_carriage_returns_end_the_message(self):
         async def parse(data):
             reader = asyncio.StreamReader()

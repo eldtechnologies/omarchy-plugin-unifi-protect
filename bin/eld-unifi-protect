@@ -1019,6 +1019,11 @@ class RelaySession:
     # Any RTSP-ish scheme as FFmpeg would read it ("rtsp:host" too).
     SCHEME = re.compile(r"(?:rtsp[hsu]?|satip)\s*:", re.I)
     DROPPED_HEADERS = {"location", "content-location"}
+    # A header's name as every RTSP reader agrees on it. FFmpeg takes a
+    # line starting with "$" for an interleaved packet and skips ahead by
+    # the length in it, past the lines after it: the relay and the player
+    # must never see a message end in different places.
+    HEADER_NAME = re.compile(r"[A-Za-z0-9-]+")
 
     def keeps_player_here(self, start, headers, body):
         """True unless a console response could send the player elsewhere.
@@ -1029,7 +1034,11 @@ class RelaySession:
         status = self.STATUS_LINE.fullmatch(start)
         if not status or status.group(1)[0] == "3":
             return False
-        for text in [v for _, v in headers] + [body.decode("latin-1")]:
+        if not all(self.HEADER_NAME.fullmatch(name) for name, _ in headers):
+            return False
+        # FFmpeg drops every CR in a line it reads: "rt\rsp://" is a URL to it.
+        text_body = body.decode("latin-1").replace("\r", "").replace("\0", "")
+        for text in [v for _, v in headers] + [text_body]:
             for match in self.SCHEME.finditer(text):
                 if not text.startswith(self.local_base, match.start()):
                     return False
