@@ -1324,11 +1324,73 @@ ShellRoot {
                : shell.indexLoaded ? "" : "  ·  loading detections…")
       color: shell.backendFailures >= 3 ? "#ff7777" : "#9aa0a6"
       font.pixelSize: 14
+      anchors.right: saveButtons.visible ? saveButtons.left : legend.visible ? legend.left : liveButton.left
+      anchors.rightMargin: 14
+      elide: Text.ElideRight
+    }
+
+    // ---- saving what is marked ----
+    Row {
+      id: saveButtons
+      readonly property real marked: shell.markOut - shell.markIn
+      readonly property bool tooLong: marked > shell.saveLimit
+      visible: shell.markIn >= 0 && shell.markOut >= 0
+      anchors.right: liveButton.left
+      anchors.rightMargin: 12
+      anchors.verticalCenter: liveButton.verticalCenter
+      spacing: 6
+      Rectangle {
+        readonly property bool usable: !shell.saving && !saveButtons.tooLong && !!shell.saveCamera && shell.backendReady
+        width: saveLabel.implicitWidth + 24
+        height: 28
+        radius: 14
+        color: !usable ? "#26282a" : saveArea.containsMouse ? "#ffe08a" : "#ffd24a"
+        Text {
+          id: saveLabel
+          textFormat: Text.PlainText
+          anchors.centerIn: parent
+          text: shell.saving ? "Saving…"
+                : saveButtons.tooLong ? "Too long to save"
+                : "Save clip (" + (saveButtons.marked >= 120 ? Math.round(saveButtons.marked / 6) / 10 + " min"
+                                                             : Math.round(saveButtons.marked) + " s") + ")"
+          color: parent.usable ? "#1b1c1d" : "#9aa0a6"
+          font.pixelSize: 14
+          font.bold: true
+        }
+        MouseArea {
+          id: saveArea
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: parent.usable ? Qt.PointingHandCursor : Qt.ArrowCursor
+          onClicked: if (parent.usable) shell.saveClip()
+        }
+      }
+      Rectangle {
+        width: 28
+        height: 28
+        radius: 14
+        color: clearArea.containsMouse ? "#3a3d40" : "#26282a"
+        Text {
+          textFormat: Text.PlainText
+          anchors.centerIn: parent
+          text: "✕"
+          color: "white"
+          font.pixelSize: 13
+        }
+        MouseArea {
+          id: clearArea
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: shell.clearMarks()
+        }
+      }
     }
 
     Row {
-      // Room for it only in a wide window.
-      visible: timelineStrip.width >= 1200
+      id: legend
+      // Room for it only in a wide window, and not beside the save button.
+      visible: timelineStrip.width >= 1200 && !saveButtons.visible
       anchors.right: liveButton.left
       anchors.rightMargin: 18
       anchors.verticalCenter: liveButton.verticalCenter

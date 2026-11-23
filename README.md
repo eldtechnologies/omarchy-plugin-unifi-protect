@@ -252,8 +252,9 @@ recording" while the others play on.
 your videos folder, named for the camera and the time, in the enlarged
 quality. Mark the stretch by dragging along the timeline, or with `I` at
 its start and `O` at its end, up to ten minutes (hold Shift to drag
-without marking); without marks, `S` saves the half minute around the
-playhead.
+without marking). While a stretch is marked, a **Save clip** button at
+the top right does the same as `S`. Without marks, `S` saves the half
+minute around the playhead.
 The file is private to you (mode 0600), like everything else the plugin
 writes.
 

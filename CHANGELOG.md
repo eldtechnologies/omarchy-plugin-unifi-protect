@@ -10,8 +10,8 @@ All notable changes to this plugin. The version is set in `manifest.json`;
 - **Save a clip from the timeline:** `S` saves a stretch of the enlarged
   (or selected) camera's recording as an MP4 in `UniFi Protect` inside
   your videos folder. Dragging along the timeline, or `I` and `O`, marks
-  its start and end, up to ten minutes; without marks it is the half
-  minute around the playhead.
+  its start and end, up to ten minutes, and a Save clip button appears;
+  without marks it is the half minute around the playhead.
 
 ### Changed
 
