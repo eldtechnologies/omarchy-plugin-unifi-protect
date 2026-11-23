@@ -378,6 +378,83 @@ ShellRoot {
     if (best !== null) seekTo(best, true)
   }
 
+  // ---- keeping a stretch of a recording ----
+  //
+  // I and O mark where it starts and ends; S saves it, for the camera
+  // enlarged or selected, to the videos folder. Without marks S saves
+  // the half minute around the playhead.
+  property real markIn: -1
+  property real markOut: -1
+  property bool saving: false
+  property string saveNote: ""
+  property bool saveFailed: false
+  readonly property int saveLimit: 600
+  readonly property var saveCamera: focusedIndex >= 0 ? focusedCamera : (cameras[selectedIndex] || null)
+
+  function mark(end) {
+    if (!reviewing) return
+    if (end) {
+      markOut = playhead
+      if (markIn >= markOut) markIn = -1
+    } else {
+      markIn = playhead
+      if (markOut >= 0 && markOut <= markIn) markOut = -1
+    }
+  }
+
+  function clearMarks() {
+    markIn = -1
+    markOut = -1
+  }
+
+  function saveSaid(text, failed) {
+    saveNote = text
+    saveFailed = failed
+    saveNoteTimer.restart()
+  }
+
+  function saveClip() {
+    var camera = saveCamera
+    if (saving || !reviewing || !camera || !backendReady) return
+    var start = markIn >= 0 ? markIn : markOut >= 0 ? playhead : playhead - 15
+    var end = markOut >= 0 ? markOut : markIn >= 0 ? playhead : playhead + 15
+    // Nothing later than the console has written.
+    end = Math.min(end, Date.now() / 1000 - recordLag)
+    if (end - start < 1) {
+      saveSaid("Nothing to save: mark the start with I and the end with O", true)
+      return
+    }
+    if (end - start > saveLimit) {
+      saveSaid("A saved clip is at most " + saveLimit / 60 + " minutes; "
+               + Math.round((end - start) / 60) + " are marked", true)
+      return
+    }
+    var what = camera.name + " " + clockText(start, false) + " (" + Math.round(end - start) + " s)"
+    saving = true
+    saveNoteTimer.stop()
+    saveNote = "Saving " + what + "…"
+    saveFailed = false
+    ask({ op: "save", uid: camera.uid, start: start, end: end, quality: focusQuality }, function(reply) {
+      shell.saving = false
+      if (reply.ok) {
+        var home = Quickshell.env("HOME") || ""
+        var path = String(reply.path || "")
+        if (home !== "" && path.indexOf(home + "/") === 0) path = "~" + path.slice(home.length)
+        shell.saveSaid("Saved " + what + " to " + path, false)
+        shell.clearMarks()
+      } else {
+        shell.saveSaid("Could not save " + what + ": "
+                       + (reply.noFootage ? "no recording there" : (reply.error || "something went wrong")), true)
+      }
+    })
+  }
+
+  Timer {
+    id: saveNoteTimer
+    interval: 15000
+    onTriggered: shell.saveNote = ""
+  }
+
   // ---- the helper, for stills, clips and the lanes ----
   property bool backendReady: false
   property var pendingReplies: ({})
@@ -427,6 +504,10 @@ ShellRoot {
       shell.backendReady = false
       backendSettled.stop()
       shell.pendingReplies = ({})
+      if (shell.saving) {
+        shell.saving = false
+        shell.saveSaid("Could not save: the recordings helper stopped", true)
+      }
       // One that stops as soon as it starts is tried less and less often,
       // and the strip says so.
       shell.backendFailures = Date.now() - shell.backendStarted < 10000 ? shell.backendFailures + 1 : 0
@@ -1216,6 +1297,13 @@ ShellRoot {
       anchors.baseline: clock.baseline
       text: (shell.paused ? "paused  ·  " : shell.scrubbing ? "" : shell.reviewing ? "recorded  ·  " : "")
             + shell.spanText(shell.span) + " shown"
+            + (shell.markIn >= 0 && shell.markOut >= 0
+               ? "  ·  marked " + shell.clockText(shell.markIn, false) + "–" + shell.clockText(shell.markOut, false)
+                 + " (" + Math.round(shell.markOut - shell.markIn) + " s): S saves it"
+                 + (shell.saveCamera ? " for " + shell.saveCamera.name : "") + ", X clears"
+               : shell.markIn >= 0 ? "  ·  start marked at " + shell.clockText(shell.markIn, false) + ": O marks the end"
+               : shell.markOut >= 0 ? "  ·  end marked at " + shell.clockText(shell.markOut, false) + ": I marks the start"
+               : "")
             + (shell.backendFailures >= 3 ? "  ·  the recordings helper keeps stopping; "
                                             + "run `eld-unifi-protect timeline-serve` to see why"
                : shell.indexLoaded ? "" : "  ·  loading detections…")
@@ -1434,6 +1522,34 @@ ShellRoot {
       }
     }
 
+    // ---- the stretch marked for saving ----
+    Rectangle {
+      readonly property real from: timelineStrip.xAt(shell.markIn >= 0 ? shell.markIn : shell.markOut)
+      readonly property real to: timelineStrip.xAt(shell.markOut >= 0 ? shell.markOut : shell.markIn)
+      readonly property real fromX: Math.max(0, Math.min(timelineStrip.trackWidth, from))
+      readonly property real toX: Math.max(0, Math.min(timelineStrip.trackWidth, to))
+      visible: shell.markIn >= 0 && shell.markOut >= 0 && toX > fromX
+      x: timelineStrip.trackX + fromX
+      y: laneColumn.y - 2
+      width: toX - fromX
+      height: timelineStrip.lanesHeight + 4
+      color: "#40ffd24a"
+    }
+
+    Repeater {
+      model: [shell.markIn, shell.markOut]
+      Rectangle {
+        required property real modelData
+        readonly property real at: timelineStrip.xAt(modelData)
+        visible: modelData >= 0 && at >= 0 && at <= timelineStrip.trackWidth
+        x: timelineStrip.trackX + at - 1
+        y: laneColumn.y - 4
+        width: 2
+        height: timelineStrip.lanesHeight + 8
+        color: "#ffd24a"
+      }
+    }
+
     // ---- the pointer ----
     Rectangle {
       visible: trackArea.containsMouse && !trackArea.pressed
@@ -1503,14 +1619,15 @@ ShellRoot {
       anchors.bottomMargin: 6
       width: Math.min(implicitWidth, parent.width - 32)
       elide: Text.ElideRight
-      text: "Drag or ←/→ 10 s (Shift 1 min)  ·  , . detections  ·  Space pause  ·  + − or wheel zoom"
-            + "  ·  End live  ·  Enter enlarge  ·  H/L camera"
+      text: shell.saveNote !== "" ? shell.saveNote
+            : "Drag or ←/→ 10 s (Shift 1 min)  ·  , . detections  ·  Space pause  ·  + − or wheel zoom"
+            + "  ·  I O mark, S save  ·  End live  ·  Enter enlarge  ·  H/L camera"
             + (shell.focusedIndex >= 0 ? "  ·  M mute" : "  ·  G layout")
             + (shell.focusedIndex < 0 && shell.pageCount > 1
                ? "  ·  PgDn page " + (shell.page + 1) + "/" + shell.pageCount : "")
             + "  ·  Q close"
-      color: "#6f757b"
-      font.pixelSize: 12
+      color: shell.saveNote === "" ? "#6f757b" : shell.saveFailed ? "#ff7777" : "#d8dde2"
+      font.pixelSize: shell.saveNote === "" ? 12 : 13
     }
   }
 
@@ -1538,6 +1655,10 @@ ShellRoot {
       else if (text === "+" || text === "=") { if (once) shell.zoomStep(-1) }
       else if (text === "-") { if (once) shell.zoomStep(1) }
       else if (event.key === Qt.Key_Space) { if (once) shell.togglePause() }
+      else if (text === "i") { if (once) shell.mark(false) }
+      else if (text === "o") { if (once) shell.mark(true) }
+      else if (text === "s") { if (once) shell.saveClip() }
+      else if (text === "x") { if (once) shell.clearMarks() }
       else if (event.key === Qt.Key_End || event.key === Qt.Key_Backspace) shell.goLive()
       else if (event.key === Qt.Key_Escape && shell.focusedIndex < 0 && shell.reviewing) shell.goLive()
       else return false

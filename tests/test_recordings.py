@@ -21,6 +21,7 @@ import unittest
 import urllib.parse
 from unittest import mock
 
+import helpers
 from helpers import helper as h
 
 JPEG = b"\xff\xd8" + b"thumb" + b"\xff\xd9"
@@ -471,6 +472,78 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         with self.assertRaises(h.NotFound) as raised:
             server.session("nvr")[1].get("/nowhere")
         self.assertNotIsInstance(raised.exception, h.NoFootage)
+
+    def test_timeline_saves_a_stretch_to_the_videos_folder(self):
+        server, out = self.timeline_server()
+        start = time.time() - 3600
+        request = {"id": 1, "op": "save", "uid": f"nvr_{CAMERA}", "start": start, "end": start + 45,
+                   "quality": "high"}
+        server.handle(request)
+        reply = self.replies(out)[1]
+        self.assertTrue(reply["ok"], reply)
+        folder = os.path.join(helpers.VIDEOS, "UniFi Protect")
+        self.assertEqual(os.path.dirname(reply["path"]), folder)
+        self.assertEqual(self.server.last_export["channel"], ["0"])
+        self.assertEqual(int(self.server.last_export["end"][0]), int((start + 45) * 1000))
+        with open(reply["path"], "rb") as handle:
+            self.assertEqual(handle.read(), MP4)
+        self.assertEqual(os.stat(reply["path"]).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(folder).st_mode & 0o777, 0o700)
+        # The same stretch again is a second file, not the first written over.
+        server.handle(dict(request, id=2))
+        again = self.replies(out)[2]["path"]
+        self.assertNotEqual(again, reply["path"])
+        self.assertTrue(os.path.exists(reply["path"]) and os.path.exists(again))
+        # Nothing is left behind by a save that fails.
+        before = sorted(os.listdir(folder))
+        for camera in ("gone", "empty"):
+            server.handle(dict(request, id=camera, uid=f"nvr_{camera}"))
+            self.assertTrue(self.replies(out)[camera]["noFootage"], camera)
+        for bad in ({"end": start}, {"end": start + 601}, {"quality": "best"}, {"start": "x"},
+                    {"uid": "nvr_../etc"}, {"start": time.time() + 5, "end": time.time() + 50}):
+            server.handle(dict(request, id="bad", **bad))
+            self.assertFalse(self.replies(out)["bad"]["ok"], bad)
+        self.assertEqual(sorted(os.listdir(folder)), before)
+
+    def test_a_saved_clip_is_named_safely(self):
+        folder = tempfile.mkdtemp()
+        start = time.mktime((2026, 11, 20, 17, 4, 10, 0, 0, -1))
+        self.assertEqual(os.path.basename(h.saved_clip_path(folder, "Front Door", start)),
+                         "Front Door 2026-11-20 17.04.10.mp4")
+        # A console names its cameras: nothing of a path, no hidden file,
+        # no option, no control characters.
+        for name, expected in (("../../.ssh/authorized_keys", "ssh authorized_keys"),
+                               ("/etc/passwd", "etc passwd"), (".hidden", "hidden"),
+                               ("--help", "help"), ("a\x1b[31m\nb\0c", "a 31m b c"),
+                               ("", "Camera"), ("///", "Camera"), ("Einfahrt Süd", "Einfahrt Süd"),
+                               ("x" * 200, "x" * 40)):
+            path = h.saved_clip_path(folder, name, start)
+            self.assertEqual(os.path.dirname(path), folder, name)
+            self.assertEqual(os.path.basename(path), f"{expected} 2026-11-20 17.04.10.mp4", name)
+        # A name already taken (a file, or a link planted there) is left alone.
+        first = h.saved_clip_path(folder, "Gate", start)
+        os.symlink("/etc/hostname", first)
+        second = h.saved_clip_path(folder, "Gate", start)
+        self.assertEqual(os.path.basename(second), "Gate 2026-11-20 17.04.10 (2).mp4")
+
+    def test_the_videos_folder_comes_from_the_user_dirs(self):
+        listed = os.path.join(os.environ["XDG_CONFIG_HOME"], "user-dirs.dirs")
+        with open(listed) as handle:
+            kept = handle.read()
+        home = os.path.expanduser("~")
+        try:
+            for line, expected in (('XDG_VIDEOS_DIR="$HOME/Film"', os.path.join(home, "Film")),
+                                   ('XDG_VIDEOS_DIR="/srv/video"', "/srv/video"),
+                                   ('XDG_VIDEOS_DIR="$HOME/"', os.path.join(home, "Videos")),
+                                   ('XDG_VIDEOS_DIR="$(rm -rf x)"', os.path.join(home, "Videos")),
+                                   ('XDG_VIDEOS_DIR="relative"', os.path.join(home, "Videos")),
+                                   ('# nothing here', os.path.join(home, "Videos"))):
+                with open(listed, "w") as handle:
+                    handle.write("XDG_MUSIC_DIR=\"$HOME/Music\"\n" + line + "\n")
+                self.assertEqual(h.videos_dir(), expected, line)
+        finally:
+            with open(listed, "w") as handle:
+                handle.write(kept)
 
     def test_timeline_clips_nobody_waits_for_are_not_exported(self):
         server, out = self.timeline_server()

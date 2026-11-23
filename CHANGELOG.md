@@ -3,6 +3,24 @@
 All notable changes to this plugin. The version is set in `manifest.json`;
 `eld-unifi-protect --version` reads it from there.
 
+## Unreleased
+
+### Added
+
+- **Save a clip from the timeline:** `S` saves a stretch of the enlarged
+  (or selected) camera's recording as an MP4 in `UniFi Protect` inside
+  your videos folder. `I` and `O` mark its start and end, up to ten
+  minutes; without marks it is the half minute around the playhead.
+
+### Changed
+
+- **Timeline playback no longer blinks between minutes:** the next
+  minute's clip is loaded ahead and takes over without a gap, also right
+  behind "now".
+- **An enlarged timeline camera starts at once:** it shows the
+  low-quality clip first and changes to the full-quality one when that
+  arrives, instead of waiting seconds for a minute of 4K.
+
 ## 0.6.1 — 2026-11-18
 
 ### Security

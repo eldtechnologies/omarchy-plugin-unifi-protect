@@ -232,6 +232,7 @@ recordings from there, playing on in step. Drag to the right-hand end, press
 | ← / → | Back / forward 10 s (`Shift`: 1 min) |
 | `,` / `.` | Previous / next detection on the cameras shown |
 | Space | Pause / play |
+| `I` / `O`, `S`, `X` | Mark the start / end of a stretch, save it, clear the marks |
 | `+` / `-`, wheel | Zoom: 1, 6 or 24 hours (the wheel zooms freely, down to 10 minutes; `Shift`+wheel pans) |
 | `End`, Backspace | Back to live |
 | Enter, click, `1`–`9` | Enlarge a camera (high quality, with sound); again for the grid |
@@ -246,10 +247,20 @@ console you are not signed in to says so. Coloured marks are detections
 along the bottom. A camera with nothing recorded at the playhead says "No
 recording" while the others play on.
 
+**Saving a clip.** `S` saves a stretch of the enlarged camera's recording
+(in the grid, the selected camera's) as an MP4 in `UniFi Protect` inside
+your videos folder, named for the camera and the time, in the enlarged
+quality. Mark the stretch with `I` at its start and `O` at its end, up to
+ten minutes; without marks, `S` saves the half minute around the playhead.
+The file is private to you (mode 0600), like everything else the plugin
+writes.
+
 Recordings play in one-minute clips at low quality in the grid
-(`--playback-quality`) and at the enlarged quality for an enlarged camera;
-there is a short blink as each minute hands over to the next. The last 30
-seconds are not played back: the console has not written all of them yet,
+(`--playback-quality`) and at the enlarged quality for an enlarged camera.
+Each next minute is loaded ahead and takes over without a gap. An enlarged
+camera shows the low-quality clip first and changes to the full-quality
+one when it arrives (a minute of 4K takes a few seconds to come). The last
+30 seconds are not played back: the console has not written all of them yet,
 and stepping or dragging up to them goes back to live. Clips
 and stills are kept in memory (the runtime directory), at most 80 clips or
 500 MB, and are gone when the window closes.
@@ -435,6 +446,7 @@ The plugin's own files:
 | `~/.config/eld-unifi-protect/config.json` | Consoles, pinned certificates and recordings usernames; API keys and passwords only if there is no keyring (mode 0600) |
 | `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras, favourite, armed cameras, read-only setting (no secrets) |
 | `~/.local/state/eld-unifi-protect/state.json` | Last camera list |
+| `UniFi Protect/` in your videos folder | Clips you save from the timeline with `S`; yours to keep or delete, never removed by the plugin |
 | `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their pictures, recordings sessions, thumbnails, clips and the timeline's stills and clips (tmpfs, gone on reboot; your notification history may keep its own copy of alert pictures) |
 | `~/.local/state/eld-unifi-protect/` | Last camera list, rejected recordings logins, streams the plugin switched on |
 

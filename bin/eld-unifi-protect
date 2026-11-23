@@ -3169,8 +3169,12 @@ class ProtectSession:
             modes[camera["id"]] = {"coverage": RECORDING_MODES.get(mode, "unknown"), "from": oldest}
         return modes
 
-    def export(self, camera_id, start, end, quality, path):
-        """Write the recording between two times (seconds) to path as MP4."""
+    def export(self, camera_id, start, end, quality, path, limit=None):
+        """Write the recording between two times (seconds) to path as MP4.
+
+        limit: the most bytes to write; the default is for clips kept in
+        memory (the runtime dir).
+        """
         try:
             conn, response = self.open("/video/export", params={
                 "camera": camera_id, "start": int(start * 1000), "end": int(end * 1000),
@@ -3188,8 +3192,9 @@ class ProtectSession:
                     if not chunk:
                         break
                     written += len(chunk)
-                    if written > CLIPS_MAX_BYTES:
-                        raise ProtectError("the clip is too large to keep in memory; try a lower quality")
+                    if written > (limit or CLIPS_MAX_BYTES):
+                        raise ProtectError("the clip is too large to save; try a shorter stretch" if limit else
+                                           "the clip is too large to keep in memory; try a lower quality")
                     out.write(chunk)
             with open(partial, "rb") as handle:
                 head = handle.read(12)
@@ -3267,7 +3272,7 @@ class DemoSession:
         with open(os.path.join(DEMO_DIR, f"{camera}.jpg"), "rb") as handle:
             return handle.read()
 
-    def export(self, camera_id, start, end, quality, path):
+    def export(self, camera_id, start, end, quality, path, limit=None):
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise ProtectError("demo mode needs ffmpeg")
@@ -3387,6 +3392,9 @@ TIMELINE_CLIP_SECONDS = 600     # the longest stretch one request may export
 TIMELINE_CLIPS_KEEP = 80
 TIMELINE_CLIPS_MAX_BYTES = 500 * 1024 * 1024   # clips live in RAM (the runtime dir)
 TIMELINE_SLOT = re.compile(r"[a-z]{1,8}")
+SAVED_CLIP_SECONDS = 600        # the longest stretch saved as one file
+SAVED_CLIP_MAX_BYTES = 2 * 1024 ** 3
+SAVED_CLIPS_FOLDER = "UniFi Protect"    # inside the videos folder
 
 
 def timeline_target(config, uid):
@@ -3477,6 +3485,42 @@ def prune_timeline_clips(folder, keep_path=None):
                 pass
 
 
+def videos_dir():
+    """The user's videos folder (XDG user dirs), else ~/Videos."""
+    home = os.path.expanduser("~")
+    listed = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "user-dirs.dirs")
+    try:
+        with open(listed, encoding="utf-8", errors="replace") as handle:
+            lines = handle.read(65536).splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        match = re.fullmatch(r'\s*XDG_VIDEOS_DIR="(\$HOME/|/)([^"$`\\\0]*)"\s*', line)
+        if match:
+            path = os.path.normpath(os.path.join(home if match.group(1) != "/" else "/", match.group(2)))
+            # Unset, it is written as the home folder itself.
+            if path not in (home, "/"):
+                return path
+    return os.path.join(home, "Videos")
+
+
+def saved_clip_path(folder, name, start):
+    """A file name not yet taken: the camera's name and the clip's start.
+
+    The name comes from a console: only letters, digits, spaces, "-" and
+    "_" of it reach the file name, so it can never name another folder or
+    a hidden file.
+    """
+    safe = "".join(ch if ch.isalnum() or ch in " -_" else " " for ch in clean_text(name, "", 60))
+    safe = " ".join(safe.split())[:40].strip(" -_") or "Camera"
+    base = f"{safe} {time.strftime('%Y-%m-%d %H.%M.%S', time.localtime(start))}"
+    for n in range(1, 100):
+        path = os.path.join(folder, base + ("" if n == 1 else f" ({n})") + ".mp4")
+        if not os.path.lexists(path):
+            return path
+    raise ProtectError("that moment has been saved too many times; clear some out first")
+
+
 def sweep_timeline_dirs():
     """Remove what timeline servers that are gone left behind.
 
@@ -3495,6 +3539,7 @@ class TimelineServer:
     {"id", "op": "index", "uids": [...]}
     {"id", "op": "still", "uid", "at", "quality", "slot"}
     {"id", "op": "clip", "uid", "start", "end", "quality", "serial"}
+    {"id", "op": "save", "uid", "start", "end", "quality"}
 
     Replies carry the id and "ok"; a failure says why in "error", with
     "noFootage", "needsLogin" or "superseded" set when that is the reason.
@@ -3514,6 +3559,7 @@ class TimelineServer:
         self.lock = threading.Lock()
         self.sessions = {}      # console id -> (session, made at)
         self.clip_locks = {}    # path -> [lock, users]
+        self.save_lock = threading.Lock()
         self.stills = {}        # (uid, slot) -> paths, oldest first
         self.counter = 0
         self.serial = 0
@@ -3577,6 +3623,8 @@ class TimelineServer:
                 result = self.still(request)
             elif op == "clip":
                 result = self.clip(request)
+            elif op == "save":
+                result = self.save(request)
             else:
                 raise ProtectError("unknown request")
             self.reply(request_id, ok=True, **result)
@@ -3644,6 +3692,28 @@ class TimelineServer:
             except FileNotFoundError:
                 pass
         return {"path": path, "at": at}
+
+    def save(self, request):
+        """Keep a stretch of a camera's recording: a file in the videos folder."""
+        start, end, quality = self.number(request, "start"), self.number(request, "end"), self.quality(request)
+        if not 1 <= end - start <= SAVED_CLIP_SECONDS:
+            raise ProtectError(f"a saved clip is at most {SAVED_CLIP_SECONDS // 60} minutes")
+        if end > time.time():
+            raise NoFootage("that time has not happened yet")
+        camera_id, session = self.target(request)
+        if hasattr(session, "footage"):     # demo mode's gaps
+            session.footage(camera_id, start, end)
+        folder = os.path.join(videos_dir(), SAVED_CLIPS_FOLDER)
+        try:
+            os.makedirs(folder, mode=0o700, exist_ok=True)
+        except OSError as error:
+            raise ProtectError(f"cannot save to {folder}: {error.strerror or error}")
+        # One at a time: two saves of one moment get two names, and a
+        # console is not asked for several long exports at once.
+        with self.save_lock:
+            path = saved_clip_path(folder, camera_name(request["uid"]), start)
+            session.export(camera_id, start, end, quality, path, limit=SAVED_CLIP_MAX_BYTES)
+        return {"path": path, "start": start, "end": end}
 
     def clip(self, request):
         start, end, quality = self.number(request, "start"), self.number(request, "end"), self.quality(request)
