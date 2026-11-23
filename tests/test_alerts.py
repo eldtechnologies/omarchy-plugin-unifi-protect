@@ -174,6 +174,65 @@ class ListenerLifecycle(unittest.TestCase):
         lst.handle("nvr", {"type": "update", "item": dict(item, smartDetectTypes=["person", "vehicle"])})
         self.assertEqual(lst.alerts, [])
 
+    def test_one_console_cannot_touch_anothers_events(self):
+        lst = self.listener()
+        lst.armed["gw"] = {"cam9": {"uid": "gw_cam9", "name": "Yard", "consoleName": "GW", "alerts": ["person"]}}
+        event = {"modelKey": "event", "type": "smartDetectZone", "start": 1791700000000}
+        lst.handle("nvr", {"item": dict(event, id="e1", device="cam1", smartDetectTypes=[])})
+        # Another console floods the listener with events, of unarmed
+        # cameras and of an armed one: the first console's are not forgotten.
+        for n in range(h.EVENTS_REMEMBERED + 50):
+            lst.handle("gw", {"item": dict(event, id=f"x{n}", device="zz", smartDetectTypes=[])})
+            lst.handle("gw", {"item": dict(event, id=f"y{n}", device="cam9", smartDetectTypes=[])})
+        self.assertLessEqual(len(lst.event_cameras), h.EVENTS_REMEMBERED + 1)
+        lst.handle("nvr", {"item": {"id": "e1", "modelKey": "event", "type": "smartDetectZone",
+                                    "smartDetectTypes": ["person"]}})
+        self.assertEqual([a["uid"] for a in lst.alerts], ["nvr_cam1"])
+        # Nor can it end the other's alert by using its event's id...
+        lst.handle("gw", {"item": dict(event, id="e1", device="cam9", end=1791700005000)})
+        self.assertIsNone(lst.alerts[0]["end"])
+        # ...and an event of its own with that id is its own.
+        lst.handle("gw", {"item": dict(event, id="e1", device="cam9", smartDetectTypes=["person"])})
+        self.assertEqual(sorted(a["uid"] for a in lst.alerts), ["gw_cam9", "nvr_cam1"])
+
+    def test_a_slow_snapshot_does_not_hold_back_the_notification(self):
+        lst = self.listener()
+        lst.config = {"consoles": [{"id": "nvr"}, {"id": "gw"}]}
+        told, release = [], threading.Event()
+        lst.notify = lambda console_id, camera, alert: told.append((console_id, time.monotonic()))
+
+        class Slow:
+            def __init__(self, console, config):
+                self.slow = console["id"] == "gw"
+
+            def snapshot(self, camera_id):
+                if self.slow:
+                    release.wait(30)
+                raise h.ProtectError("no picture")
+
+        async def run():
+            started = time.monotonic()
+            cameras = [{"uid": f"gw_c{n}", "id": f"c{n}", "name": "Yard", "consoleName": "GW"} for n in range(12)]
+            slow = [asyncio.ensure_future(lst.capture("gw", c, {"id": f"g{n}"})) for n, c in enumerate(cameras)]
+            await asyncio.sleep(0.05)
+            # Only a few of a console's pictures are ever taken or waited for at once.
+            self.assertEqual(lst.capturing["gw"], h.CAPTURES_AT_ONCE + h.CAPTURES_WAITING)
+            await lst.capture("nvr", {"uid": "nvr_cam1", "id": "cam1", "name": "Door", "consoleName": "NVR"},
+                              {"id": "n1"})
+            quick = time.monotonic() - started
+            await asyncio.gather(*slow)
+            waited = time.monotonic() - started
+            release.set()
+            return quick, waited
+
+        with mock.patch.object(h, "Protect", Slow), mock.patch.object(h, "CAPTURE_WAIT", 0.3):
+            quick, waited = asyncio.run(run())
+        # The other console's alert was told of at once, and the slow
+        # console's own after the short wait, not when its snapshots ended.
+        self.assertLess(quick, 0.25)
+        self.assertLess(waited, 2)
+        self.assertEqual(len(told), 13)
+
     def test_malformed_messages_are_ignored(self):
         lst = self.listener()
         for message in ([], {"item": []}, {"item": {"id": "e9", "device": ["cam1"], "type": "ring"}},

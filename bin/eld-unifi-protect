@@ -1317,6 +1317,10 @@ EVENT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ALERT_IMAGE = re.compile(r"[A-Za-z0-9_-]{1,64}\.jpg")
 NOTIFY_EVERY = 60   # seconds; at most one notification per camera per minute
 CAPTURE_EVERY = 5   # seconds; at most one alert snapshot per camera
+CAPTURE_WAIT = 4    # seconds a notification waits for its picture
+CAPTURES_AT_ONCE = 2    # per console; a few more may wait their turn
+CAPTURES_WAITING = 4
+EVENTS_REMEMBERED = 1000    # per console
 PLUGIN_ID = "com.eldtechnologies.unifi-protect"
 ALERTS_MAX_AGE = 24 * 3600
 ALERTS_PER_MINUTE = 10      # new alerts per camera
@@ -1904,9 +1908,13 @@ class AlertListener:
         self.parent = os.getppid() if follow_parent else None
         self.alerts = load_alerts()
         self.status = {}
-        self.event_cameras = {}      # event id -> camera id, for sparse updates
-        self.event_starts = {}       # event id -> its start, likewise
-        self.opened = {}             # event ids that already opened an alert
+        # Each keyed by (console id, event id): a console's events are its
+        # own, whatever ids it gives them.
+        self.event_cameras = {}      # -> camera id, for sparse updates
+        self.event_starts = {}       # -> the event's start, likewise
+        self.opened = {}             # events that already opened an alert
+        self.capture_pools = {}      # console id -> its snapshot threads
+        self.capturing = {}          # console id -> snapshots running or waiting
         self.armed = {}
         self.config = None
         self.prefs_stamp = None
@@ -1958,31 +1966,40 @@ class AlertListener:
         event_id = str(item["id"])
         if not EVENT_ID.fullmatch(event_id):
             return  # not a Protect ID; it would name the snapshot file
-        camera_id = item.get("device") or self.event_cameras.get(event_id)
+        key = (console_id, event_id)
+        camera_id = item.get("device") or self.event_cameras.get(key)
         if not isinstance(camera_id, str) or not CAMERA_ID.fullmatch(camera_id):
             return
-        self.event_cameras[event_id] = camera_id
-        if event_time(item.get("start")) is not None:
-            # Updates may omit the start, like the device: remember it.
-            self.event_starts[event_id] = event_time(item.get("start"))
-        if len(self.event_cameras) > 1000:
-            gone = next(iter(self.event_cameras))
-            self.event_cameras.pop(gone)
-            self.event_starts.pop(gone, None)
         self.refresh()
         camera = self.armed.get(console_id, {}).get(camera_id)
-        existing = next((a for a in self.alerts if a["id"] == event_id), None)
+        if camera is None:
+            return      # not armed: nothing to remember either
+        self.event_cameras[key] = camera_id
+        if event_time(item.get("start")) is not None:
+            # Updates may omit the start, like the device: remember it.
+            self.event_starts[key] = event_time(item.get("start"))
+        # The oldest of this console's own go first: no console can make
+        # the listener forget another's events.
+        mine = [k for k in self.event_cameras if k[0] == console_id]
+        for gone in mine[:max(0, len(mine) - EVENTS_REMEMBERED)]:
+            self.event_cameras.pop(gone)
+            self.event_starts.pop(gone, None)
+        # Only this console's own alert: another's event of the same id is
+        # another event.
+        existing = next((a for a in self.alerts
+                         if a["id"] == event_id and str(a.get("uid", "")).startswith(console_id + "_")), None)
         kind = alert_kind(item, camera["alerts"]) if camera else None
         changed = False
         now = time.time()
         kind_is_new = False
         # One alert per event, ever: a Clear must not be undone by the same
         # event's next update.
-        if (kind and existing is None and event_id not in self.opened
+        if (kind and existing is None and key not in self.opened
                 and self.allow_new_alert(camera["uid"], now)):
-            self.opened[event_id] = True
-            if len(self.opened) > 1000:
-                self.opened.pop(next(iter(self.opened)))
+            self.opened[key] = True
+            mine = [k for k in self.opened if k[0] == console_id]
+            for gone in mine[:max(0, len(mine) - EVENTS_REMEMBERED)]:
+                self.opened.pop(gone)
             kind_is_new = True
             # Smart detections often arrive as an empty "add" followed by an
             # "update" naming what was seen, so either can open an alert.
@@ -1990,7 +2007,7 @@ class AlertListener:
             existing = {
                 "id": event_id, "uid": camera["uid"], "camera": camera["name"],
                 "consoleName": camera["consoleName"], "kind": kind,
-                "start": min(self.event_starts.get(event_id) or now, now), "end": None,
+                "start": min(self.event_starts.get(key) or now, now), "end": None,
                 # When it was opened, on the boot's monotonic clock: what
                 # Clear and "seen" compare, so a clock step cannot reorder them.
                 "seq": time.monotonic(), "boot": BOOT_ID,
@@ -2034,24 +2051,47 @@ class AlertListener:
         now = time.monotonic()     # throttles: a wall-clock step must not silence them
         console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
         last = self.last_captured.get(camera["uid"])
-        if console is not None and (last is None or now - last >= CAPTURE_EVERY):
+        if (console is not None and (last is None or now - last >= CAPTURE_EVERY)
+                and self.capturing.get(console_id, 0) < CAPTURES_AT_ONCE + CAPTURES_WAITING):
             self.last_captured[camera["uid"]] = now
-            try:
-                data = await asyncio.to_thread(
-                    lambda: Protect(console, self.config).snapshot(camera["id"]))
-                if plugin_gone():
-                    return
-                name = f"{alert['id']}.jpg"
-                path = alert_image_path(name)
-                if not path:
-                    raise ProtectError("unsafe alert id")
-                os.makedirs(ALERT_IMAGES_DIR, mode=0o700, exist_ok=True)
-                write_atomic(path, data)
-                alert["image"] = name
-                self.save()
-            except (ProtectError, OSError):
-                pass
+            # Counted here, not when the task first runs: several alerts
+            # arrive before any of them does.
+            self.capturing[console_id] = self.capturing.get(console_id, 0) + 1
+            picture = asyncio.ensure_future(self.take_picture(console, camera, alert))
+            # The notification waits a moment for its picture, never
+            # longer: a console slow with snapshots (they can take minutes
+            # to fail) must not hold back the news, its own or another's.
+            await asyncio.wait({picture}, timeout=CAPTURE_WAIT)
         self.notify(console_id, camera, alert)
+
+    async def take_picture(self, console, camera, alert):
+        """The camera's snapshot, kept as the alert's picture. Never raises.
+
+        On the console's own few threads: one that answers slowly keeps
+        only its own pictures waiting.
+        """
+        console_id = console["id"]
+        pool = self.capture_pools.get(console_id)
+        if pool is None:
+            pool = self.capture_pools[console_id] = ThreadPoolExecutor(
+                max_workers=CAPTURES_AT_ONCE, thread_name_prefix="alert-picture")
+        try:
+            data = await asyncio.get_running_loop().run_in_executor(
+                pool, lambda: Protect(console, self.config).snapshot(camera["id"]))
+            if plugin_gone():
+                return
+            name = f"{alert['id']}.jpg"
+            path = alert_image_path(name)
+            if not path:
+                raise ProtectError("unsafe alert id")
+            os.makedirs(ALERT_IMAGES_DIR, mode=0o700, exist_ok=True)
+            write_atomic(path, data)
+            alert["image"] = name
+            self.save()
+        except (ProtectError, OSError, RuntimeError):
+            pass    # RuntimeError: the listener is shutting down
+        finally:
+            self.capturing[console_id] -= 1
 
     def notify(self, console_id, camera, alert):
         """Desktop notification for a new alert, at most once a minute per camera."""
