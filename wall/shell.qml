@@ -671,12 +671,111 @@ ShellRoot {
     }
   }
 
+  // A player and its picture. A Playback has two, so that the next clip
+  // can be made ready out of sight and take over without a gap.
+  component Deck: Item {
+    id: deck
+    property bool playAudio: false
+    // { path, start, end, chunk, seek, quality }: what the player holds,
+    // and the move of the playhead it was fetched for.
+    property var clip: null
+    // Loaded, and told where in the clip to be.
+    property bool positioned: false
+    // Where that was (ms), and whether a frame from there has arrived.
+    property real target: 0
+    property bool hasFrame: false
+    property alias player: deckPlayer
+    signal placed()
+    signal failed(string message)
+
+    function load(newClip) {
+      positioned = false
+      hasFrame = false
+      target = 0
+      clip = newClip
+      // The same file again would not load anew, and so never be lined up.
+      if (String(deckPlayer.source) === "file://" + newClip.path) {
+        deckPlayer.stop()
+        deckPlayer.source = ""
+      }
+      deckPlayer.source = "file://" + newClip.path
+    }
+
+    function release() {
+      clip = null
+      positioned = false
+      hasFrame = false
+      deckPlayer.stop()
+      deckPlayer.source = ""
+    }
+
+    // Where the shell's clock says this clip should be (ms); its start
+    // for a clip made ready ahead of its minute.
+    function wanted() {
+      return clip === null ? 0 : Math.max(0, (shell.playhead - clip.start) * 1000)
+    }
+
+    // Move there. The picture counts as arrived again only once a frame
+    // from there has.
+    function place(position) {
+      target = Math.max(0, Math.min(deckPlayer.duration - 50, position))
+      hasFrame = false
+      deckPlayer.setPosition(target)
+    }
+
+    VideoOutput {
+      id: deckVideo
+      anchors.fill: parent
+      fillMode: VideoOutput.PreserveAspectFit
+    }
+
+    Connections {
+      target: deckVideo.videoSink
+      function onVideoFrameChanged() {
+        if (deck.clip !== null && deck.positioned && !deck.hasFrame
+            && Math.abs(deckPlayer.position - deck.target) < 2000)
+          deck.hasFrame = true
+      }
+    }
+
+    AudioOutput {
+      id: deckAudio
+      device: shell.mediaDevices.defaultAudioOutput
+      muted: shell.muted
+    }
+
+    MediaPlayer {
+      id: deckPlayer
+      videoOutput: deckVideo
+      audioOutput: deck.playAudio ? deckAudio : null
+      activeAudioTrack: deck.playAudio ? 0 : -1
+      onErrorOccurred: function(error, errorString) {
+        if (deck.clip !== null) deck.failed(errorString || "cannot play the recording")
+      }
+      onMediaStatusChanged: {
+        if (mediaStatus === MediaPlayer.InvalidMedia && deck.clip !== null) {
+          deck.failed("cannot play the recording")
+          return
+        }
+        if (deck.clip === null || deck.positioned) return
+        if (mediaStatus !== MediaPlayer.LoadedMedia && mediaStatus !== MediaPlayer.BufferedMedia) return
+        deck.positioned = true
+        var want = deck.wanted()
+        if (want > 300) deck.place(want)
+        deck.placed()
+      }
+    }
+  }
+
   // A camera's recording at the shell's playhead: stills while it is
   // dragged, then the clip around it.
   component Playback: Item {
     id: playback
     property string uid: ""
     property string quality: "low"
+    // A quality that arrives sooner, shown first while `quality` is on its
+    // way (a minute of 4K takes seconds to come). "" for none.
+    property string quickQuality: ""
     // Names this view's stills apart from another view of the same camera.
     property string slot: "grid"
     property bool playAudio: false
@@ -689,37 +788,47 @@ ShellRoot {
     property real stillAt: -1
     property real stillAsked: -1
     property bool stillBusy: false
-    // { path, start, end, chunk, seek }: what the player holds, and the
-    // move of the playhead it was fetched for.
-    property var clip: null
-    property bool positioned: false
+    // Two decks. `front` holds the clip the clock is in; the other is
+    // where the next one is made ready. `shown` is the one on screen: the
+    // old front, until the new one has a frame to show.
+    property Item front: deckA
+    property Item shown: deckA
+    readonly property Item back: front === deckA ? deckB : deckA
     property real askedChunk: -1
     property real failedChunk: -1
     property real fetchedAhead: -1
+    property real upgradeChunk: -1
     property real refetchedAt: 0
     property int serial: 0
+    // Counts the camera changes and stops: an answer from before one is
+    // not for what is shown now.
+    property int epoch: 0
     // "", "nofootage", or what went wrong.
     property string problem: ""
-    // The clip is the one for the minute the playhead is in. After a jump
-    // it is not, until the new one arrives; when a minute simply runs into
-    // the next, the old clip's last frame stays up for that moment.
-    readonly property bool clipCurrent: clip !== null && clip.chunk === shell.chunkStart
-    readonly property bool clipUsable: clipCurrent
-                                       || (clip !== null && clip.seek === shell.seekSerial
-                                           && clip.chunk === shell.chunkStart - shell.chunkSeconds)
+
+    // A clip is worth showing in the minute it is for. After a jump an
+    // older one is not; when a minute simply runs into the next, the old
+    // clip's last frame stays up until the new one takes over.
+    function usable(clip) {
+      return clip !== null && (clip.chunk === shell.chunkStart
+                               || (clip.seek === shell.seekSerial
+                                   && clip.chunk === shell.chunkStart - shell.chunkSeconds))
+    }
+    readonly property bool clipUsable: usable(front.clip)
+    readonly property bool videoShowing: shown.hasFrame && usable(shown.clip)
     // A still is worth showing only close to where it was taken.
     readonly property bool stillFresh: stillPath !== "" && Math.abs(stillAt - shell.playhead) < 4
 
     function refresh() {
       if (!active || uid === "" || !shell.reviewing || !shell.backendReady || needsLogin) return
       if (shell.scrubbing) {
-        player.pause()
+        front.player.pause()
         wantStill()
       } else {
         // A jump elsewhere: stop what was playing, and show a frame from
         // there until the clip comes (unless there is none to come).
         if (!clipUsable) {
-          if (clip !== null) player.pause()
+          if (front.clip !== null) front.player.pause()
           if (failedChunk !== shell.chunkStart) {
             // What went wrong in the minute left behind says nothing of this one.
             problem = ""
@@ -731,29 +840,36 @@ ShellRoot {
       }
     }
 
+    function dropClips() {
+      deckA.release()
+      deckB.release()
+      front = deckA
+      shown = deckA
+    }
+
     // Another camera in this view (the enlarged one flips): start afresh.
     property bool ready: false
     function reset() {
       if (!ready) return
       serial++
+      epoch++
       stillSerial++
       stillBusy = false
-      clip = null
-      positioned = false
+      dropClips()
       askedChunk = -1
       failedChunk = -1
       fetchedAhead = -1
+      upgradeChunk = -1
       stillPath = ""
       stillAt = -1
       stillAsked = -1
       refetchedAt = 0
       problem = ""
-      player.stop()
-      player.source = ""
       refresh()
     }
     onUidChanged: reset()
     onQualityChanged: reset()
+    onQuickQualityChanged: reset()
     property int stillSerial: 0
 
     // One request at a time: the next asks for wherever the playhead is by
@@ -784,19 +900,84 @@ ShellRoot {
       })
     }
 
+    // Into the deck out of sight; it takes over once it is loaded (see
+    // deckPlaced), or when its minute comes.
+    function loadClip(clip) {
+      var deck = back
+      // Still waiting for the front's first frame: no longer.
+      if (shown === deck) shown = front
+      // The next minute's clip was ready there: it is asked for again.
+      if (deck.clip !== null && deck.clip.chunk > shell.chunkStart) fetchedAhead = -1
+      deck.load(clip)
+      if (shell.paused || shell.scrubbing || clip.chunk !== shell.chunkStart) deck.player.pause()
+      else deck.player.play()
+    }
+
+    function deckPlaced(deck) {
+      if (deck === back && deck.clip !== null && deck.clip.chunk === shell.chunkStart) promote()
+    }
+
+    // The deck made ready takes over. The one on screen holds its last
+    // frame until the new one has a frame of its own.
+    function promote() {
+      var old = front
+      front = back
+      if (!shell.paused && !shell.scrubbing) front.player.play()
+      if (old.clip !== null) old.player.pause()
+      showFront()
+    }
+
+    function showFront() {
+      if (shown === front) return
+      // Nothing worth holding on screen, or the new picture is there.
+      if (front.hasFrame || !usable(shown.clip)) {
+        var old = shown
+        shown = front
+        old.release()
+      }
+    }
+
+    function deckFailed(deck, message) {
+      // A clip made ready ahead that will not play is tried again when
+      // its minute comes; only the one wanted now is a problem to show.
+      if (deck === front || (deck.clip !== null && deck.clip.chunk === shell.chunkStart)) problem = message
+      if (deck !== front) {
+        if (shown === deck) shown = front
+        deck.release()
+      }
+    }
+
     // again: fetch this minute's clip anew although one is held (it was
     // cut short at "now", and there is more by now).
     function wantClip(again) {
       var chunk = shell.chunkStart
-      if (!again && clip !== null && clip.chunk === chunk) { resync(); return }
+      if (!again) {
+        if (front.clip !== null && front.clip.chunk === chunk) {
+          resync()
+          wantUpgrade()
+          return
+        }
+        if (back.clip !== null && back.clip.chunk === chunk) {
+          // Made ready ahead: its minute has come. (One still loading
+          // takes over when it has.)
+          if (back.positioned) {
+            promote()
+            resync()
+            wantUpgrade()
+          }
+          return
+        }
+      }
       if (askedChunk === chunk || failedChunk === chunk) return
       var end = Math.min(chunk + shell.chunkSeconds, Math.floor(Date.now() / 1000) - shell.recordLag)
       if (end - chunk < 2) return
       askedChunk = chunk
       var mine = ++serial
+      // What is on screen keeps its quality; a first clip comes quickly.
+      var asked = again ? front.clip.quality : (quickQuality !== "" ? quickQuality : quality)
       // seekSerial lets the helper skip this export if the playhead has
       // moved on by the time its turn comes.
-      shell.ask({ op: "clip", uid: uid, start: chunk, end: end, quality: quality,
+      shell.ask({ op: "clip", uid: uid, start: chunk, end: end, quality: asked,
                   serial: shell.seekSerial }, function(reply) {
         if (mine !== playback.serial) return
         playback.askedChunk = -1
@@ -807,66 +988,112 @@ ShellRoot {
         }
         if (!reply.ok) {
           playback.failedChunk = chunk
-          playback.clip = null
-          player.stop()
+          playback.dropClips()
           playback.problem = reply.noFootage ? "nofootage" : (reply.error || "no recording")
           return
         }
         playback.problem = ""
         playback.failedChunk = -1
-        playback.positioned = false
-        playback.clip = { path: reply.path, start: reply.start, end: reply.end, chunk: chunk,
-                          seek: shell.seekSerial }
-        // The same file again (back from an enlarged camera within the
-        // minute) would not load anew, and so never be lined up.
-        if (String(player.source) === "file://" + reply.path) {
-          player.stop()
-          player.source = ""
+        // Made ready ahead meanwhile: that one will do.
+        if (!again && ((playback.front.clip !== null && playback.front.clip.chunk === chunk)
+                       || (playback.back.clip !== null && playback.back.clip.chunk === chunk))) return
+        playback.loadClip({ path: reply.path, start: reply.start, end: reply.end, chunk: chunk,
+                            seek: shell.seekSerial, quality: asked })
+        playback.wantUpgrade()
+      })
+    }
+
+    // The quick clip is up (or on its way): now the one in full quality,
+    // which takes over when it lands.
+    function wantUpgrade() {
+      var chunk = shell.chunkStart
+      if (quickQuality === "" || quickQuality === quality || upgradeChunk === chunk) return
+      var held = front.clip !== null && front.clip.chunk === chunk ? front.clip
+               : back.clip !== null && back.clip.chunk === chunk ? back.clip : null
+      if (held === null || held.quality === quality) return
+      upgradeChunk = chunk
+      var mine = epoch
+      shell.ask({ op: "clip", uid: uid, start: chunk, end: held.end, quality: quality,
+                  serial: shell.seekSerial }, function(reply) {
+        if (mine !== playback.epoch || !playback.active) return
+        if (reply.superseded) {
+          playback.upgradeChunk = -1
+          playback.refresh()
+          return
         }
-        player.source = "file://" + reply.path
-        if (shell.paused || shell.scrubbing) player.pause()
-        else player.play()
+        // Without it the quick clip stays; this minute is not asked again.
+        if (!reply.ok || chunk !== shell.chunkStart) return
+        playback.loadClip({ path: reply.path, start: reply.start, end: reply.end, chunk: chunk,
+                            seek: shell.seekSerial, quality: playback.quality })
       })
     }
 
     // Back in step with the shell's clock, after a move within the clip
     // or a stall.
     function resync() {
-      if (clip === null || !positioned) return
+      var clip = front.clip
+      var player = front.player
+      if (clip === null || !front.positioned) return
       var want = (shell.playhead - clip.start) * 1000
-      if (want > player.duration + 500 && clip.end < clip.chunk + shell.chunkSeconds - 1) {
-        // A clip cut short at "now" has run out: there is more by now.
-        // Its last frame stays up meanwhile, and a console that sends
-        // less than asked is not asked again and again.
+      if (want > player.duration - 3000 && clip.end < clip.chunk + shell.chunkSeconds - 1) {
+        // A clip cut short at "now" is about to run out: there is more by
+        // now, and it takes over when it comes. A console that sends less
+        // than asked is not asked again and again.
         if (Date.now() - refetchedAt > 4000) {
           refetchedAt = Date.now()
           wantClip(true)
         }
-        return
+        if (want > player.duration + 500) return
       }
-      if (Math.abs(player.position - want) > 1500)
-        player.setPosition(Math.max(0, Math.min(player.duration - 50, want)))
+      if (Math.abs(player.position - want) > 1500) front.place(want)
       if (shell.paused) player.pause()
       else if (player.playbackState !== MediaPlayer.PlayingState && want < player.duration - 200) player.play()
     }
 
-    // The next clip, fetched before this one ends.
+    // The next clip, fetched and made ready before this one ends. Close
+    // behind "now" the next minute is not all recorded yet: then what
+    // there is of it, in the last seconds.
     function fetchAhead() {
       var next = shell.chunkStart + shell.chunkSeconds
       if (shell.paused || fetchedAhead === next) return
-      if (shell.playhead - shell.chunkStart < shell.chunkSeconds - 20) return
-      if (next + shell.chunkSeconds > Date.now() / 1000 - shell.recordLag) return
+      var left = next - shell.playhead
+      if (left > 20) return
+      var recorded = Math.floor(Date.now() / 1000) - shell.recordLag
+      var end = next + shell.chunkSeconds
+      if (end > recorded) {
+        if (left > 3 || recorded - next < 2) return
+        end = recorded
+      }
       fetchedAhead = next
-      shell.ask({ op: "clip", uid: uid, start: next, end: next + shell.chunkSeconds, quality: quality,
-                  serial: shell.seekSerial }, function(reply) {})
+      var mine = epoch
+      shell.ask({ op: "clip", uid: uid, start: next, end: end, quality: quality,
+                  serial: shell.seekSerial }, function(reply) {
+        if (mine !== playback.epoch || !playback.active || !reply.ok) return
+        // Only for the minute coming up, or just begun, and only if
+        // nothing has it already or is using the deck out of sight.
+        if (next !== shell.chunkStart && next !== shell.chunkStart + shell.chunkSeconds) return
+        var front = playback.front.clip
+        var back = playback.back.clip
+        if (front !== null && front.chunk === next) return
+        if (back !== null && back.chunk >= shell.chunkStart) {
+          // The deck is busy with this minute: asked again in a moment
+          // (the helper has the clip by now).
+          if (back.chunk !== next) playback.fetchedAhead = -1
+          return
+        }
+        playback.loadClip({ path: reply.path, start: reply.start, end: reply.end, chunk: next,
+                            seek: shell.seekSerial, quality: playback.quality })
+      })
     }
 
     onActiveChanged: {
       if (active) { refresh(); return }
       serial++
+      epoch++
       askedChunk = -1
-      clip = null
-      player.stop()
+      upgradeChunk = -1
+      fetchedAhead = -1
+      dropClips()
     }
     onNeedsLoginChanged: refresh()
     Component.onCompleted: {
@@ -887,16 +1114,31 @@ ShellRoot {
         playback.stillBusy = false
         playback.askedChunk = -1
         playback.failedChunk = -1
+        playback.upgradeChunk = -1
+        playback.fetchedAhead = -1
         playback.refresh()
       }
       function onNowChanged() { if (!shell.scrubbing) playback.refresh() }
     }
 
-    VideoOutput {
-      id: video
+    Deck {
+      id: deckA
       anchors.fill: parent
-      fillMode: VideoOutput.PreserveAspectFit
-      visible: playback.clipUsable
+      playAudio: playback.playAudio
+      visible: playback.shown === deckA && playback.usable(clip)
+      onPlaced: playback.deckPlaced(deckA)
+      onHasFrameChanged: playback.showFront()
+      onFailed: function(message) { playback.deckFailed(deckA, message) }
+    }
+
+    Deck {
+      id: deckB
+      anchors.fill: parent
+      playAudio: playback.playAudio
+      visible: playback.shown === deckB && playback.usable(clip)
+      onPlaced: playback.deckPlaced(deckB)
+      onHasFrameChanged: playback.showFront()
+      onFailed: function(message) { playback.deckFailed(deckB, message) }
     }
 
     // The frame under the playhead, until the clip from there plays.
@@ -905,38 +1147,10 @@ ShellRoot {
       // While dragging, the latest frame there is; afterwards only one
       // from about where the playhead is, never an old one flashing back.
       visible: playback.stillPath !== "" && playback.problem === ""
-               && (shell.scrubbing
-                   || (playback.stillFresh && (!playback.clipCurrent || !playback.positioned)))
+               && (shell.scrubbing || (playback.stillFresh && !playback.videoShowing))
       source: playback.stillPath !== "" ? "file://" + playback.stillPath : ""
       fillMode: Image.PreserveAspectFit
       cache: false
-    }
-
-    AudioOutput {
-      id: audio
-      device: shell.mediaDevices.defaultAudioOutput
-      muted: shell.muted
-    }
-
-    MediaPlayer {
-      id: player
-      videoOutput: video
-      audioOutput: playback.playAudio ? audio : null
-      activeAudioTrack: playback.playAudio ? 0 : -1
-      onErrorOccurred: function(error, errorString) {
-        playback.problem = errorString || "cannot play the recording"
-      }
-      onMediaStatusChanged: {
-        if (mediaStatus === MediaPlayer.InvalidMedia && playback.clip !== null) {
-          playback.problem = "cannot play the recording"
-          return
-        }
-        if (playback.clip === null || playback.positioned) return
-        if (mediaStatus !== MediaPlayer.LoadedMedia && mediaStatus !== MediaPlayer.BufferedMedia) return
-        playback.positioned = true
-        var want = (shell.playhead - playback.clip.start) * 1000
-        if (want > 300) player.setPosition(Math.max(0, Math.min(player.duration - 50, want)))
-      }
     }
 
     Text {
@@ -950,7 +1164,7 @@ ShellRoot {
             ? "Sign in to see recordings\neld-unifi-protect login " + (playback.info.console || "")
             : playback.problem === "nofootage" ? "No recording at " + shell.clockText(shell.playhead, false)
             : playback.problem !== "" ? playback.problem
-            : !playback.clipUsable && !playback.stillFresh ? "Loading…" : ""
+            : !playback.usable(playback.shown.clip) && !playback.stillFresh ? "Loading…" : ""
       color: playback.problem !== "" && playback.problem !== "nofootage" ? "#ff7777" : "#cccccc"
       font.pixelSize: 16
     }
@@ -1507,6 +1721,7 @@ ShellRoot {
             sourceComponent: Playback {
               uid: shell.focusedCamera ? shell.focusedCamera.uid : ""
               quality: shell.focusQuality
+              quickQuality: shell.focusQuality !== "low" ? "low" : ""
               slot: "focus"
               playAudio: true
             }
