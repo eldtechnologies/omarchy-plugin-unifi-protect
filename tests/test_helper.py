@@ -10,6 +10,7 @@ import time
 import unittest
 from unittest import mock
 
+import helpers
 from helpers import ROOT, helper as h
 
 
@@ -237,6 +238,36 @@ class RelayRewriting(unittest.TestCase):
         self.assertEqual(s.to_client("Content-Base: rtsps://192.168.1.240:7441"),
                          "Content-Base: rtsp://127.0.0.1:4000/tok/nvr")
 
+    def test_a_console_cannot_make_the_player_read_a_message_differently(self):
+        # FFmpeg takes a header line starting with "$" for an interleaved
+        # packet and skips past the lines after it, Content-Length among
+        # them; the body would then be read as the next reply, a redirect.
+        s = self.session()
+        s.route("rtsp://127.0.0.1:4000/tok/nvr/R1")
+        hidden = b"RTSP/1.0 302 Found\r\nCSeq: 2\r\nLocation: rt\rsp://198.51.100.7:8554/x\r\n\r\n"
+        for name in ("$A\x01\x01" + "F" * 200, "$", "", "X Y", "X\tY", "Sess\x01ion", "Café"):
+            self.assertFalse(s.keeps_player_here("RTSP/1.0 200 OK", [("CSeq", "1"), (name, "")], b""), name)
+        self.assertTrue(s.keeps_player_here("RTSP/1.0 200 OK", [("CSeq", "1"), ("Content-Type", "application/sdp"),
+                                                               ("X-Accept-Dynamic-Rate", "1")], b"v=0\r\n"))
+        # And a URL the player would see once it drops the CRs is a URL.
+        self.assertFalse(s.keeps_player_here("RTSP/1.0 200 OK", [("CSeq", "1")], hidden))
+        for body in (b"a=control:rt\rsp://evil/x", b"a=control:r\0tsp://evil/x", b"sat\r\rip:evil"):
+            self.assertFalse(s.keeps_player_here("RTSP/1.0 200 OK", [], body), body)
+
+        async def relayed(data):
+            reader = asyncio.StreamReader()
+            reader.feed_data(data)
+            reader.feed_eof()
+            sent = []
+            s.upstream_reader = reader
+            s.client_writer = mock.Mock(write=sent.append, drain=mock.AsyncMock())
+            s.close = lambda: None
+            await s.pump_upstream()
+            return b"".join(sent)
+        crafted = (b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n$A\x01\x01" + b"F" * 220 + b"\r\nContent-Length: "
+                   + str(len(hidden)).encode() + b"\r\n\r\n" + hidden)
+        self.assertEqual(asyncio.run(relayed(crafted)), b"RTSP/1.0 502 Bad Gateway\r\nCSeq: 1\r\n\r\n")
+
     def test_bare_carriage_returns_end_the_message(self):
         async def parse(data):
             reader = asyncio.StreamReader()
@@ -384,6 +415,60 @@ class ConsoleInput(unittest.TestCase):
         moved = h.merge_cameras([cam("gw_old", False), cam("nvr_new", True)])
         self.assertEqual([c["uid"] for c in moved], ["nvr_new"])
 
+    def test_settings_stay_with_the_camera_that_had_them(self):
+        mac = "aabbccddeeff"
+
+        def cam(uid, online=True, **more):
+            return dict({"uid": uid, "mac": mac, "online": online, "consoleName": uid, "name": "Door"}, **more)
+
+        def keys(cameras):
+            return {c["uid"]: h.camera_key(c) for c in cameras}
+
+        # The camera armed under this MAC keeps it when another console
+        # claims it, whichever is listed first, poll after poll.
+        state = [cam("nvr_real")]
+        for listed in ([cam("gw_fake"), cam("nvr_real")], [cam("nvr_real"), cam("gw_fake")]):
+            for _ in range(3):
+                merged = h.merge_cameras([dict(c) for c in listed], state)
+                self.assertEqual(keys(merged), {"nvr_real": mac, "gw_fake": "gw_fake"})
+                self.assertTrue(all(c["macConflict"] for c in merged))
+                state = merged
+            state = [cam("nvr_real")]
+        prefs = dict(h.load_prefs(), alerts={mac: ["person", "ring"]}, favorite=mac, hidden=[])
+        applied = {c["uid"]: c for c in h.apply_prefs(h.merge_cameras([cam("gw_fake"), cam("nvr_real")],
+                                                                      [cam("nvr_real")]), prefs)}
+        self.assertEqual(applied["nvr_real"]["alerts"], ["person", "ring"])
+        self.assertEqual(applied["gw_fake"]["alerts"], [])
+        self.assertFalse(applied["gw_fake"]["favorite"])
+        # Also while its console cannot be reached (its last entry, stale).
+        merged = h.merge_cameras([cam("gw_fake"), cam("nvr_real", online=False, stale=True)], [cam("nvr_real")])
+        self.assertEqual(keys(merged), {"nvr_real": mac, "gw_fake": "gw_fake"})
+        # Claimed while it was offline, it gets its MAC back when it returns...
+        state = h.merge_cameras([cam("gw_fake"), cam("nvr_real", online=False)], [cam("nvr_real")])
+        self.assertEqual(keys(state), {"gw_fake": mac})
+        state = h.merge_cameras([cam("nvr_real", online=False), cam("gw_fake")], state)    # still away
+        self.assertEqual(keys(state), {"gw_fake": mac})
+        back = h.merge_cameras([cam("gw_fake"), cam("nvr_real")], state)
+        self.assertEqual(keys(back), {"nvr_real": mac, "gw_fake": "gw_fake"})
+        # ...also when its console could not be reached for a poll meanwhile
+        # (it had dropped out as a ghost, so nothing of it is listed then).
+        state = h.merge_cameras([cam("gw_fake"), cam("nvr_real", online=False)], [cam("nvr_real")])
+        for _ in range(2):
+            state = h.merge_cameras([cam("gw_fake")], state)
+            self.assertEqual(keys(state), {"gw_fake": mac})
+        back = h.merge_cameras([cam("gw_fake"), cam("nvr_real")], state)
+        self.assertEqual(keys(back), {"nvr_real": mac, "gw_fake": "gw_fake"})
+        # ...and a console listing an offline camera with its MAC earns no such claim.
+        state = h.merge_cameras([cam("gw_fake", online=False), cam("nvr_real")], [cam("nvr_real")])
+        self.assertEqual(keys(state), {"nvr_real": mac})
+        self.assertEqual(keys(h.merge_cameras([cam("gw_fake"), cam("nvr_real")], state)),
+                         {"nvr_real": mac, "gw_fake": "gw_fake"})
+        # A camera really moved keeps its settings on its new console.
+        moved = h.merge_cameras([cam("gw_old", online=False), cam("nvr_new")], [cam("gw_old")])
+        self.assertEqual(keys(moved), {"nvr_new": mac})
+        # Neither had it: neither gets it.
+        self.assertEqual(keys(h.merge_cameras([cam("a_x"), cam("b_y")], [])), {"a_x": "a_x", "b_y": "b_y"})
+
     def test_snapshots_of_cameras_no_longer_listed_are_removed(self):
         os.makedirs(h.SNAP_DIR, exist_ok=True)
         for uid in ("nvr_a", "nvr_gone"):
@@ -393,6 +478,36 @@ class ConsoleInput(unittest.TestCase):
         h.refresh_snapshots({"consoles": []}, [{"uid": "nvr_a", "console": "nvr", "online": False}], index)
         self.assertEqual(sorted(os.listdir(h.SNAP_DIR)), sorted(["nvr_a.jpg", os.path.basename(h.SNAP_INDEX)]))
         self.assertEqual(index, {"nvr_a": 1})
+
+class Pictures(unittest.TestCase):
+    @staticmethod
+    def jpeg(width, height, sof=0xC0, before=b""):
+        frame = bytes([0xFF, sof]) + (17).to_bytes(2, "big") + b"\x08" + height.to_bytes(2, "big") \
+            + width.to_bytes(2, "big") + b"\x03" + bytes(9)
+        app0 = b"\xff\xe0" + (16).to_bytes(2, "big") + b"JFIF\0" + bytes(9)
+        return b"\xff\xd8" + app0 + before + frame + b"\xff\xda\x00\x08" + bytes(6) + b"scan" + b"\xff\xd9"
+
+    def test_a_picture_larger_than_any_camera_makes_is_refused(self):
+        # A small file can declare a picture that costs a quarter of a
+        # gigabyte to show, in the desktop shell, for every tile.
+        for size in ((640, 360), (3840, 2160), (4000, 3000), (8192, 4320)):
+            self.assertTrue(h.is_complete_jpeg(self.jpeg(*size)), size)
+        for size in ((959, 65500), (65500, 959), (8193, 100), (100, 8193), (8192, 8192), (0, 100), (100, 0)):
+            self.assertFalse(h.is_complete_jpeg(self.jpeg(*size)), size)
+        # Progressive and other kinds of frame; the size found the way a
+        # decoder finds it, past fill bytes, stray bytes and a comment
+        # that itself looks like a small frame's header.
+        self.assertFalse(h.is_complete_jpeg(self.jpeg(959, 65500, sof=0xC2)))
+        self.assertTrue(h.is_complete_jpeg(self.jpeg(1920, 1080, sof=0xC2)))
+        decoy = b"\xff\xfe" + (21).to_bytes(2, "big") + b"\xff\xc0\x00\x11\x08\x00\x10\x00\x10" + bytes(10)
+        for before in (b"\xff\xff\xff", b"stray", decoy, b"\xff\x00"):
+            self.assertFalse(h.is_complete_jpeg(self.jpeg(959, 65500, before=before)), before)
+            self.assertTrue(h.is_complete_jpeg(self.jpeg(1280, 720, before=before)), before)
+        # Cut short inside a header is no picture.
+        self.assertFalse(h.is_complete_jpeg(b"\xff\xd8\xff\xc0\x00\x11\x08\xff\xd9"))
+        with open(os.path.join(helpers.ROOT, "docs", "demo", "garden.jpg"), "rb") as handle:
+            self.assertTrue(h.is_complete_jpeg(handle.read()))
+
 
 class WallPid(unittest.TestCase):
     def test_stop_signals_only_the_process_it_started(self):

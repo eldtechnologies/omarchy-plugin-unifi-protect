@@ -224,14 +224,17 @@ says so and opens nothing).
 
 It starts live. Click or drag anywhere on the timeline and every camera on
 screen goes to that moment: still frames while you drag, then the
-recordings from there, playing on in step. Drag to the right-hand end, press
-`End` or click **Go live** to return to live.
+recordings from there, playing on in step. A drag also marks the stretch
+it covers, ready to [save as a clip](#timeline). Drag to the right-hand
+end, press `End` or click **Go live** to return to live.
 
 | Key | Effect |
 |-----|--------|
 | ← / → | Back / forward 10 s (`Shift`: 1 min) |
 | `,` / `.` | Previous / next detection on the cameras shown |
 | Space | Pause / play |
+| `I` / `O`, `S`, `X` | Mark the start / end of a stretch, save it, clear the marks |
+| Drag, `Shift`+drag | Mark a stretch while moving through it / move without marking |
 | `+` / `-`, wheel | Zoom: 1, 6 or 24 hours (the wheel zooms freely, down to 10 minutes; `Shift`+wheel pans) |
 | `End`, Backspace | Back to live |
 | Enter, click, `1`–`9` | Enlarge a camera (high quality, with sound); again for the grid |
@@ -246,13 +249,26 @@ console you are not signed in to says so. Coloured marks are detections
 along the bottom. A camera with nothing recorded at the playhead says "No
 recording" while the others play on.
 
+**Saving a clip.** `S` saves a stretch of the enlarged camera's recording
+(in the grid, the selected camera's) as an MP4 in `UniFi Protect` inside
+your videos folder, named for the camera and the time, in the enlarged
+quality. Mark the stretch by dragging along the timeline, or with `I` at
+its start and `O` at its end, up to ten minutes (hold Shift to drag
+without marking). While a stretch is marked, a **Save clip** button at
+the top right does the same as `S`. Without marks, `S` saves the half
+minute around the playhead. The file is private to you (mode 0600), like
+everything else the plugin writes.
+
 Recordings play in one-minute clips at low quality in the grid
-(`--playback-quality`) and at the enlarged quality for an enlarged camera;
-there is a short blink as each minute hands over to the next. The last 30
-seconds are not played back: the console has not written all of them yet,
+(`--playback-quality`) and at the enlarged quality for an enlarged camera.
+Each next minute is loaded ahead and takes over without a gap. An enlarged
+camera shows the low-quality clip first and changes to the full-quality
+one when it arrives (a minute of 4K takes a few seconds to come). The last
+30 seconds are not played back: the console has not written all of them yet,
 and stepping or dragging up to them goes back to live. Clips
 and stills are kept in memory (the runtime directory), at most 80 clips or
-500 MB, and are gone when the window closes.
+500 MB, plus up to 300 MB being fetched at any moment, and are gone when
+the window closes.
 
 ```bash
 eld-unifi-protect timeline                   # toggle it
@@ -435,6 +451,7 @@ The plugin's own files:
 | `~/.config/eld-unifi-protect/config.json` | Consoles, pinned certificates and recordings usernames; API keys and passwords only if there is no keyring (mode 0600) |
 | `~/.config/eld-unifi-protect/cameras.json` | Hidden cameras, favourite, armed cameras, read-only setting (no secrets) |
 | `~/.local/state/eld-unifi-protect/state.json` | Last camera list |
+| `UniFi Protect/` in your videos folder | Clips you save from the timeline with `S`; yours to keep or delete, never removed by the plugin |
 | `$XDG_RUNTIME_DIR/eld-unifi-protect/` | Snapshots, stream URLs, recent alerts and their pictures, recordings sessions, thumbnails, clips and the timeline's stills and clips (tmpfs, gone on reboot; your notification history may keep its own copy of alert pictures) |
 | `~/.local/state/eld-unifi-protect/` | Last camera list, rejected recordings logins, streams the plugin switched on |
 

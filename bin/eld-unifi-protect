@@ -99,6 +99,10 @@ class NotFound(ProtectError):
     """The console answered 404."""
 
 
+class ClipTooLarge(ProtectError):
+    """A console sent more of a clip than there is room for."""
+
+
 class NoFootage(ProtectError):
     """The console holds no recording for the time asked for."""
 
@@ -491,6 +495,7 @@ RTSP_MAX_BODY = 64 * 1024         # a player's request bodies are tiny
 RTSP_MAX_UPSTREAM_BODY = 1 << 20  # SDP and the like from the console
 RELAY_AUTH_TIMEOUT = 10           # seconds for a new connection to show its token
 RELAY_MAX_PENDING = 16            # connections that have not shown it yet
+RELAY_MAX_UNCHECKED = 32         # connections not yet known to be this user's
 STREAM_PORT = 7441
 
 
@@ -694,6 +699,10 @@ def register_relay_route(console_id, path):
 
 def stream_path(rtsps_url):
     """The path of one of Protect's RTSPS URLs, or None if it is not one."""
+    # A console names its streams: a short URL, or it is not one of them
+    # (they are cached, and their paths kept by the relay).
+    if not isinstance(rtsps_url, str) or len(rtsps_url) > 512:
+        return None
     try:
         path = urllib.parse.urlsplit(rtsps_url).path
     except (ValueError, TypeError, AttributeError):
@@ -1019,6 +1028,11 @@ class RelaySession:
     # Any RTSP-ish scheme as FFmpeg would read it ("rtsp:host" too).
     SCHEME = re.compile(r"(?:rtsp[hsu]?|satip)\s*:", re.I)
     DROPPED_HEADERS = {"location", "content-location"}
+    # A header's name as every RTSP reader agrees on it. FFmpeg takes a
+    # line starting with "$" for an interleaved packet and skips ahead by
+    # the length in it, past the lines after it: the relay and the player
+    # must never see a message end in different places.
+    HEADER_NAME = re.compile(r"[A-Za-z0-9-]+")
 
     def keeps_player_here(self, start, headers, body):
         """True unless a console response could send the player elsewhere.
@@ -1029,7 +1043,11 @@ class RelaySession:
         status = self.STATUS_LINE.fullmatch(start)
         if not status or status.group(1)[0] == "3":
             return False
-        for text in [v for _, v in headers] + [body.decode("latin-1")]:
+        if not all(self.HEADER_NAME.fullmatch(name) for name, _ in headers):
+            return False
+        # FFmpeg drops every CR in a line it reads: "rt\rsp://" is a URL to it.
+        text_body = body.decode("latin-1").replace("\r", "").replace("\0", "")
+        for text in [v for _, v in headers] + [text_body]:
             for match in self.SCHEME.finditer(text):
                 if not text.startswith(self.local_base, match.start()):
                     return False
@@ -1056,6 +1074,7 @@ class Relay:
         self.consoles = ({c["id"]: c for c in config["consoles"]} if config is not None
                          else relay_consoles())
         self.peer_checks = asyncio.Semaphore(4)
+        self.unchecked = 0      # connections waiting to be known as this user's
         self.config_stamp = self.config_mtime()
         self.lock_inode = lock_inode
         self.sessions = set()
@@ -1125,8 +1144,17 @@ class Relay:
         peer, local = writer.get_extra_info("peername"), writer.get_extra_info("sockname")
         # Off the event loop, a few at a time: a long /proc/net/tcp must not
         # stall the streams already playing.
-        async with self.peer_checks:
-            uid = await asyncio.to_thread(loopback_peer_uid, peer, local) if peer else None
+        # Any local user can connect, and each connection holds a file
+        # descriptor until it is checked: only so many wait for that.
+        if self.unchecked >= RELAY_MAX_UNCHECKED:
+            writer.close()
+            return
+        self.unchecked += 1
+        try:
+            async with self.peer_checks:
+                uid = await asyncio.to_thread(loopback_peer_uid, peer, local) if peer else None
+        finally:
+            self.unchecked -= 1
         if uid != os.getuid():
             writer.close()
             return
@@ -1236,7 +1264,53 @@ def is_complete_jpeg(data):
     Some cameras pad the file after the end marker, so trailing zero bytes
     are allowed.
     """
-    return bool(data) and data[:2] == b"\xff\xd8" and data.rstrip(b"\x00")[-2:] == b"\xff\xd9"
+    return (bool(data) and data[:2] == b"\xff\xd8" and data.rstrip(b"\x00")[-2:] == b"\xff\xd9"
+            and jpeg_size_ok(data))
+
+
+JPEG_MAX_SIDE = 8192            # pixels; the largest cameras are about 4000 across
+JPEG_MAX_PIXELS = 40_000_000
+
+
+def jpeg_size_ok(data):
+    """False for a JPEG that says it is larger than any camera's picture.
+
+    A file's size says nothing of what it costs to show: a quarter of a
+    megabyte can declare 959 x 65500 pixels, a quarter of a gigabyte once
+    decoded, in the desktop shell, for every tile. The size is read the
+    way a decoder finds it: marker by marker, up to the first scan.
+    """
+    at, end = 2, len(data)
+    while at < end:
+        at = data.find(b"\xff", at)
+        if at < 0:
+            break
+        while at < end and data[at] == 0xFF:    # fill bytes before a marker
+            at += 1
+        if at >= end:
+            break
+        marker = data[at]
+        at += 1
+        if marker == 0x00 or marker == 0x01 or 0xD0 <= marker <= 0xD8:
+            continue                            # stuffing, or a marker without a length
+        if marker in (0xD9, 0xDA):
+            break                               # the end, or the first scan
+        if at + 2 > end:
+            return False
+        length = int.from_bytes(data[at:at + 2], "big")
+        if length < 2:
+            return False
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if length < 7 or at + 7 > end:
+                return False
+            height = int.from_bytes(data[at + 3:at + 5], "big")
+            width = int.from_bytes(data[at + 5:at + 7], "big")
+            # A height of 0 leaves it to a later marker: not from a camera.
+            return (0 < width <= JPEG_MAX_SIDE and 0 < height <= JPEG_MAX_SIDE
+                    and width * height <= JPEG_MAX_PIXELS)
+        at += length
+    # No frame at all: nothing a decoder would make a picture of.
+    return True
 
 
 # ---- alerts --------------------------------------------------------------
@@ -1262,6 +1336,10 @@ EVENT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ALERT_IMAGE = re.compile(r"[A-Za-z0-9_-]{1,64}\.jpg")
 NOTIFY_EVERY = 60   # seconds; at most one notification per camera per minute
 CAPTURE_EVERY = 5   # seconds; at most one alert snapshot per camera
+CAPTURE_WAIT = 4    # seconds a notification waits for its picture
+CAPTURES_AT_ONCE = 2    # per console; a few more may wait their turn
+CAPTURES_WAITING = 4
+EVENTS_REMEMBERED = 1000    # per console
 PLUGIN_ID = "com.eldtechnologies.unifi-protect"
 ALERTS_MAX_AGE = 24 * 3600
 ALERTS_PER_MINUTE = 10      # new alerts per camera
@@ -1849,9 +1927,13 @@ class AlertListener:
         self.parent = os.getppid() if follow_parent else None
         self.alerts = load_alerts()
         self.status = {}
-        self.event_cameras = {}      # event id -> camera id, for sparse updates
-        self.event_starts = {}       # event id -> its start, likewise
-        self.opened = {}             # event ids that already opened an alert
+        # Each keyed by (console id, event id): a console's events are its
+        # own, whatever ids it gives them.
+        self.event_cameras = {}      # -> camera id, for sparse updates
+        self.event_starts = {}       # -> the event's start, likewise
+        self.opened = {}             # events that already opened an alert
+        self.capture_pools = {}      # console id -> its snapshot threads
+        self.capturing = {}          # console id -> snapshots running or waiting
         self.armed = {}
         self.config = None
         self.prefs_stamp = None
@@ -1903,31 +1985,43 @@ class AlertListener:
         event_id = str(item["id"])
         if not EVENT_ID.fullmatch(event_id):
             return  # not a Protect ID; it would name the snapshot file
-        camera_id = item.get("device") or self.event_cameras.get(event_id)
+        key = (console_id, event_id)
+        camera_id = item.get("device") or self.event_cameras.get(key)
         if not isinstance(camera_id, str) or not CAMERA_ID.fullmatch(camera_id):
             return
-        self.event_cameras[event_id] = camera_id
-        if event_time(item.get("start")) is not None:
-            # Updates may omit the start, like the device: remember it.
-            self.event_starts[event_id] = event_time(item.get("start"))
-        if len(self.event_cameras) > 1000:
-            gone = next(iter(self.event_cameras))
-            self.event_cameras.pop(gone)
-            self.event_starts.pop(gone, None)
         self.refresh()
         camera = self.armed.get(console_id, {}).get(camera_id)
-        existing = next((a for a in self.alerts if a["id"] == event_id), None)
+        if camera is None:
+            # Not armed: nothing to remember either. An alert opened while
+            # it was armed is still closed.
+            self.close(console_id, event_id, item)
+            return
+        self.event_cameras[key] = camera_id
+        if event_time(item.get("start")) is not None:
+            # Updates may omit the start, like the device: remember it.
+            self.event_starts[key] = event_time(item.get("start"))
+        # The oldest of this console's own go first: no console can make
+        # the listener forget another's events.
+        mine = [k for k in self.event_cameras if k[0] == console_id]
+        for gone in mine[:max(0, len(mine) - EVENTS_REMEMBERED)]:
+            self.event_cameras.pop(gone)
+            self.event_starts.pop(gone, None)
+        # Only this console's own alert: another's event of the same id is
+        # another event.
+        existing = next((a for a in self.alerts
+                         if a["id"] == event_id and str(a.get("uid", "")).startswith(console_id + "_")), None)
         kind = alert_kind(item, camera["alerts"]) if camera else None
         changed = False
         now = time.time()
         kind_is_new = False
         # One alert per event, ever: a Clear must not be undone by the same
         # event's next update.
-        if (kind and existing is None and event_id not in self.opened
+        if (kind and existing is None and key not in self.opened
                 and self.allow_new_alert(camera["uid"], now)):
-            self.opened[event_id] = True
-            if len(self.opened) > 1000:
-                self.opened.pop(next(iter(self.opened)))
+            self.opened[key] = True
+            mine = [k for k in self.opened if k[0] == console_id]
+            for gone in mine[:max(0, len(mine) - EVENTS_REMEMBERED)]:
+                self.opened.pop(gone)
             kind_is_new = True
             # Smart detections often arrive as an empty "add" followed by an
             # "update" naming what was seen, so either can open an alert.
@@ -1935,7 +2029,7 @@ class AlertListener:
             existing = {
                 "id": event_id, "uid": camera["uid"], "camera": camera["name"],
                 "consoleName": camera["consoleName"], "kind": kind,
-                "start": min(self.event_starts.get(event_id) or now, now), "end": None,
+                "start": min(self.event_starts.get(key) or now, now), "end": None,
                 # When it was opened, on the boot's monotonic clock: what
                 # Clear and "seen" compare, so a clock step cannot reorder them.
                 "seq": time.monotonic(), "boot": BOOT_ID,
@@ -1943,18 +2037,35 @@ class AlertListener:
             self.alerts.append(existing)
             changed = True
             self.on_new_alert(console_id, camera, existing)
-        if existing is not None and item.get("end") and not existing.get("end"):
-            end = event_time(item["end"])
-            if end is not None and end <= now + ALERT_SKEW:
-                existing["end"] = max(existing["start"], min(end, now))
-                changed = True
+        if self.ended(existing, item, now):
+            changed = True
         if changed:
-            # A new alert is written at once (they are capped per camera);
-            # other changes at most once a second, run() flushing the rest.
-            if kind_is_new or time.monotonic() - self.last_save >= 1:
-                self.save()
-            else:
-                self.dirty = True
+            self.changed(kind_is_new)
+
+    @staticmethod
+    def ended(alert, item, now):
+        """Note the event's end on its alert; True when that changed it."""
+        if alert is None or not item.get("end") or alert.get("end"):
+            return False
+        end = event_time(item["end"])
+        if end is None or end > now + ALERT_SKEW:
+            return False
+        alert["end"] = max(alert["start"], min(end, now))
+        return True
+
+    def close(self, console_id, event_id, item):
+        existing = next((a for a in self.alerts
+                         if a["id"] == event_id and str(a.get("uid", "")).startswith(console_id + "_")), None)
+        if self.ended(existing, item, time.time()):
+            self.changed(False)
+
+    def changed(self, at_once):
+        # A new alert is written at once (they are capped per camera);
+        # other changes at most once a second, run() flushing the rest.
+        if at_once or time.monotonic() - self.last_save >= 1:
+            self.save()
+        else:
+            self.dirty = True
 
     def allow_new_alert(self, uid, now):
         """At most ALERTS_PER_MINUTE new alerts per camera: no console flood."""
@@ -1979,24 +2090,47 @@ class AlertListener:
         now = time.monotonic()     # throttles: a wall-clock step must not silence them
         console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
         last = self.last_captured.get(camera["uid"])
-        if console is not None and (last is None or now - last >= CAPTURE_EVERY):
+        if (console is not None and (last is None or now - last >= CAPTURE_EVERY)
+                and self.capturing.get(console_id, 0) < CAPTURES_AT_ONCE + CAPTURES_WAITING):
             self.last_captured[camera["uid"]] = now
-            try:
-                data = await asyncio.to_thread(
-                    lambda: Protect(console, self.config).snapshot(camera["id"]))
-                if plugin_gone():
-                    return
-                name = f"{alert['id']}.jpg"
-                path = alert_image_path(name)
-                if not path:
-                    raise ProtectError("unsafe alert id")
-                os.makedirs(ALERT_IMAGES_DIR, mode=0o700, exist_ok=True)
-                write_atomic(path, data)
-                alert["image"] = name
-                self.save()
-            except (ProtectError, OSError):
-                pass
+            # Counted here, not when the task first runs: several alerts
+            # arrive before any of them does.
+            self.capturing[console_id] = self.capturing.get(console_id, 0) + 1
+            picture = asyncio.ensure_future(self.take_picture(console, camera, alert))
+            # The notification waits a moment for its picture, never
+            # longer: a console slow with snapshots (they can take minutes
+            # to fail) must not hold back the news, its own or another's.
+            await asyncio.wait({picture}, timeout=CAPTURE_WAIT)
         self.notify(console_id, camera, alert)
+
+    async def take_picture(self, console, camera, alert):
+        """The camera's snapshot, kept as the alert's picture. Never raises.
+
+        On the console's own few threads: one that answers slowly keeps
+        only its own pictures waiting.
+        """
+        console_id = console["id"]
+        pool = self.capture_pools.get(console_id)
+        if pool is None:
+            pool = self.capture_pools[console_id] = ThreadPoolExecutor(
+                max_workers=CAPTURES_AT_ONCE, thread_name_prefix="alert-picture")
+        try:
+            data = await asyncio.get_running_loop().run_in_executor(
+                pool, lambda: Protect(console, self.config).snapshot(camera["id"]))
+            if plugin_gone():
+                return
+            name = f"{alert['id']}.jpg"
+            path = alert_image_path(name)
+            if not path:
+                raise ProtectError("unsafe alert id")
+            os.makedirs(ALERT_IMAGES_DIR, mode=0o700, exist_ok=True)
+            write_atomic(path, data)
+            alert["image"] = name
+            self.save()
+        except (ProtectError, OSError, RuntimeError):
+            pass    # RuntimeError: the listener is shutting down
+        finally:
+            self.capturing[console_id] -= 1
 
     def notify(self, console_id, camera, alert):
         """Desktop notification for a new alert, at most once a minute per camera."""
@@ -2418,6 +2552,10 @@ def cmd_demo(args):
 
 
 API_MAX_BYTES = 16 * 1024 * 1024   # a 4K snapshot is a few MB
+# JSON costs many times its size once parsed (a list of empty objects,
+# about 25 times): camera and event lists are far smaller than this.
+JSON_MAX_BYTES = 6 * 1024 * 1024
+API_BUDGET = 90     # seconds for one request, its retries and waits included
 def read_body(response, limit):
     """A whole response body of at most limit bytes.
 
@@ -2460,6 +2598,10 @@ class Protect:
         # The Integration API rate-limits per key. A burst (opening the wall,
         # several cameras at once) gets 429s that clear within a second or
         # two, so wait as asked and try again rather than fail the camera.
+        # All within one budget: a console that answers each try as slowly
+        # as allowed, then asks for another, must not hold a thread for
+        # minutes.
+        started = time.monotonic()
         for attempt in range(4):
             status, headers, data = self._send(method, path, body, params)
             if status != 429 or attempt == 3:
@@ -2470,7 +2612,10 @@ class Protect:
                 delay = 0
             if not math.isfinite(delay) or delay <= 0:
                 delay = 0.5 * 2 ** attempt
-            time.sleep(min(10.0, delay))
+            delay = min(10.0, delay)
+            if time.monotonic() - started + delay > API_BUDGET:
+                break
+            time.sleep(delay)
         if status in (401, 403):
             raise ProtectError("console rejected the API key (HTTP %d)" % status)
         if status == 404:
@@ -2482,6 +2627,8 @@ class Protect:
             raise ProtectError(f"HTTP {status} from console: {detail}")
         if raw:
             return data
+        if len(data) > JSON_MAX_BYTES:
+            raise ProtectError("console sent an implausibly long answer")
         try:
             return json.loads(data) if data else None
         except (ValueError, RecursionError):
@@ -3089,7 +3236,7 @@ class ProtectSession:
             raise ProtectError(f"HTTP {response.status} from console: {detail}")
         raise ProtectError("the console keeps refusing the session")
 
-    def get(self, path, params=None, limit=8 * 1024 * 1024):
+    def get(self, path, params=None, limit=JSON_MAX_BYTES):
         conn, response = self.open(path, params)
         try:
             return read_body(response, limit)
@@ -3153,7 +3300,7 @@ class ProtectSession:
         the console holds, in seconds, or None.
         """
         try:
-            raw = json.loads(self.get("/cameras", limit=32 * 1024 * 1024))
+            raw = json.loads(self.get("/cameras", limit=2 * JSON_MAX_BYTES))
         except (ValueError, RecursionError):
             raise ProtectError("console sent an unreadable camera list")
         modes = {}
@@ -3169,8 +3316,13 @@ class ProtectSession:
             modes[camera["id"]] = {"coverage": RECORDING_MODES.get(mode, "unknown"), "from": oldest}
         return modes
 
-    def export(self, camera_id, start, end, quality, path):
-        """Write the recording between two times (seconds) to path as MP4."""
+    def export(self, camera_id, start, end, quality, path, limit=None, spend=None):
+        """Write the recording between two times (seconds) to path as MP4.
+
+        limit: the most bytes to write; the default is for clips kept in
+        memory (the runtime dir). spend: called with each chunk's size
+        before it is written, to raise when a shared budget runs out.
+        """
         try:
             conn, response = self.open("/video/export", params={
                 "camera": camera_id, "start": int(start * 1000), "end": int(end * 1000),
@@ -3182,17 +3334,24 @@ class ProtectSession:
         partial = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.part"
         written = 0
         try:
-            with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as out:
+            # A new file of its own, never one planted there or a link.
+            with open(os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w+b") as out:
                 while True:
                     chunk = response.read(256 * 1024)
                     if not chunk:
                         break
                     written += len(chunk)
-                    if written > CLIPS_MAX_BYTES:
-                        raise ProtectError("the clip is too large to keep in memory; try a lower quality")
-                    out.write(chunk)
-            with open(partial, "rb") as handle:
-                head = handle.read(12)
+                    if written > (limit or CLIPS_MAX_BYTES):
+                        raise ClipTooLarge("the clip is too large to keep in memory; try a lower quality")
+                    if spend:
+                        spend(len(chunk))
+                    try:
+                        out.write(chunk)
+                    except OSError as error:
+                        # Ours, not the console's: a full disk, say.
+                        raise ProtectError(f"cannot write the clip: {error.strerror or error}")
+                out.seek(0)
+                head = out.read(12)
             if response.length:
                 raise ProtectError("the console stopped sending the clip partway; try again")
             # An MP4 starts with an "ftyp" box; anything else is an error page.
@@ -3267,7 +3426,7 @@ class DemoSession:
         with open(os.path.join(DEMO_DIR, f"{camera}.jpg"), "rb") as handle:
             return handle.read()
 
-    def export(self, camera_id, start, end, quality, path):
+    def export(self, camera_id, start, end, quality, path, limit=None, spend=None):
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise ProtectError("demo mode needs ffmpeg")
@@ -3383,10 +3542,15 @@ TIMELINE_DIR = os.path.join(RUNTIME_DIR, "timeline")
 TIMELINE_HOURS = 24
 TIMELINE_EVENTS = 1000          # per camera
 TIMELINE_EVENT_PAD = 10         # seconds a detections-only camera records either side
-TIMELINE_CLIP_SECONDS = 600     # the longest stretch one request may export
+TIMELINE_CLIP_SECONDS = 60      # the longest stretch one request may export (the window's minute)
+TIMELINE_CLIP_MAX_BYTES = 200 * 1024 * 1024     # one clip; a minute of 4K is about 50 MB
+TIMELINE_FETCHING_MAX_BYTES = 300 * 1024 * 1024  # all clips being fetched at once
 TIMELINE_CLIPS_KEEP = 80
 TIMELINE_CLIPS_MAX_BYTES = 500 * 1024 * 1024   # clips live in RAM (the runtime dir)
 TIMELINE_SLOT = re.compile(r"[a-z]{1,8}")
+SAVED_CLIP_SECONDS = 600        # the longest stretch saved as one file
+SAVED_CLIP_MAX_BYTES = 2 * 1024 ** 3
+SAVED_CLIPS_FOLDER = "UniFi Protect"    # inside the videos folder
 
 
 def timeline_target(config, uid):
@@ -3477,6 +3641,88 @@ def prune_timeline_clips(folder, keep_path=None):
                 pass
 
 
+def videos_dir():
+    """The user's videos folder (XDG user dirs), else ~/Videos."""
+    home = os.path.expanduser("~")
+    listed = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "user-dirs.dirs")
+    try:
+        with open(listed, encoding="utf-8", errors="replace") as handle:
+            lines = handle.read(65536).splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        match = re.fullmatch(r'\s*XDG_VIDEOS_DIR="(\$HOME/|/)([^"$`\\\0]*)"\s*', line)
+        if match:
+            path = os.path.normpath(os.path.join(home if match.group(1) != "/" else "/", match.group(2)))
+            # Unset, it is written as the home folder itself.
+            if path not in (home, "/"):
+                return path
+    return os.path.join(home, "Videos")
+
+
+SAVED_CLIP_PARTIAL = re.compile(r".+\.mp4\.(\d+)\.[0-9a-f]{8}\.part")
+
+
+def saved_clips_dir():
+    """The folder saved clips go to, made if need be: ours, and a real folder.
+
+    The videos folder may be anywhere the user dirs say, a shared drive
+    included. A folder someone else owns, or a link to one, is refused:
+    its owner could swap what is written there.
+    """
+    folder = os.path.join(videos_dir(), SAVED_CLIPS_FOLDER)
+    try:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        info = os.lstat(folder)
+    except OSError as error:
+        raise ProtectError(f"cannot save to {folder}: {error.strerror or error}")
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ProtectError(f"cannot save to {folder}: it is a link, or not your own folder")
+    return folder
+
+
+def remove_partial_saves(folder, pid=None, older_than=None):
+    """Remove half-written saved clips: this process's, or old ones.
+
+    Only files named the way an export names its unfinished file.
+    """
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        match = SAVED_CLIP_PARTIAL.fullmatch(name)
+        if not match:
+            continue
+        path = os.path.join(folder, name)
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            if (pid is not None and int(match.group(1)) == pid) or \
+                    (older_than is not None and info.st_mtime < time.time() - older_than):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def saved_clip_path(folder, name, start):
+    """A file name not yet taken: the camera's name and the clip's start.
+
+    The name comes from a console: only letters, digits, spaces, "-" and
+    "_" of it reach the file name, so it can never name another folder or
+    a hidden file.
+    """
+    safe = "".join(ch if ch.isalnum() or ch in " -_" else " " for ch in clean_text(name, "", 60))
+    safe = " ".join(safe.split())[:40].strip(" -_") or "Camera"
+    base = f"{safe} {time.strftime('%Y-%m-%d %H.%M.%S', time.localtime(start))}"
+    for n in range(1, 100):
+        path = os.path.join(folder, base + ("" if n == 1 else f" ({n})") + ".mp4")
+        if not os.path.lexists(path):
+            return path
+    raise ProtectError("that moment has been saved too many times; clear some out first")
+
+
 def sweep_timeline_dirs():
     """Remove what timeline servers that are gone left behind.
 
@@ -3495,6 +3741,7 @@ class TimelineServer:
     {"id", "op": "index", "uids": [...]}
     {"id", "op": "still", "uid", "at", "quality", "slot"}
     {"id", "op": "clip", "uid", "start", "end", "quality", "serial"}
+    {"id", "op": "save", "uid", "start", "end", "quality"}
 
     Replies carry the id and "ok"; a failure says why in "error", with
     "noFootage", "needsLogin" or "superseded" set when that is the reason.
@@ -3514,6 +3761,10 @@ class TimelineServer:
         self.lock = threading.Lock()
         self.sessions = {}      # console id -> (session, made at)
         self.clip_locks = {}    # path -> [lock, users]
+        self.save_lock = threading.Lock()
+        self.fetching = 0       # bytes of clips being fetched
+        self.saved_to = None    # the folder a save is writing in
+        self.demo = demo_on()
         self.stills = {}        # (uid, slot) -> paths, oldest first
         self.counter = 0
         self.serial = 0
@@ -3532,14 +3783,8 @@ class TimelineServer:
         console was away is tried again after a while, and a login added or
         replaced meanwhile (the config file changes) is picked up.
         """
+        self.refresh_config()
         with self.lock:
-            stamp = self.stamp()
-            if stamp != self.config_stamp:
-                fresh = None if demo_on() else load_config()
-                if fresh:
-                    self.config, self.config_stamp = fresh, stamp
-                    self.sessions.clear()
-                    _key_cache.clear()
             console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
             if console is None:
                 raise ProtectError("no such console")
@@ -3551,6 +3796,27 @@ class TimelineServer:
                 session = ProtectSession(console, self.config)
                 self.sessions[console_id] = (session, time.monotonic())
             return console, session
+
+    def refresh_config(self):
+        """Follow the config file and demo mode as they change under the window.
+
+        Before anything is looked up in the config: a console removed and
+        added back must be found again. A config that is gone (the last
+        console removed) or unreadable is an empty one, so its logins do
+        not live on in this process; nor do those of the other kind when
+        demo mode is switched.
+        """
+        with self.lock:
+            stamp, demo = self.stamp(), demo_on()
+            if demo == self.demo and (demo or stamp == self.config_stamp):
+                return
+            try:
+                config = load_config()
+            except ProtectError:
+                config = None
+            self.config, self.config_stamp, self.demo = config or {"consoles": []}, stamp, demo
+            self.sessions.clear()
+            _key_cache.clear()
 
     def make(self, folder):
         """A private folder inside this server's own (private too)."""
@@ -3569,6 +3835,7 @@ class TimelineServer:
         request_id = request.get("id") if isinstance(request, dict) else None
         try:
             op = request.get("op")
+            self.refresh_config()
             if op == "index":
                 uids = [u for u in request.get("uids") or [] if isinstance(u, str)][:64]
                 result = timeline_index(self.config, uids,
@@ -3577,6 +3844,8 @@ class TimelineServer:
                 result = self.still(request)
             elif op == "clip":
                 result = self.clip(request)
+            elif op == "save":
+                result = self.save(request)
             else:
                 raise ProtectError("unknown request")
             self.reply(request_id, ok=True, **result)
@@ -3586,6 +3855,8 @@ class TimelineServer:
             self.reply(request_id, ok=False, needsLogin=True, error=str(error))
         except Superseded:
             self.reply(request_id, ok=False, superseded=True, error="superseded")
+        except Busy as error:
+            self.reply(request_id, ok=False, busy=True, error=str(error))
         except ProtectError as error:
             self.reply(request_id, ok=False, error=str(error))
         except Exception:     # one bad answer from a console must not end the server
@@ -3645,9 +3916,53 @@ class TimelineServer:
                 pass
         return {"path": path, "at": at}
 
+    def save(self, request):
+        """Keep a stretch of a camera's recording: a file in the videos folder."""
+        start, end, quality = self.number(request, "start"), self.number(request, "end"), self.quality(request)
+        if not 1 <= end - start <= SAVED_CLIP_SECONDS:
+            raise ProtectError(f"a saved clip is at most {SAVED_CLIP_SECONDS // 60} minutes")
+        if end > time.time():
+            raise NoFootage("that time has not happened yet")
+        camera_id, session = self.target(request)
+        if hasattr(session, "footage"):     # demo mode's gaps
+            session.footage(camera_id, start, end)
+        folder = saved_clips_dir()
+        # One at a time: two saves of one moment get two names, and a
+        # console is not asked for several long exports at once.
+        with self.save_lock:
+            self.saved_to = folder
+            remove_partial_saves(folder, older_than=CLIP_DEADLINE)
+            path = saved_clip_path(folder, camera_name(request["uid"]), start)
+            try:
+                session.export(camera_id, start, end, quality, path, limit=SAVED_CLIP_MAX_BYTES)
+            except ClipTooLarge:
+                raise ProtectError("the clip is too large to save; try a shorter stretch")
+        return {"path": path, "start": start, "end": end}
+
+    def fetch(self, session, camera_id, start, end, quality, path):
+        """Export a clip into memory, within what all of them may take.
+
+        Clips live in RAM. A console decides how much it sends, and several
+        are fetched at once: without a budget for those under way, six of
+        them could fill the runtime directory, which the whole session uses.
+        """
+        spent = [0]
+
+        def spend(size):
+            with self.lock:
+                if self.fetching + size > TIMELINE_FETCHING_MAX_BYTES:
+                    raise Busy("too much video is being fetched at once; try again in a moment")
+                self.fetching += size
+                spent[0] += size
+        try:
+            session.export(camera_id, start, end, quality, path, limit=TIMELINE_CLIP_MAX_BYTES, spend=spend)
+        finally:
+            with self.lock:
+                self.fetching -= spent[0]
+
     def clip(self, request):
         start, end, quality = self.number(request, "start"), self.number(request, "end"), self.quality(request)
-        if not 1 <= end - start <= TIMELINE_CLIP_SECONDS:
+        if not 1 <= end - start <= TIMELINE_CLIP_SECONDS + 1:
             raise ProtectError("no such stretch of time")
         if end > time.time() + 60:
             raise NoFootage("that time has not happened yet")
@@ -3670,7 +3985,7 @@ class TimelineServer:
                     if hasattr(session, "footage"):     # demo mode's gaps
                         session.footage(camera_id, start, end)
                     self.make(os.path.dirname(path))
-                    session.export(camera_id, start, end, quality, path)
+                    self.fetch(session, camera_id, start, end, quality, path)
         finally:
             with self.lock:
                 entry[1] -= 1
@@ -3703,6 +4018,13 @@ class TimelineServer:
 
     def cleanup(self):
         shutil.rmtree(self.folder, ignore_errors=True)
+        # A save cut off as the window closed: its half-written file goes.
+        if self.saved_to:
+            remove_partial_saves(self.saved_to, pid=os.getpid())
+
+
+class Busy(ProtectError):
+    """Too much is being fetched just now; the same request works in a moment."""
 
 
 class Superseded(Exception):
@@ -3906,16 +4228,44 @@ def find_cameras(cameras, wanted):
     return []
 
 
-def merge_cameras(cameras):
+def merge_cameras(cameras, previous=()):
     """Drop stale copies of a camera that moved between consoles.
 
     A camera moved from a gateway to an NVR stays listed on the gateway as
     DISCONNECTED. Keep one entry per MAC, preferring a connected one, so the
-    ghost never hides the live copy. Only an offline copy ever gives way:
-    when two consoles both report the same MAC online, both are kept, so a
-    console cannot make another's camera vanish (and take over its name,
-    favourite and alerts) by claiming its MAC.
+    ghost never hides the live copy. Only a copy its own console reports
+    offline ever gives way.
+
+    A console can claim any MAC. When two consoles both hold one (online,
+    or last seen so on a console that cannot be reached now), both cameras
+    are kept, and the settings saved under that MAC stay with the one that
+    had them (previous: the last camera list); the newcomer's are kept
+    under its own id. So a console cannot hide, disarm or impersonate
+    another's camera by claiming its MAC, nor by claiming it while that
+    camera is briefly offline: the camera gets its MAC back when it
+    returns. When neither had it, neither gets it.
     """
+    # MAC -> (the uid that held it, the uid it took it over from, if any)
+    holders = {c["mac"]: (c.get("uid"), c.get("macFrom")) for c in previous if c.get("mac")}
+
+    def incumbent(mac, one, other):
+        uid, taken_from = holders.get(mac, (None, None))
+        for keeper, claimant in ((one, other), (other, one)):
+            if keeper["uid"] == uid:
+                # Taken over from the other while that was offline: it is back.
+                return claimant if taken_from == claimant["uid"] else keeper
+        return None
+
+    def gone(camera):
+        return not camera["online"] and not camera.get("stale")
+
+    def took_over(taker, ghost, mac):
+        # Remembered only where the ghost really had the MAC before: a
+        # console listing an offline camera with another's MAC earns nothing.
+        uid, taken_from = holders.get(mac, (None, None))
+        if uid == ghost["uid"] or (uid == taker["uid"] and taken_from == ghost["uid"]):
+            taker["macFrom"] = ghost["uid"]
+
     best = {}
     order = []
     seen = set()
@@ -3923,20 +4273,39 @@ def merge_cameras(cameras):
         if camera["uid"] in seen:
             continue      # a console listing one camera twice
         seen.add(camera["uid"])
+        camera.pop("macFrom", None)
         key = camera["mac"] or camera["uid"]
         if key not in best:
             best[key] = camera
             order.append(key)
-        elif camera["online"] and not best[key]["online"]:
+            continue
+        current = best[key]
+        if gone(camera):
+            if not gone(current):
+                took_over(current, camera, key)
+            continue
+        if gone(current):
+            took_over(camera, current, key)
             best[key] = camera
-        elif camera["online"] and best[key]["online"] and camera["uid"] not in best:
-            # Two consoles claim one MAC online: keep both, and key their
-            # settings by uid, so neither can hide, disarm or impersonate the
-            # other through a MAC-keyed setting.
-            for copy in (best[key], camera):
-                copy["mac"], copy["macConflict"] = "", True
+        elif camera["uid"] not in best:
+            keeper = incumbent(key, current, camera)
+            for copy in (current, camera):
+                copy["macConflict"] = True
+                copy.pop("macFrom", None)
+                if copy is not keeper:
+                    copy["mac"] = ""
+            if keeper is camera:
+                best[key], camera = camera, current
             best[camera["uid"]] = camera
             order.append(camera["uid"])
+    for mac, (uid, taken_from) in holders.items():
+        camera = best.get(mac)
+        # The camera it took the MAC over from is not listed just now (its
+        # console cannot be reached, and it had dropped out as a ghost):
+        # still remembered, so that camera gets its MAC back on return.
+        if taken_from and camera is not None and camera["uid"] == uid and camera["mac"] == mac \
+                and not camera.get("macConflict"):
+            camera.setdefault("macFrom", taken_from)
     return sorted((best[k] for k in order), key=lambda c: (c["consoleName"].lower(), c["name"].lower()))
 
 
@@ -4022,7 +4391,7 @@ def poll_cameras(config=None):
         "consoles": summaries,
         "hideOffline": load_prefs()["hideOffline"],
         "alertNotify": load_prefs()["notify"],
-        "cameras": demo_arming(apply_prefs(merge_cameras(cameras), load_prefs())),
+        "cameras": demo_arming(apply_prefs(merge_cameras(cameras, previous_cameras), load_prefs())),
     }
     write_json(STATE_PATH, state)
     return state
@@ -4667,8 +5036,8 @@ def cmd_cameras(args):
     conflicts = [c for c in state["cameras"] if c.get("macConflict")]
     if conflicts:
         # Two consoles report one camera online: one of them may be lying.
-        print("! these cameras share a MAC address across consoles, so their settings are kept\n"
-              "  per console and earlier ones no longer apply; check which console is right: "
+        print("! these cameras share a MAC address across consoles; the settings saved for that\n"
+              "  camera stay with the one that had them. Check which console is right: "
               + ", ".join(f"{c['name']} ({c['consoleName']})" for c in conflicts), file=sys.stderr)
 
 

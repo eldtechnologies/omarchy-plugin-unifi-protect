@@ -2365,6 +2365,22 @@ Panel {
               }
             }
 
+            // Two consoles reporting one camera: one of them may be lying.
+            Text {
+              readonly property var disputed: root.allCameras.filter(function(c) { return c.macConflict === true })
+              textFormat: Text.PlainText
+              visible: disputed.length > 0
+              width: parent.width
+              wrapMode: Text.WordWrap
+              horizontalAlignment: Text.AlignHCenter
+              text: "Two consoles report the same camera: "
+                    + disputed.map(function(c) { return c.name + " (" + c.consoleName + ")" }).join(", ")
+                    + ". Its settings stay with the one that had them; check which console is right."
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
             Text {
               textFormat: Text.PlainText
               visible: root.configured && root.cameras.length > 0

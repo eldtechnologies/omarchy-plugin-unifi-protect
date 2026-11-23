@@ -21,6 +21,10 @@ for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
     path = os.path.join(SANDBOX, name.lower())
     os.makedirs(path, mode=0o700, exist_ok=True)
     os.environ[name] = path
+# Saved clips go to the videos folder: a throwaway one, never the real one.
+VIDEOS = os.path.join(SANDBOX, "videos")
+with open(os.path.join(SANDBOX, "xdg_config_home", "user-dirs.dirs"), "w") as handle:
+    handle.write(f'XDG_VIDEOS_DIR="{VIDEOS}"\n')
 
 
 def load_helper():
