@@ -250,8 +250,10 @@ recording" while the others play on.
 **Saving a clip.** `S` saves a stretch of the enlarged camera's recording
 (in the grid, the selected camera's) as an MP4 in `UniFi Protect` inside
 your videos folder, named for the camera and the time, in the enlarged
-quality. Mark the stretch with `I` at its start and `O` at its end, up to
-ten minutes; without marks, `S` saves the half minute around the playhead.
+quality. Mark the stretch by dragging along the timeline, or with `I` at
+its start and `O` at its end, up to ten minutes (hold Shift to drag
+without marking); without marks, `S` saves the half minute around the
+playhead.
 The file is private to you (mode 0600), like everything else the plugin
 writes.
 

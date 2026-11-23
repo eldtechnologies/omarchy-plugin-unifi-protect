@@ -380,9 +380,9 @@ ShellRoot {
 
   // ---- keeping a stretch of a recording ----
   //
-  // I and O mark where it starts and ends; S saves it, for the camera
-  // enlarged or selected, to the videos folder. Without marks S saves
-  // the half minute around the playhead.
+  // Dragging along the timeline, or I and O, marks where it starts and
+  // ends; S saves it, for the camera enlarged or selected, to the videos
+  // folder. Without marks S saves the half minute around the playhead.
   property real markIn: -1
   property real markOut: -1
   property bool saving: false
@@ -402,6 +402,16 @@ ShellRoot {
     }
   }
 
+  // Both marks at once, from a drag: either end may be the later one.
+  function markBetween(one, other) {
+    var current = Date.now() / 1000
+    var from = Math.max(current - reach + 60, Math.min(one, other))
+    var to = Math.min(current - liveEdge, Math.max(one, other))
+    if (to <= from) return
+    markIn = from
+    markOut = to
+  }
+
   function clearMarks() {
     markIn = -1
     markOut = -1
@@ -415,7 +425,10 @@ ShellRoot {
 
   function saveClip() {
     var camera = saveCamera
-    if (saving || !reviewing || !camera || !backendReady) return
+    // A marked stretch can be saved from live too: dragging up to the
+    // right-hand end marks it and goes back to live.
+    var marked = markIn >= 0 && markOut >= 0
+    if (saving || (!reviewing && !marked) || !camera || !backendReady) return
     var start = markIn >= 0 ? markIn : markOut >= 0 ? playhead : playhead - 15
     var end = markOut >= 0 ? markOut : markIn >= 0 ? playhead : playhead + 15
     // Nothing later than the console has written.
@@ -1299,7 +1312,9 @@ ShellRoot {
             + shell.spanText(shell.span) + " shown"
             + (shell.markIn >= 0 && shell.markOut >= 0
                ? "  ·  marked " + shell.clockText(shell.markIn, false) + "–" + shell.clockText(shell.markOut, false)
-                 + " (" + Math.round(shell.markOut - shell.markIn) + " s): S saves it"
+                 + " (" + Math.round(shell.markOut - shell.markIn) + " s): "
+                 + (shell.markOut - shell.markIn > shell.saveLimit
+                    ? "more than the " + shell.saveLimit / 60 + " minutes S can save" : "S saves it")
                  + (shell.saveCamera ? " for " + shell.saveCamera.name : "") + ", X clears"
                : shell.markIn >= 0 ? "  ·  start marked at " + shell.clockText(shell.markIn, false) + ": O marks the end"
                : shell.markOut >= 0 ? "  ·  end marked at " + shell.clockText(shell.markOut, false) + ": I marks the start"
@@ -1533,7 +1548,8 @@ ShellRoot {
       y: laneColumn.y - 2
       width: toX - fromX
       height: timelineStrip.lanesHeight + 4
-      color: "#40ffd24a"
+      // Red while it is longer than can be saved.
+      color: shell.markOut - shell.markIn > shell.saveLimit ? "#40ff5555" : "#40ffd24a"
     }
 
     Repeater {
@@ -1598,13 +1614,36 @@ ShellRoot {
       height: timelineStrip.lanesHeight + 30
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
-      function time(mouse) {
-        return timelineStrip.timeAt(Math.max(0, Math.min(width, mouse.x)))
+      // A drag marks the stretch it covers, for saving, as well as taking
+      // the cameras along; a click only goes there, and so does a drag
+      // with Shift held. The marks follow once the pointer has moved far
+      // enough not to be a click.
+      property real pressedX: 0
+      property real pressedTime: 0
+      property bool marks: false
+      property bool marking: false
+      function timeFor(x) { return timelineStrip.timeAt(Math.max(0, Math.min(width, x))) }
+      function press(x, plain) {
+        pressedX = x
+        pressedTime = timeFor(x)
+        marks = plain
+        marking = false
+        shell.seekTo(pressedTime, false)
       }
-      onPressed: function(mouse) { shell.seekTo(time(mouse), false) }
-      onPositionChanged: function(mouse) { if (pressed) shell.seekTo(time(mouse), false) }
-      onReleased: function(mouse) { shell.seekTo(time(mouse), true) }
-      onCanceled: shell.settle()
+      function move(x) {
+        if (marks && !marking && Math.abs(x - pressedX) >= 6) marking = true
+        if (marking) shell.markBetween(pressedTime, timeFor(x))
+        shell.seekTo(timeFor(x), false)
+      }
+      function release(x) {
+        if (marking) shell.markBetween(pressedTime, timeFor(x))
+        marking = false
+        shell.seekTo(timeFor(x), true)
+      }
+      onPressed: function(mouse) { press(mouse.x, !(mouse.modifiers & Qt.ShiftModifier)) }
+      onPositionChanged: function(mouse) { if (pressed) move(mouse.x) }
+      onReleased: function(mouse) { release(mouse.x) }
+      onCanceled: { marking = false; shell.settle() }
       onWheel: function(wheel) {
         var notches = wheel.angleDelta.y / 120
         if (wheel.modifiers & Qt.ShiftModifier) shell.setViewEnd(shell.viewEndTime - notches * shell.span / 8)
@@ -1620,8 +1659,8 @@ ShellRoot {
       width: Math.min(implicitWidth, parent.width - 32)
       elide: Text.ElideRight
       text: shell.saveNote !== "" ? shell.saveNote
-            : "Drag or ←/→ 10 s (Shift 1 min)  ·  , . detections  ·  Space pause  ·  + − or wheel zoom"
-            + "  ·  I O mark, S save  ·  End live  ·  Enter enlarge  ·  H/L camera"
+            : "Click or ←/→ 10 s (Shift 1 min)  ·  , . detections  ·  Space pause  ·  + − or wheel zoom"
+            + "  ·  drag or I O mark, S save  ·  End live  ·  Enter enlarge  ·  H/L camera"
             + (shell.focusedIndex >= 0 ? "  ·  M mute" : "  ·  G layout")
             + (shell.focusedIndex < 0 && shell.pageCount > 1
                ? "  ·  PgDn page " + (shell.page + 1) + "/" + shell.pageCount : "")
