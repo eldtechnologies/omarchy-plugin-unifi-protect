@@ -263,7 +263,8 @@ one when it arrives (a minute of 4K takes a few seconds to come). The last
 30 seconds are not played back: the console has not written all of them yet,
 and stepping or dragging up to them goes back to live. Clips
 and stills are kept in memory (the runtime directory), at most 80 clips or
-500 MB, and are gone when the window closes.
+500 MB, plus up to 300 MB being fetched at any moment, and are gone when
+the window closes.
 
 ```bash
 eld-unifi-protect timeline                   # toggle it

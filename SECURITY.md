@@ -29,8 +29,11 @@ the source before installing. In short, this plugin:
   into the panel, the shell only passes it to the helper on stdin and clears
   the field; it never stores, logs or puts it on a command line;
 - keeps fetched recordings in memory only (the runtime directory, mode
-  0700), deleted at logout, when the console is removed, and at reboot;
-  only `clip -o` writes one to disk, where you asked;
+  0700), deleted at logout, when the console is removed, and at reboot.
+  A recording reaches disk only where you ask: `clip -o`, and `S` in the
+  timeline, which saves a clip to `UniFi Protect` in your videos folder
+  (a file only you can read). Saved clips are yours: logout, removing a
+  console and uninstalling never delete them;
 - carries video over TLS through a local relay that listens on 127.0.0.1
   only, serves only your own user, requires a per-session token, never
   hands players the console's stream alias, and refuses to redirect them

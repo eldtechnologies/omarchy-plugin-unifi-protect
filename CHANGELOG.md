@@ -21,6 +21,40 @@ All notable changes to this plugin. The version is set in `manifest.json`;
   low-quality clip first and changes to the full-quality one when that
   arrives, instead of waiting seconds for a minute of 4K.
 
+### Security
+
+From a security review of the whole plugin before this release.
+
+- **Stream relay:** a console could hide a redirect inside a response
+  that the relay and the video player read differently, and so send the
+  player out of the encrypted tunnel to an address of its choosing.
+  Responses with header names that are not plain words are now refused,
+  and URLs are looked for the way the player reads them.
+- **Pictures:** a console could send a small JPEG declaring an enormous
+  picture (a quarter of a gigabyte once decoded, per tile) and exhaust
+  the desktop shell's memory. Snapshots, thumbnails and stills above
+  8192 pixels a side or 40 megapixels are refused.
+- **Camera settings:** a console could disarm, unhide or unfavourite
+  another console's camera by claiming its MAC address. The settings now
+  stay with the camera that had them, and the panel says when two
+  consoles report the same camera.
+- **Alerts:** a console answering snapshots slowly could delay other
+  consoles' notifications by minutes, and a flood of events from one
+  could make the listener drop another's. A notification now waits four
+  seconds for its picture at most, and each console has its own share of
+  threads and of remembered events.
+- **Timeline memory:** clips being fetched share a budget (300 MB) and
+  each is limited to 200 MB, so a console sending endless video cannot
+  fill the runtime directory, which the whole desktop session uses.
+- **Saved clips:** the folder must be your own and not a link; files are
+  created anew, never through a link; a save cut off by closing the
+  window no longer leaves its half-written file behind.
+- **Smaller limits:** one time budget per API request across its
+  retries, smaller caps on JSON answers, a length limit on stream URLs,
+  a cap on relay connections waiting to be checked, and a timeline left
+  open no longer keeps using a console's login after the console is
+  removed.
+
 ## 0.6.1 — 2026-11-18
 
 ### Security

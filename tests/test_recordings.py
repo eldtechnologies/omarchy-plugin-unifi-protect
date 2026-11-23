@@ -505,6 +505,120 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
             self.assertFalse(self.replies(out)["bad"]["ok"], bad)
         self.assertEqual(sorted(os.listdir(folder)), before)
 
+    def test_clips_being_fetched_share_one_budget_of_memory(self):
+        # A console decides how much it sends, and six clips are fetched
+        # at once into RAM: together they may take only so much.
+        server, out = self.timeline_server()
+        gate, taken = threading.Event(), []
+
+        class Greedy:
+            def export(self, camera_id, start, end, quality, path, limit=None, spend=None):
+                taken.append(limit)
+                spend(40)
+                gate.wait(5)
+                spend(40)
+                h.write_atomic(path, MP4)
+
+        server.session = lambda console_id: (self.console, Greedy())
+        start = (time.time() - 7200) // 60 * 60
+        with mock.patch.object(h, "TIMELINE_FETCHING_MAX_BYTES", 200):
+            threads = [threading.Thread(target=server.handle, args=({
+                "id": n, "op": "clip", "uid": f"nvr_{CAMERA}", "start": start + 60 * n,
+                "end": start + 60 * n + 60, "quality": "low"},)) for n in range(4)]
+            for thread in threads:
+                thread.start()
+            time.sleep(0.2)
+            self.assertEqual(server.fetching, 160)
+            gate.set()
+            for thread in threads:
+                thread.join()
+        replies = self.replies(out)
+        # 4 x 40 fit; the second 40s do not all (one that fails gives its
+        # share back, so how many get through depends on their order).
+        results = [r["ok"] for r in replies.values()]
+        self.assertIn(False, results)
+        self.assertIn(True, results)
+        self.assertTrue(all("at once" in r["error"] for r in replies.values() if not r["ok"]))
+        self.assertEqual(server.fetching, 0)
+        self.assertEqual(taken, [h.TIMELINE_CLIP_MAX_BYTES] * 4)
+
+    def test_a_clip_is_written_to_a_new_file_never_through_a_link(self):
+        session = h.ProtectSession(self.console, self.config)
+        folder = tempfile.mkdtemp()
+        target = os.path.join(folder, "clip.mp4")
+        victim = os.path.join(folder, "victim")
+        with open(victim, "w") as handle:
+            handle.write("keep")
+        start = time.time() - 600
+        with mock.patch.object(h.secrets, "token_hex", return_value="00000000"):
+            os.symlink(victim, f"{target}.{os.getpid()}.00000000.part")
+            with self.assertRaisesRegex(h.ProtectError, "cannot save"):
+                session.export(CAMERA, start, start + 5, "low", target)
+        with open(victim) as handle:
+            self.assertEqual(handle.read(), "keep")
+        self.assertFalse(os.path.exists(target))
+
+    def test_saved_clips_go_only_to_a_folder_of_ones_own(self):
+        server, out = self.timeline_server()
+        folder = os.path.join(helpers.VIDEOS, "UniFi Protect")
+        shutil.rmtree(folder, ignore_errors=True)
+        elsewhere = tempfile.mkdtemp()
+        os.makedirs(helpers.VIDEOS, exist_ok=True)
+        os.symlink(elsewhere, folder)
+        start = time.time() - 3600
+        request = {"id": 1, "op": "save", "uid": f"nvr_{CAMERA}", "start": start, "end": start + 5,
+                   "quality": "low"}
+        try:
+            server.handle(request)
+            reply = self.replies(out)[1]
+            self.assertFalse(reply["ok"])
+            self.assertIn("link", reply["error"])
+            self.assertEqual(os.listdir(elsewhere), [])
+        finally:
+            os.remove(folder)
+
+    def test_half_written_saves_are_cleared_away(self):
+        server, out = self.timeline_server()
+        folder = h.saved_clips_dir()
+        mine = os.path.join(folder, f"Door 2026-11-20 17.04.10.mp4.{os.getpid()}.0a1b2c3d.part")
+        other = os.path.join(folder, "Door 2026-11-20 17.04.10.mp4.4194999.0a1b2c3d.part")
+        old = os.path.join(folder, "Gate 2026-11-19 09.00.00.mp4.4194998.ffffffff.part")
+        kept = [os.path.join(folder, name) for name in ("Door 2026-11-20 17.04.10.mp4", "notes.part",
+                                                        "holiday.mp4.12.part")]
+        for path in [mine, other, old] + kept:
+            with open(path, "w") as handle:
+                handle.write("x")
+        os.utime(old, (time.time() - 3600, time.time() - 3600))
+        try:
+            # As the window closes: this server's own unfinished save goes.
+            server.saved_to = folder
+            server.cleanup()
+            self.assertFalse(os.path.exists(mine))
+            self.assertTrue(os.path.exists(other) and os.path.exists(old))
+            # At the next save: those long abandoned go too; another
+            # window's save under way, and anything not ours, stays.
+            start = time.time() - 3600
+            server.handle({"id": 1, "op": "save", "uid": f"nvr_{CAMERA}", "start": start, "end": start + 5,
+                           "quality": "low"})
+            self.assertTrue(self.replies(out)[1]["ok"])
+            self.assertFalse(os.path.exists(old))
+            self.assertTrue(all(os.path.exists(path) for path in [other] + kept))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_a_removed_console_is_gone_from_an_open_timeline(self):
+        h.save_config(self.config)
+        server, out = self.timeline_server()
+        server.config_stamp = server.stamp()
+        console, _ = server.session("nvr")
+        self.assertEqual(console["id"], "nvr")
+        # The last console removed: the config file goes with it.
+        os.remove(h.CONFIG_PATH)
+        with self.assertRaisesRegex(h.ProtectError, "no such console"):
+            server.session("nvr")
+        self.assertEqual(server.sessions, {})
+        self.assertEqual(server.config, {"consoles": []})
+
     def test_a_saved_clip_is_named_safely(self):
         folder = tempfile.mkdtemp()
         start = time.mktime((2026, 11, 20, 17, 4, 10, 0, 0, -1))
@@ -569,7 +683,7 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         gate = threading.Lock()
 
         class Slow:
-            def export(self, camera_id, start, end, quality, path):
+            def export(self, camera_id, start, end, quality, path, limit=None, spend=None):
                 with gate:
                     state["running"] += 1
                     state["calls"] += 1

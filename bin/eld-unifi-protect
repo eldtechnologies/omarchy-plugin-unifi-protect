@@ -491,6 +491,7 @@ RTSP_MAX_BODY = 64 * 1024         # a player's request bodies are tiny
 RTSP_MAX_UPSTREAM_BODY = 1 << 20  # SDP and the like from the console
 RELAY_AUTH_TIMEOUT = 10           # seconds for a new connection to show its token
 RELAY_MAX_PENDING = 16            # connections that have not shown it yet
+RELAY_MAX_UNCHECKED = 32         # connections not yet known to be this user's
 STREAM_PORT = 7441
 
 
@@ -694,6 +695,10 @@ def register_relay_route(console_id, path):
 
 def stream_path(rtsps_url):
     """The path of one of Protect's RTSPS URLs, or None if it is not one."""
+    # A console names its streams: a short URL, or it is not one of them
+    # (they are cached, and their paths kept by the relay).
+    if not isinstance(rtsps_url, str) or len(rtsps_url) > 512:
+        return None
     try:
         path = urllib.parse.urlsplit(rtsps_url).path
     except (ValueError, TypeError, AttributeError):
@@ -1065,6 +1070,7 @@ class Relay:
         self.consoles = ({c["id"]: c for c in config["consoles"]} if config is not None
                          else relay_consoles())
         self.peer_checks = asyncio.Semaphore(4)
+        self.unchecked = 0      # connections waiting to be known as this user's
         self.config_stamp = self.config_mtime()
         self.lock_inode = lock_inode
         self.sessions = set()
@@ -1134,8 +1140,17 @@ class Relay:
         peer, local = writer.get_extra_info("peername"), writer.get_extra_info("sockname")
         # Off the event loop, a few at a time: a long /proc/net/tcp must not
         # stall the streams already playing.
-        async with self.peer_checks:
-            uid = await asyncio.to_thread(loopback_peer_uid, peer, local) if peer else None
+        # Any local user can connect, and each connection holds a file
+        # descriptor until it is checked: only so many wait for that.
+        if self.unchecked >= RELAY_MAX_UNCHECKED:
+            writer.close()
+            return
+        self.unchecked += 1
+        try:
+            async with self.peer_checks:
+                uid = await asyncio.to_thread(loopback_peer_uid, peer, local) if peer else None
+        finally:
+            self.unchecked -= 1
         if uid != os.getuid():
             writer.close()
             return
@@ -2513,6 +2528,10 @@ def cmd_demo(args):
 
 
 API_MAX_BYTES = 16 * 1024 * 1024   # a 4K snapshot is a few MB
+# JSON costs many times its size once parsed (a list of empty objects,
+# about 25 times): camera and event lists are far smaller than this.
+JSON_MAX_BYTES = 6 * 1024 * 1024
+API_BUDGET = 90     # seconds for one request, its retries and waits included
 def read_body(response, limit):
     """A whole response body of at most limit bytes.
 
@@ -2555,6 +2574,10 @@ class Protect:
         # The Integration API rate-limits per key. A burst (opening the wall,
         # several cameras at once) gets 429s that clear within a second or
         # two, so wait as asked and try again rather than fail the camera.
+        # All within one budget: a console that answers each try as slowly
+        # as allowed, then asks for another, must not hold a thread for
+        # minutes.
+        started = time.monotonic()
         for attempt in range(4):
             status, headers, data = self._send(method, path, body, params)
             if status != 429 or attempt == 3:
@@ -2565,7 +2588,10 @@ class Protect:
                 delay = 0
             if not math.isfinite(delay) or delay <= 0:
                 delay = 0.5 * 2 ** attempt
-            time.sleep(min(10.0, delay))
+            delay = min(10.0, delay)
+            if time.monotonic() - started + delay > API_BUDGET:
+                break
+            time.sleep(delay)
         if status in (401, 403):
             raise ProtectError("console rejected the API key (HTTP %d)" % status)
         if status == 404:
@@ -2577,6 +2603,8 @@ class Protect:
             raise ProtectError(f"HTTP {status} from console: {detail}")
         if raw:
             return data
+        if len(data) > JSON_MAX_BYTES:
+            raise ProtectError("console sent an implausibly long answer")
         try:
             return json.loads(data) if data else None
         except (ValueError, RecursionError):
@@ -3184,7 +3212,7 @@ class ProtectSession:
             raise ProtectError(f"HTTP {response.status} from console: {detail}")
         raise ProtectError("the console keeps refusing the session")
 
-    def get(self, path, params=None, limit=8 * 1024 * 1024):
+    def get(self, path, params=None, limit=JSON_MAX_BYTES):
         conn, response = self.open(path, params)
         try:
             return read_body(response, limit)
@@ -3248,7 +3276,7 @@ class ProtectSession:
         the console holds, in seconds, or None.
         """
         try:
-            raw = json.loads(self.get("/cameras", limit=32 * 1024 * 1024))
+            raw = json.loads(self.get("/cameras", limit=2 * JSON_MAX_BYTES))
         except (ValueError, RecursionError):
             raise ProtectError("console sent an unreadable camera list")
         modes = {}
@@ -3264,11 +3292,12 @@ class ProtectSession:
             modes[camera["id"]] = {"coverage": RECORDING_MODES.get(mode, "unknown"), "from": oldest}
         return modes
 
-    def export(self, camera_id, start, end, quality, path, limit=None):
+    def export(self, camera_id, start, end, quality, path, limit=None, spend=None):
         """Write the recording between two times (seconds) to path as MP4.
 
         limit: the most bytes to write; the default is for clips kept in
-        memory (the runtime dir).
+        memory (the runtime dir). spend: called with each chunk's size
+        before it is written, to raise when a shared budget runs out.
         """
         try:
             conn, response = self.open("/video/export", params={
@@ -3281,7 +3310,8 @@ class ProtectSession:
         partial = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.part"
         written = 0
         try:
-            with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as out:
+            # A new file of its own, never one planted there or a link.
+            with open(os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w+b") as out:
                 while True:
                     chunk = response.read(256 * 1024)
                     if not chunk:
@@ -3290,9 +3320,11 @@ class ProtectSession:
                     if written > (limit or CLIPS_MAX_BYTES):
                         raise ProtectError("the clip is too large to save; try a shorter stretch" if limit else
                                            "the clip is too large to keep in memory; try a lower quality")
+                    if spend:
+                        spend(len(chunk))
                     out.write(chunk)
-            with open(partial, "rb") as handle:
-                head = handle.read(12)
+                out.seek(0)
+                head = out.read(12)
             if response.length:
                 raise ProtectError("the console stopped sending the clip partway; try again")
             # An MP4 starts with an "ftyp" box; anything else is an error page.
@@ -3367,7 +3399,7 @@ class DemoSession:
         with open(os.path.join(DEMO_DIR, f"{camera}.jpg"), "rb") as handle:
             return handle.read()
 
-    def export(self, camera_id, start, end, quality, path, limit=None):
+    def export(self, camera_id, start, end, quality, path, limit=None, spend=None):
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise ProtectError("demo mode needs ffmpeg")
@@ -3483,7 +3515,9 @@ TIMELINE_DIR = os.path.join(RUNTIME_DIR, "timeline")
 TIMELINE_HOURS = 24
 TIMELINE_EVENTS = 1000          # per camera
 TIMELINE_EVENT_PAD = 10         # seconds a detections-only camera records either side
-TIMELINE_CLIP_SECONDS = 600     # the longest stretch one request may export
+TIMELINE_CLIP_SECONDS = 60      # the longest stretch one request may export (the window's minute)
+TIMELINE_CLIP_MAX_BYTES = 200 * 1024 * 1024     # one clip; a minute of 4K is about 50 MB
+TIMELINE_FETCHING_MAX_BYTES = 300 * 1024 * 1024  # all clips being fetched at once
 TIMELINE_CLIPS_KEEP = 80
 TIMELINE_CLIPS_MAX_BYTES = 500 * 1024 * 1024   # clips live in RAM (the runtime dir)
 TIMELINE_SLOT = re.compile(r"[a-z]{1,8}")
@@ -3599,6 +3633,52 @@ def videos_dir():
     return os.path.join(home, "Videos")
 
 
+SAVED_CLIP_PARTIAL = re.compile(r".+\.mp4\.(\d+)\.[0-9a-f]{8}\.part")
+
+
+def saved_clips_dir():
+    """The folder saved clips go to, made if need be: ours, and a real folder.
+
+    The videos folder may be anywhere the user dirs say, a shared drive
+    included. A folder someone else owns, or a link to one, is refused:
+    its owner could swap what is written there.
+    """
+    folder = os.path.join(videos_dir(), SAVED_CLIPS_FOLDER)
+    try:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        info = os.lstat(folder)
+    except OSError as error:
+        raise ProtectError(f"cannot save to {folder}: {error.strerror or error}")
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ProtectError(f"cannot save to {folder}: it is a link, or not your own folder")
+    return folder
+
+
+def remove_partial_saves(folder, pid=None, older_than=None):
+    """Remove half-written saved clips: this process's, or old ones.
+
+    Only files named the way an export names its unfinished file.
+    """
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        match = SAVED_CLIP_PARTIAL.fullmatch(name)
+        if not match:
+            continue
+        path = os.path.join(folder, name)
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            if (pid is not None and int(match.group(1)) == pid) or \
+                    (older_than is not None and info.st_mtime < time.time() - older_than):
+                os.remove(path)
+        except OSError:
+            pass
+
+
 def saved_clip_path(folder, name, start):
     """A file name not yet taken: the camera's name and the clip's start.
 
@@ -3655,6 +3735,9 @@ class TimelineServer:
         self.sessions = {}      # console id -> (session, made at)
         self.clip_locks = {}    # path -> [lock, users]
         self.save_lock = threading.Lock()
+        self.fetching = 0       # bytes of clips being fetched
+        self.saved_to = None    # the folder a save is writing in
+        self.demo = demo_on()
         self.stills = {}        # (uid, slot) -> paths, oldest first
         self.counter = 0
         self.serial = 0
@@ -3675,12 +3758,18 @@ class TimelineServer:
         """
         with self.lock:
             stamp = self.stamp()
-            if stamp != self.config_stamp:
-                fresh = None if demo_on() else load_config()
-                if fresh:
-                    self.config, self.config_stamp = fresh, stamp
-                    self.sessions.clear()
-                    _key_cache.clear()
+            if demo_on() != self.demo:
+                # Demo mode switched under an open window: nothing of the
+                # other kind is served, and no login is kept.
+                self.config, self.config_stamp = {"consoles": []}, stamp
+                self.sessions.clear()
+                _key_cache.clear()
+            elif stamp != self.config_stamp and not self.demo:
+                # A config that is gone (the last console removed) is an
+                # empty one: its logins must not live on in this process.
+                self.config, self.config_stamp = load_config() or {"consoles": []}, stamp
+                self.sessions.clear()
+                _key_cache.clear()
             console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
             if console is None:
                 raise ProtectError("no such console")
@@ -3798,21 +3887,40 @@ class TimelineServer:
         camera_id, session = self.target(request)
         if hasattr(session, "footage"):     # demo mode's gaps
             session.footage(camera_id, start, end)
-        folder = os.path.join(videos_dir(), SAVED_CLIPS_FOLDER)
-        try:
-            os.makedirs(folder, mode=0o700, exist_ok=True)
-        except OSError as error:
-            raise ProtectError(f"cannot save to {folder}: {error.strerror or error}")
+        folder = saved_clips_dir()
         # One at a time: two saves of one moment get two names, and a
         # console is not asked for several long exports at once.
         with self.save_lock:
+            self.saved_to = folder
+            remove_partial_saves(folder, older_than=CLIP_DEADLINE)
             path = saved_clip_path(folder, camera_name(request["uid"]), start)
             session.export(camera_id, start, end, quality, path, limit=SAVED_CLIP_MAX_BYTES)
         return {"path": path, "start": start, "end": end}
 
+    def fetch(self, session, camera_id, start, end, quality, path):
+        """Export a clip into memory, within what all of them may take.
+
+        Clips live in RAM. A console decides how much it sends, and several
+        are fetched at once: without a budget for those under way, six of
+        them could fill the runtime directory, which the whole session uses.
+        """
+        spent = [0]
+
+        def spend(size):
+            with self.lock:
+                if self.fetching + size > TIMELINE_FETCHING_MAX_BYTES:
+                    raise ProtectError("too much video is being fetched at once; try again in a moment")
+                self.fetching += size
+                spent[0] += size
+        try:
+            session.export(camera_id, start, end, quality, path, limit=TIMELINE_CLIP_MAX_BYTES, spend=spend)
+        finally:
+            with self.lock:
+                self.fetching -= spent[0]
+
     def clip(self, request):
         start, end, quality = self.number(request, "start"), self.number(request, "end"), self.quality(request)
-        if not 1 <= end - start <= TIMELINE_CLIP_SECONDS:
+        if not 1 <= end - start <= TIMELINE_CLIP_SECONDS + 1:
             raise ProtectError("no such stretch of time")
         if end > time.time() + 60:
             raise NoFootage("that time has not happened yet")
@@ -3835,7 +3943,7 @@ class TimelineServer:
                     if hasattr(session, "footage"):     # demo mode's gaps
                         session.footage(camera_id, start, end)
                     self.make(os.path.dirname(path))
-                    session.export(camera_id, start, end, quality, path)
+                    self.fetch(session, camera_id, start, end, quality, path)
         finally:
             with self.lock:
                 entry[1] -= 1
@@ -3868,6 +3976,9 @@ class TimelineServer:
 
     def cleanup(self):
         shutil.rmtree(self.folder, ignore_errors=True)
+        # A save cut off as the window closed: its half-written file goes.
+        if self.saved_to:
+            remove_partial_saves(self.saved_to, pid=os.getpid())
 
 
 class Superseded(Exception):
