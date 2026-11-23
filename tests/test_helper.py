@@ -415,6 +415,52 @@ class ConsoleInput(unittest.TestCase):
         moved = h.merge_cameras([cam("gw_old", False), cam("nvr_new", True)])
         self.assertEqual([c["uid"] for c in moved], ["nvr_new"])
 
+    def test_settings_stay_with_the_camera_that_had_them(self):
+        mac = "aabbccddeeff"
+
+        def cam(uid, online=True, **more):
+            return dict({"uid": uid, "mac": mac, "online": online, "consoleName": uid, "name": "Door"}, **more)
+
+        def keys(cameras):
+            return {c["uid"]: h.camera_key(c) for c in cameras}
+
+        # The camera armed under this MAC keeps it when another console
+        # claims it, whichever is listed first, poll after poll.
+        state = [cam("nvr_real")]
+        for listed in ([cam("gw_fake"), cam("nvr_real")], [cam("nvr_real"), cam("gw_fake")]):
+            for _ in range(3):
+                merged = h.merge_cameras([dict(c) for c in listed], state)
+                self.assertEqual(keys(merged), {"nvr_real": mac, "gw_fake": "gw_fake"})
+                self.assertTrue(all(c["macConflict"] for c in merged))
+                state = merged
+            state = [cam("nvr_real")]
+        prefs = dict(h.load_prefs(), alerts={mac: ["person", "ring"]}, favorite=mac, hidden=[])
+        applied = {c["uid"]: c for c in h.apply_prefs(h.merge_cameras([cam("gw_fake"), cam("nvr_real")],
+                                                                      [cam("nvr_real")]), prefs)}
+        self.assertEqual(applied["nvr_real"]["alerts"], ["person", "ring"])
+        self.assertEqual(applied["gw_fake"]["alerts"], [])
+        self.assertFalse(applied["gw_fake"]["favorite"])
+        # Also while its console cannot be reached (its last entry, stale).
+        merged = h.merge_cameras([cam("gw_fake"), cam("nvr_real", online=False, stale=True)], [cam("nvr_real")])
+        self.assertEqual(keys(merged), {"nvr_real": mac, "gw_fake": "gw_fake"})
+        # Claimed while it was offline, it gets its MAC back when it returns...
+        state = h.merge_cameras([cam("gw_fake"), cam("nvr_real", online=False)], [cam("nvr_real")])
+        self.assertEqual(keys(state), {"gw_fake": mac})
+        state = h.merge_cameras([cam("nvr_real", online=False), cam("gw_fake")], state)    # still away
+        self.assertEqual(keys(state), {"gw_fake": mac})
+        back = h.merge_cameras([cam("gw_fake"), cam("nvr_real")], state)
+        self.assertEqual(keys(back), {"nvr_real": mac, "gw_fake": "gw_fake"})
+        # ...and a console listing an offline camera with its MAC earns no such claim.
+        state = h.merge_cameras([cam("gw_fake", online=False), cam("nvr_real")], [cam("nvr_real")])
+        self.assertEqual(keys(state), {"nvr_real": mac})
+        self.assertEqual(keys(h.merge_cameras([cam("gw_fake"), cam("nvr_real")], state)),
+                         {"nvr_real": mac, "gw_fake": "gw_fake"})
+        # A camera really moved keeps its settings on its new console.
+        moved = h.merge_cameras([cam("gw_old", online=False), cam("nvr_new")], [cam("gw_old")])
+        self.assertEqual(keys(moved), {"nvr_new": mac})
+        # Neither had it: neither gets it.
+        self.assertEqual(keys(h.merge_cameras([cam("a_x"), cam("b_y")], [])), {"a_x": "a_x", "b_y": "b_y"})
+
     def test_snapshots_of_cameras_no_longer_listed_are_removed(self):
         os.makedirs(h.SNAP_DIR, exist_ok=True)
         for uid in ("nvr_a", "nvr_gone"):

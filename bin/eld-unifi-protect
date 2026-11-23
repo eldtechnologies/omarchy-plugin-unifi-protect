@@ -4031,16 +4031,44 @@ def find_cameras(cameras, wanted):
     return []
 
 
-def merge_cameras(cameras):
+def merge_cameras(cameras, previous=()):
     """Drop stale copies of a camera that moved between consoles.
 
     A camera moved from a gateway to an NVR stays listed on the gateway as
     DISCONNECTED. Keep one entry per MAC, preferring a connected one, so the
-    ghost never hides the live copy. Only an offline copy ever gives way:
-    when two consoles both report the same MAC online, both are kept, so a
-    console cannot make another's camera vanish (and take over its name,
-    favourite and alerts) by claiming its MAC.
+    ghost never hides the live copy. Only a copy its own console reports
+    offline ever gives way.
+
+    A console can claim any MAC. When two consoles both hold one (online,
+    or last seen so on a console that cannot be reached now), both cameras
+    are kept, and the settings saved under that MAC stay with the one that
+    had them (previous: the last camera list); the newcomer's are kept
+    under its own id. So a console cannot hide, disarm or impersonate
+    another's camera by claiming its MAC, nor by claiming it while that
+    camera is briefly offline: the camera gets its MAC back when it
+    returns. When neither had it, neither gets it.
     """
+    # MAC -> (the uid that held it, the uid it took it over from, if any)
+    holders = {c["mac"]: (c.get("uid"), c.get("macFrom")) for c in previous if c.get("mac")}
+
+    def incumbent(mac, one, other):
+        uid, taken_from = holders.get(mac, (None, None))
+        for keeper, claimant in ((one, other), (other, one)):
+            if keeper["uid"] == uid:
+                # Taken over from the other while that was offline: it is back.
+                return claimant if taken_from == claimant["uid"] else keeper
+        return None
+
+    def gone(camera):
+        return not camera["online"] and not camera.get("stale")
+
+    def took_over(taker, ghost, mac):
+        # Remembered only where the ghost really had the MAC before: a
+        # console listing an offline camera with another's MAC earns nothing.
+        uid, taken_from = holders.get(mac, (None, None))
+        if uid == ghost["uid"] or (uid == taker["uid"] and taken_from == ghost["uid"]):
+            taker["macFrom"] = ghost["uid"]
+
     best = {}
     order = []
     seen = set()
@@ -4048,18 +4076,29 @@ def merge_cameras(cameras):
         if camera["uid"] in seen:
             continue      # a console listing one camera twice
         seen.add(camera["uid"])
+        camera.pop("macFrom", None)
         key = camera["mac"] or camera["uid"]
         if key not in best:
             best[key] = camera
             order.append(key)
-        elif camera["online"] and not best[key]["online"]:
+            continue
+        current = best[key]
+        if gone(camera):
+            if not gone(current):
+                took_over(current, camera, key)
+            continue
+        if gone(current):
+            took_over(camera, current, key)
             best[key] = camera
-        elif camera["online"] and best[key]["online"] and camera["uid"] not in best:
-            # Two consoles claim one MAC online: keep both, and key their
-            # settings by uid, so neither can hide, disarm or impersonate the
-            # other through a MAC-keyed setting.
-            for copy in (best[key], camera):
-                copy["mac"], copy["macConflict"] = "", True
+        elif camera["uid"] not in best:
+            keeper = incumbent(key, current, camera)
+            for copy in (current, camera):
+                copy["macConflict"] = True
+                copy.pop("macFrom", None)
+                if copy is not keeper:
+                    copy["mac"] = ""
+            if keeper is camera:
+                best[key], camera = camera, current
             best[camera["uid"]] = camera
             order.append(camera["uid"])
     return sorted((best[k] for k in order), key=lambda c: (c["consoleName"].lower(), c["name"].lower()))
@@ -4147,7 +4186,7 @@ def poll_cameras(config=None):
         "consoles": summaries,
         "hideOffline": load_prefs()["hideOffline"],
         "alertNotify": load_prefs()["notify"],
-        "cameras": demo_arming(apply_prefs(merge_cameras(cameras), load_prefs())),
+        "cameras": demo_arming(apply_prefs(merge_cameras(cameras, previous_cameras), load_prefs())),
     }
     write_json(STATE_PATH, state)
     return state
@@ -4792,8 +4831,8 @@ def cmd_cameras(args):
     conflicts = [c for c in state["cameras"] if c.get("macConflict")]
     if conflicts:
         # Two consoles report one camera online: one of them may be lying.
-        print("! these cameras share a MAC address across consoles, so their settings are kept\n"
-              "  per console and earlier ones no longer apply; check which console is right: "
+        print("! these cameras share a MAC address across consoles; the settings saved for that\n"
+              "  camera stay with the one that had them. Check which console is right: "
               + ", ".join(f"{c['name']} ({c['consoleName']})" for c in conflicts), file=sys.stderr)
 
 
