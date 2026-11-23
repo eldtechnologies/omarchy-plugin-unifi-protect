@@ -1245,7 +1245,53 @@ def is_complete_jpeg(data):
     Some cameras pad the file after the end marker, so trailing zero bytes
     are allowed.
     """
-    return bool(data) and data[:2] == b"\xff\xd8" and data.rstrip(b"\x00")[-2:] == b"\xff\xd9"
+    return (bool(data) and data[:2] == b"\xff\xd8" and data.rstrip(b"\x00")[-2:] == b"\xff\xd9"
+            and jpeg_size_ok(data))
+
+
+JPEG_MAX_SIDE = 8192            # pixels; the largest cameras are about 4000 across
+JPEG_MAX_PIXELS = 40_000_000
+
+
+def jpeg_size_ok(data):
+    """False for a JPEG that says it is larger than any camera's picture.
+
+    A file's size says nothing of what it costs to show: a quarter of a
+    megabyte can declare 959 x 65500 pixels, a quarter of a gigabyte once
+    decoded, in the desktop shell, for every tile. The size is read the
+    way a decoder finds it: marker by marker, up to the first scan.
+    """
+    at, end = 2, len(data)
+    while at < end:
+        at = data.find(b"\xff", at)
+        if at < 0:
+            break
+        while at < end and data[at] == 0xFF:    # fill bytes before a marker
+            at += 1
+        if at >= end:
+            break
+        marker = data[at]
+        at += 1
+        if marker == 0x00 or marker == 0x01 or 0xD0 <= marker <= 0xD8:
+            continue                            # stuffing, or a marker without a length
+        if marker in (0xD9, 0xDA):
+            break                               # the end, or the first scan
+        if at + 2 > end:
+            return False
+        length = int.from_bytes(data[at:at + 2], "big")
+        if length < 2:
+            return False
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if length < 7 or at + 7 > end:
+                return False
+            height = int.from_bytes(data[at + 3:at + 5], "big")
+            width = int.from_bytes(data[at + 5:at + 7], "big")
+            # A height of 0 leaves it to a later marker: not from a camera.
+            return (0 < width <= JPEG_MAX_SIDE and 0 < height <= JPEG_MAX_SIDE
+                    and width * height <= JPEG_MAX_PIXELS)
+        at += length
+    # No frame at all: nothing a decoder would make a picture of.
+    return True
 
 
 # ---- alerts --------------------------------------------------------------

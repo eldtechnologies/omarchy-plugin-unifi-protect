@@ -10,6 +10,7 @@ import time
 import unittest
 from unittest import mock
 
+import helpers
 from helpers import ROOT, helper as h
 
 
@@ -423,6 +424,36 @@ class ConsoleInput(unittest.TestCase):
         h.refresh_snapshots({"consoles": []}, [{"uid": "nvr_a", "console": "nvr", "online": False}], index)
         self.assertEqual(sorted(os.listdir(h.SNAP_DIR)), sorted(["nvr_a.jpg", os.path.basename(h.SNAP_INDEX)]))
         self.assertEqual(index, {"nvr_a": 1})
+
+class Pictures(unittest.TestCase):
+    @staticmethod
+    def jpeg(width, height, sof=0xC0, before=b""):
+        frame = bytes([0xFF, sof]) + (17).to_bytes(2, "big") + b"\x08" + height.to_bytes(2, "big") \
+            + width.to_bytes(2, "big") + b"\x03" + bytes(9)
+        app0 = b"\xff\xe0" + (16).to_bytes(2, "big") + b"JFIF\0" + bytes(9)
+        return b"\xff\xd8" + app0 + before + frame + b"\xff\xda\x00\x08" + bytes(6) + b"scan" + b"\xff\xd9"
+
+    def test_a_picture_larger_than_any_camera_makes_is_refused(self):
+        # A small file can declare a picture that costs a quarter of a
+        # gigabyte to show, in the desktop shell, for every tile.
+        for size in ((640, 360), (3840, 2160), (4000, 3000), (8192, 4320)):
+            self.assertTrue(h.is_complete_jpeg(self.jpeg(*size)), size)
+        for size in ((959, 65500), (65500, 959), (8193, 100), (100, 8193), (8192, 8192), (0, 100), (100, 0)):
+            self.assertFalse(h.is_complete_jpeg(self.jpeg(*size)), size)
+        # Progressive and other kinds of frame; the size found the way a
+        # decoder finds it, past fill bytes, stray bytes and a comment
+        # that itself looks like a small frame's header.
+        self.assertFalse(h.is_complete_jpeg(self.jpeg(959, 65500, sof=0xC2)))
+        self.assertTrue(h.is_complete_jpeg(self.jpeg(1920, 1080, sof=0xC2)))
+        decoy = b"\xff\xfe" + (21).to_bytes(2, "big") + b"\xff\xc0\x00\x11\x08\x00\x10\x00\x10" + bytes(10)
+        for before in (b"\xff\xff\xff", b"stray", decoy, b"\xff\x00"):
+            self.assertFalse(h.is_complete_jpeg(self.jpeg(959, 65500, before=before)), before)
+            self.assertTrue(h.is_complete_jpeg(self.jpeg(1280, 720, before=before)), before)
+        # Cut short inside a header is no picture.
+        self.assertFalse(h.is_complete_jpeg(b"\xff\xd8\xff\xc0\x00\x11\x08\xff\xd9"))
+        with open(os.path.join(helpers.ROOT, "docs", "demo", "garden.jpg"), "rb") as handle:
+            self.assertTrue(h.is_complete_jpeg(handle.read()))
+
 
 class WallPid(unittest.TestCase):
     def test_stop_signals_only_the_process_it_started(self):
