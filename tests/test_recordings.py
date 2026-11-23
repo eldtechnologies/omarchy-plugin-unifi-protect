@@ -539,6 +539,8 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         self.assertIn(False, results)
         self.assertIn(True, results)
         self.assertTrue(all("at once" in r["error"] for r in replies.values() if not r["ok"]))
+        # Marked as worth asking again: the window does, in a moment.
+        self.assertTrue(all(r.get("busy") for r in replies.values() if not r["ok"]))
         self.assertEqual(server.fetching, 0)
         self.assertEqual(taken, [h.TIMELINE_CLIP_MAX_BYTES] * 4)
 
@@ -618,6 +620,42 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
             server.session("nvr")
         self.assertEqual(server.sessions, {})
         self.assertEqual(server.config, {"consoles": []})
+
+    def test_a_console_added_back_is_found_by_an_open_timeline(self):
+        h.save_config(self.config)
+        server, out = self.timeline_server()
+        os.remove(h.CONFIG_PATH)
+        request = {"op": "still", "uid": f"nvr_{CAMERA}", "at": time.time() - 3600, "quality": "low",
+                   "slot": "grid"}
+        server.handle(dict(request, id=1))
+        self.assertFalse(self.replies(out)[1]["ok"])
+        self.assertEqual(server.config, {"consoles": []})
+        # Requests name cameras, and those are looked up in the config:
+        # it has to be read again before that, not only when signing in.
+        h.save_config(self.config)
+        server.session = lambda console_id: (self.console, mock.Mock(spec=["still"], still=lambda *a: JPEG))
+        server.handle(dict(request, id=2))
+        self.assertTrue(self.replies(out)[2]["ok"], self.replies(out)[2])
+        self.assertEqual([c["id"] for c in server.config["consoles"]], ["nvr"])
+
+    def test_a_clip_too_large_says_what_fits_the_request(self):
+        server, out = self.timeline_server()
+
+        class Huge:
+            def export(self, camera_id, start, end, quality, path, limit=None, spend=None):
+                raise h.ClipTooLarge("the clip is too large to keep in memory; try a lower quality")
+
+        server.session = lambda console_id: (self.console, Huge())
+        start = (time.time() - 7200) // 60 * 60
+        request = {"uid": f"nvr_{CAMERA}", "start": start, "end": start + 60, "quality": "low"}
+        folder = tempfile.mkdtemp()
+        with mock.patch.object(h, "saved_clips_dir", lambda: folder):
+            server.handle(dict(request, id="clip", op="clip"))
+            server.handle(dict(request, id="save", op="save"))
+        replies = self.replies(out)
+        self.assertIn("lower quality", replies["clip"]["error"])
+        self.assertIn("shorter stretch", replies["save"]["error"])
+        shutil.rmtree(folder, ignore_errors=True)
 
     def test_a_saved_clip_is_named_safely(self):
         folder = tempfile.mkdtemp()

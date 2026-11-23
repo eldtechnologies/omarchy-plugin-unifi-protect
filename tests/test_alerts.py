@@ -146,6 +146,19 @@ class ListenerLifecycle(unittest.TestCase):
         lst.handle("gateway", {"item": {"id": "e3", "type": "ring", "device": "cam1"}})
         self.assertEqual(lst.alerts, [])
 
+    def test_an_open_alert_is_closed_after_its_camera_is_disarmed(self):
+        lst = self.listener()
+        lst.save = lambda: None
+        lst.handle("nvr", {"item": {"id": "e5", "type": "ring", "device": "cam1"}})
+        self.assertIsNone(lst.alerts[0]["end"])
+        del lst.armed["nvr"]["cam1"]
+        lst.handle("nvr", {"item": {"id": "e5", "end": int(time.time() * 1000)}})
+        self.assertIsNotNone(lst.alerts[0]["end"])
+        # Nothing new is opened for it, and another console's event of
+        # the same id closes nothing.
+        lst.handle("nvr", {"item": {"id": "e6", "type": "ring", "device": "cam1"}})
+        self.assertEqual(len(lst.alerts), 1)
+
     def test_doorbell_ring(self):
         lst = self.listener()
         lst.handle("nvr", {"item": {"id": "e4", "type": "ring", "device": "cam1", "start": 1791700000000}})

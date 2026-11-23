@@ -443,6 +443,7 @@ ShellRoot {
       return
     }
     var what = camera.name + " " + clockText(start, false) + " (" + Math.round(end - start) + " s)"
+    var from = markIn, to = markOut
     saving = true
     saveNoteTimer.stop()
     saveNote = "Saving " + what + "…"
@@ -454,7 +455,8 @@ ShellRoot {
         var path = String(reply.path || "")
         if (home !== "" && path.indexOf(home + "/") === 0) path = "~" + path.slice(home.length)
         shell.saveSaid("Saved " + what + " to " + path, false)
-        shell.clearMarks()
+        // Not marks made since, for the next clip.
+        if (shell.markIn === from && shell.markOut === to) shell.clearMarks()
       } else {
         shell.saveSaid("Could not save " + what + ": "
                        + (reply.noFootage ? "no recording there" : (reply.error || "something went wrong")), true)
@@ -915,6 +917,8 @@ ShellRoot {
 
     function refresh() {
       if (!active || uid === "" || !shell.reviewing || !shell.backendReady || needsLogin) return
+      // A clip still loading out of sight was told to play when it has.
+      if ((shell.scrubbing || shell.paused) && back.clip !== null) back.player.pause()
       if (shell.scrubbing) {
         front.player.pause()
         wantStill()
@@ -1017,7 +1021,10 @@ ShellRoot {
       var old = front
       front = back
       if (!shell.paused && !shell.scrubbing) front.player.play()
+      else front.player.pause()
       if (old.clip !== null) old.player.pause()
+      // What went wrong with the clip before says nothing of this one.
+      problem = ""
       showFront()
     }
 
@@ -1034,7 +1041,10 @@ ShellRoot {
     function deckFailed(deck, message) {
       // A clip made ready ahead that will not play is tried again when
       // its minute comes; only the one wanted now is a problem to show.
-      if (deck === front || (deck.clip !== null && deck.clip.chunk === shell.chunkStart)) problem = message
+      // Nor is a full-quality clip that fails while the quick one plays.
+      var playing = deck !== front && front.clip !== null && front.clip.chunk === shell.chunkStart
+      if (deck === front || (deck.clip !== null && deck.clip.chunk === shell.chunkStart && !playing))
+        problem = message
       if (deck !== front) {
         if (shown === deck) shown = front
         deck.release()
@@ -1080,6 +1090,11 @@ ShellRoot {
           playback.refresh()
           return
         }
+        if (reply.busy) {
+          // More being fetched at once than the helper holds: in a moment.
+          retryTimer.restart()
+          return
+        }
         if (!reply.ok) {
           playback.failedChunk = chunk
           playback.dropClips()
@@ -1115,8 +1130,14 @@ ShellRoot {
           playback.refresh()
           return
         }
+        if (reply.busy || chunk !== shell.chunkStart) {
+          // Not this time: asked again when the playhead is in that minute.
+          if (playback.upgradeChunk === chunk) playback.upgradeChunk = -1
+          if (reply.busy) retryTimer.restart()
+          return
+        }
         // Without it the quick clip stays; this minute is not asked again.
-        if (!reply.ok || chunk !== shell.chunkStart) return
+        if (!reply.ok) return
         playback.loadClip({ path: reply.path, start: reply.start, end: reply.end, chunk: chunk,
                             seek: shell.seekSerial, quality: playback.quality })
       })
@@ -1178,6 +1199,12 @@ ShellRoot {
         playback.loadClip({ path: reply.path, start: reply.start, end: reply.end, chunk: next,
                             seek: shell.seekSerial, quality: playback.quality })
       })
+    }
+
+    Timer {
+      id: retryTimer
+      interval: 2000
+      onTriggered: playback.refresh()
     }
 
     onActiveChanged: {

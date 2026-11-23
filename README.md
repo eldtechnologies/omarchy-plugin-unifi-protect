@@ -224,8 +224,9 @@ says so and opens nothing).
 
 It starts live. Click or drag anywhere on the timeline and every camera on
 screen goes to that moment: still frames while you drag, then the
-recordings from there, playing on in step. Drag to the right-hand end, press
-`End` or click **Go live** to return to live.
+recordings from there, playing on in step. A drag also marks the stretch
+it covers, ready to [save as a clip](#timeline). Drag to the right-hand
+end, press `End` or click **Go live** to return to live.
 
 | Key | Effect |
 |-----|--------|
@@ -233,6 +234,7 @@ recordings from there, playing on in step. Drag to the right-hand end, press
 | `,` / `.` | Previous / next detection on the cameras shown |
 | Space | Pause / play |
 | `I` / `O`, `S`, `X` | Mark the start / end of a stretch, save it, clear the marks |
+| Drag, `Shift`+drag | Mark a stretch while moving through it / move without marking |
 | `+` / `-`, wheel | Zoom: 1, 6 or 24 hours (the wheel zooms freely, down to 10 minutes; `Shift`+wheel pans) |
 | `End`, Backspace | Back to live |
 | Enter, click, `1`–`9` | Enlarge a camera (high quality, with sound); again for the grid |
@@ -254,9 +256,8 @@ quality. Mark the stretch by dragging along the timeline, or with `I` at
 its start and `O` at its end, up to ten minutes (hold Shift to drag
 without marking). While a stretch is marked, a **Save clip** button at
 the top right does the same as `S`. Without marks, `S` saves the half
-minute around the playhead.
-The file is private to you (mode 0600), like everything else the plugin
-writes.
+minute around the playhead. The file is private to you (mode 0600), like
+everything else the plugin writes.
 
 Recordings play in one-minute clips at low quality in the grid
 (`--playback-quality`) and at the enlarged quality for an enlarged camera.

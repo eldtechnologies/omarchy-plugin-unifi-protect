@@ -99,6 +99,10 @@ class NotFound(ProtectError):
     """The console answered 404."""
 
 
+class ClipTooLarge(ProtectError):
+    """A console sent more of a clip than there is room for."""
+
+
 class NoFootage(ProtectError):
     """The console holds no recording for the time asked for."""
 
@@ -1988,7 +1992,10 @@ class AlertListener:
         self.refresh()
         camera = self.armed.get(console_id, {}).get(camera_id)
         if camera is None:
-            return      # not armed: nothing to remember either
+            # Not armed: nothing to remember either. An alert opened while
+            # it was armed is still closed.
+            self.close(console_id, event_id, item)
+            return
         self.event_cameras[key] = camera_id
         if event_time(item.get("start")) is not None:
             # Updates may omit the start, like the device: remember it.
@@ -2030,18 +2037,35 @@ class AlertListener:
             self.alerts.append(existing)
             changed = True
             self.on_new_alert(console_id, camera, existing)
-        if existing is not None and item.get("end") and not existing.get("end"):
-            end = event_time(item["end"])
-            if end is not None and end <= now + ALERT_SKEW:
-                existing["end"] = max(existing["start"], min(end, now))
-                changed = True
+        if self.ended(existing, item, now):
+            changed = True
         if changed:
-            # A new alert is written at once (they are capped per camera);
-            # other changes at most once a second, run() flushing the rest.
-            if kind_is_new or time.monotonic() - self.last_save >= 1:
-                self.save()
-            else:
-                self.dirty = True
+            self.changed(kind_is_new)
+
+    @staticmethod
+    def ended(alert, item, now):
+        """Note the event's end on its alert; True when that changed it."""
+        if alert is None or not item.get("end") or alert.get("end"):
+            return False
+        end = event_time(item["end"])
+        if end is None or end > now + ALERT_SKEW:
+            return False
+        alert["end"] = max(alert["start"], min(end, now))
+        return True
+
+    def close(self, console_id, event_id, item):
+        existing = next((a for a in self.alerts
+                         if a["id"] == event_id and str(a.get("uid", "")).startswith(console_id + "_")), None)
+        if self.ended(existing, item, time.time()):
+            self.changed(False)
+
+    def changed(self, at_once):
+        # A new alert is written at once (they are capped per camera);
+        # other changes at most once a second, run() flushing the rest.
+        if at_once or time.monotonic() - self.last_save >= 1:
+            self.save()
+        else:
+            self.dirty = True
 
     def allow_new_alert(self, uid, now):
         """At most ALERTS_PER_MINUTE new alerts per camera: no console flood."""
@@ -3318,11 +3342,14 @@ class ProtectSession:
                         break
                     written += len(chunk)
                     if written > (limit or CLIPS_MAX_BYTES):
-                        raise ProtectError("the clip is too large to save; try a shorter stretch" if limit else
-                                           "the clip is too large to keep in memory; try a lower quality")
+                        raise ClipTooLarge("the clip is too large to keep in memory; try a lower quality")
                     if spend:
                         spend(len(chunk))
-                    out.write(chunk)
+                    try:
+                        out.write(chunk)
+                    except OSError as error:
+                        # Ours, not the console's: a full disk, say.
+                        raise ProtectError(f"cannot write the clip: {error.strerror or error}")
                 out.seek(0)
                 head = out.read(12)
             if response.length:
@@ -3756,20 +3783,8 @@ class TimelineServer:
         console was away is tried again after a while, and a login added or
         replaced meanwhile (the config file changes) is picked up.
         """
+        self.refresh_config()
         with self.lock:
-            stamp = self.stamp()
-            if demo_on() != self.demo:
-                # Demo mode switched under an open window: nothing of the
-                # other kind is served, and no login is kept.
-                self.config, self.config_stamp = {"consoles": []}, stamp
-                self.sessions.clear()
-                _key_cache.clear()
-            elif stamp != self.config_stamp and not self.demo:
-                # A config that is gone (the last console removed) is an
-                # empty one: its logins must not live on in this process.
-                self.config, self.config_stamp = load_config() or {"consoles": []}, stamp
-                self.sessions.clear()
-                _key_cache.clear()
             console = next((c for c in self.config["consoles"] if c["id"] == console_id), None)
             if console is None:
                 raise ProtectError("no such console")
@@ -3781,6 +3796,27 @@ class TimelineServer:
                 session = ProtectSession(console, self.config)
                 self.sessions[console_id] = (session, time.monotonic())
             return console, session
+
+    def refresh_config(self):
+        """Follow the config file and demo mode as they change under the window.
+
+        Before anything is looked up in the config: a console removed and
+        added back must be found again. A config that is gone (the last
+        console removed) or unreadable is an empty one, so its logins do
+        not live on in this process; nor do those of the other kind when
+        demo mode is switched.
+        """
+        with self.lock:
+            stamp, demo = self.stamp(), demo_on()
+            if demo == self.demo and (demo or stamp == self.config_stamp):
+                return
+            try:
+                config = load_config()
+            except ProtectError:
+                config = None
+            self.config, self.config_stamp, self.demo = config or {"consoles": []}, stamp, demo
+            self.sessions.clear()
+            _key_cache.clear()
 
     def make(self, folder):
         """A private folder inside this server's own (private too)."""
@@ -3799,6 +3835,7 @@ class TimelineServer:
         request_id = request.get("id") if isinstance(request, dict) else None
         try:
             op = request.get("op")
+            self.refresh_config()
             if op == "index":
                 uids = [u for u in request.get("uids") or [] if isinstance(u, str)][:64]
                 result = timeline_index(self.config, uids,
@@ -3818,6 +3855,8 @@ class TimelineServer:
             self.reply(request_id, ok=False, needsLogin=True, error=str(error))
         except Superseded:
             self.reply(request_id, ok=False, superseded=True, error="superseded")
+        except Busy as error:
+            self.reply(request_id, ok=False, busy=True, error=str(error))
         except ProtectError as error:
             self.reply(request_id, ok=False, error=str(error))
         except Exception:     # one bad answer from a console must not end the server
@@ -3894,7 +3933,10 @@ class TimelineServer:
             self.saved_to = folder
             remove_partial_saves(folder, older_than=CLIP_DEADLINE)
             path = saved_clip_path(folder, camera_name(request["uid"]), start)
-            session.export(camera_id, start, end, quality, path, limit=SAVED_CLIP_MAX_BYTES)
+            try:
+                session.export(camera_id, start, end, quality, path, limit=SAVED_CLIP_MAX_BYTES)
+            except ClipTooLarge:
+                raise ProtectError("the clip is too large to save; try a shorter stretch")
         return {"path": path, "start": start, "end": end}
 
     def fetch(self, session, camera_id, start, end, quality, path):
@@ -3909,7 +3951,7 @@ class TimelineServer:
         def spend(size):
             with self.lock:
                 if self.fetching + size > TIMELINE_FETCHING_MAX_BYTES:
-                    raise ProtectError("too much video is being fetched at once; try again in a moment")
+                    raise Busy("too much video is being fetched at once; try again in a moment")
                 self.fetching += size
                 spent[0] += size
         try:
@@ -3979,6 +4021,10 @@ class TimelineServer:
         # A save cut off as the window closed: its half-written file goes.
         if self.saved_to:
             remove_partial_saves(self.saved_to, pid=os.getpid())
+
+
+class Busy(ProtectError):
+    """Too much is being fetched just now; the same request works in a moment."""
 
 
 class Superseded(Exception):
@@ -4252,6 +4298,14 @@ def merge_cameras(cameras, previous=()):
                 best[key], camera = camera, current
             best[camera["uid"]] = camera
             order.append(camera["uid"])
+    for mac, (uid, taken_from) in holders.items():
+        camera = best.get(mac)
+        # The camera it took the MAC over from is not listed just now (its
+        # console cannot be reached, and it had dropped out as a ghost):
+        # still remembered, so that camera gets its MAC back on return.
+        if taken_from and camera is not None and camera["uid"] == uid and camera["mac"] == mac \
+                and not camera.get("macConflict"):
+            camera.setdefault("macFrom", taken_from)
     return sorted((best[k] for k in order), key=lambda c: (c["consoleName"].lower(), c["name"].lower()))
 
 

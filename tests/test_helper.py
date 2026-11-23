@@ -450,6 +450,14 @@ class ConsoleInput(unittest.TestCase):
         self.assertEqual(keys(state), {"gw_fake": mac})
         back = h.merge_cameras([cam("gw_fake"), cam("nvr_real")], state)
         self.assertEqual(keys(back), {"nvr_real": mac, "gw_fake": "gw_fake"})
+        # ...also when its console could not be reached for a poll meanwhile
+        # (it had dropped out as a ghost, so nothing of it is listed then).
+        state = h.merge_cameras([cam("gw_fake"), cam("nvr_real", online=False)], [cam("nvr_real")])
+        for _ in range(2):
+            state = h.merge_cameras([cam("gw_fake")], state)
+            self.assertEqual(keys(state), {"gw_fake": mac})
+        back = h.merge_cameras([cam("gw_fake"), cam("nvr_real")], state)
+        self.assertEqual(keys(back), {"nvr_real": mac, "gw_fake": "gw_fake"})
         # ...and a console listing an offline camera with its MAC earns no such claim.
         state = h.merge_cameras([cam("gw_fake", online=False), cam("nvr_real")], [cam("nvr_real")])
         self.assertEqual(keys(state), {"nvr_real": mac})
