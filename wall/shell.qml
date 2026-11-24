@@ -901,6 +901,12 @@ ShellRoot {
     property int epoch: 0
     // "", "nofootage", or what went wrong.
     property string problem: ""
+    // The helper had too much to fetch: no clip is asked for before then.
+    property real busyUntil: 0
+    function busy() {
+      busyUntil = Date.now() + retryTimer.interval
+      retryTimer.restart()
+    }
 
     // A clip is worth showing in the minute it is for. After a jump an
     // older one is not; when a minute simply runs into the next, the old
@@ -1043,8 +1049,11 @@ ShellRoot {
       // its minute comes; only the one wanted now is a problem to show.
       // Nor is a full-quality clip that fails while the quick one plays.
       var playing = deck !== front && front.clip !== null && front.clip.chunk === shell.chunkStart
-      if (deck === front || (deck.clip !== null && deck.clip.chunk === shell.chunkStart && !playing))
-        problem = message
+      var wanted = deck !== front && deck.clip !== null && deck.clip.chunk === shell.chunkStart && !playing
+      if (deck === front || wanted) problem = message
+      // The helper would hand the same file over again: not asked for
+      // again in this minute.
+      if (wanted) failedChunk = shell.chunkStart
       if (deck !== front) {
         if (shown === deck) shown = front
         deck.release()
@@ -1072,7 +1081,7 @@ ShellRoot {
           return
         }
       }
-      if (askedChunk === chunk || failedChunk === chunk) return
+      if (askedChunk === chunk || failedChunk === chunk || Date.now() < busyUntil) return
       var end = Math.min(chunk + shell.chunkSeconds, Math.floor(Date.now() / 1000) - shell.recordLag)
       if (end - chunk < 2) return
       askedChunk = chunk
@@ -1092,7 +1101,7 @@ ShellRoot {
         }
         if (reply.busy) {
           // More being fetched at once than the helper holds: in a moment.
-          retryTimer.restart()
+          playback.busy()
           return
         }
         if (!reply.ok) {
@@ -1116,7 +1125,8 @@ ShellRoot {
     // which takes over when it lands.
     function wantUpgrade() {
       var chunk = shell.chunkStart
-      if (quickQuality === "" || quickQuality === quality || upgradeChunk === chunk) return
+      if (quickQuality === "" || quickQuality === quality || upgradeChunk === chunk
+          || Date.now() < busyUntil) return
       var held = front.clip !== null && front.clip.chunk === chunk ? front.clip
                : back.clip !== null && back.clip.chunk === chunk ? back.clip : null
       if (held === null || held.quality === quality) return
@@ -1133,7 +1143,7 @@ ShellRoot {
         if (reply.busy || chunk !== shell.chunkStart) {
           // Not this time: asked again when the playhead is in that minute.
           if (playback.upgradeChunk === chunk) playback.upgradeChunk = -1
-          if (reply.busy) retryTimer.restart()
+          if (reply.busy) playback.busy()
           return
         }
         // Without it the quick clip stays; this minute is not asked again.
@@ -1170,7 +1180,7 @@ ShellRoot {
     // there is of it, in the last seconds.
     function fetchAhead() {
       var next = shell.chunkStart + shell.chunkSeconds
-      if (shell.paused || fetchedAhead === next) return
+      if (shell.paused || fetchedAhead === next || Date.now() < busyUntil) return
       var left = next - shell.playhead
       if (left > 20) return
       var recorded = Math.floor(Date.now() / 1000) - shell.recordLag
@@ -1183,7 +1193,13 @@ ShellRoot {
       var mine = epoch
       shell.ask({ op: "clip", uid: uid, start: next, end: end, quality: quality,
                   serial: shell.seekSerial }, function(reply) {
-        if (mine !== playback.epoch || !playback.active || !reply.ok) return
+        if (mine !== playback.epoch || !playback.active) return
+        if (reply.busy) {
+          if (playback.fetchedAhead === next) playback.fetchedAhead = -1
+          playback.busy()
+          return
+        }
+        if (!reply.ok) return
         // Only for the minute coming up, or just begun, and only if
         // nothing has it already or is using the deck out of sight.
         if (next !== shell.chunkStart && next !== shell.chunkStart + shell.chunkSeconds) return

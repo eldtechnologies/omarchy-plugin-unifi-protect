@@ -512,7 +512,7 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         gate, taken = threading.Event(), []
 
         class Greedy:
-            def export(self, camera_id, start, end, quality, path, limit=None, spend=None):
+            def export(self, camera_id, start, end, quality, path, limit=None, spend=None, deadline=None):
                 taken.append(limit)
                 spend(40)
                 gate.wait(5)
@@ -521,7 +521,8 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
 
         server.session = lambda console_id: (self.console, Greedy())
         start = (time.time() - 7200) // 60 * 60
-        with mock.patch.object(h, "TIMELINE_FETCHING_MAX_BYTES", 200):
+        with mock.patch.object(h, "TIMELINE_FETCHING_MAX_BYTES", 200), \
+                mock.patch.object(h, "TIMELINE_FETCH_ROOM", 40):
             threads = [threading.Thread(target=server.handle, args=({
                 "id": n, "op": "clip", "uid": f"nvr_{CAMERA}", "start": start + 60 * n,
                 "end": start + 60 * n + 60, "quality": "low"},)) for n in range(4)]
@@ -543,6 +544,15 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         self.assertTrue(all(r.get("busy") for r in replies.values() if not r["ok"]))
         self.assertEqual(server.fetching, 0)
         self.assertEqual(taken, [h.TIMELINE_CLIP_MAX_BYTES] * 4)
+        # With no room left, the console is not even asked.
+        server.fetching = 190
+        with mock.patch.object(h, "TIMELINE_FETCHING_MAX_BYTES", 200), \
+                mock.patch.object(h, "TIMELINE_FETCH_ROOM", 40):
+            server.handle({"id": "full", "op": "clip", "uid": f"nvr_{CAMERA}", "start": start + 600,
+                           "end": start + 660, "quality": "low"})
+        self.assertTrue(self.replies(out)["full"]["busy"])
+        self.assertEqual(len(taken), 4)
+        server.fetching = 0
 
     def test_a_clip_is_written_to_a_new_file_never_through_a_link(self):
         session = h.ProtectSession(self.console, self.config)
@@ -642,7 +652,7 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         server, out = self.timeline_server()
 
         class Huge:
-            def export(self, camera_id, start, end, quality, path, limit=None, spend=None):
+            def export(self, camera_id, start, end, quality, path, limit=None, spend=None, deadline=None):
                 raise h.ClipTooLarge("the clip is too large to keep in memory; try a lower quality")
 
         server.session = lambda console_id: (self.console, Huge())
@@ -656,6 +666,64 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         self.assertIn("lower quality", replies["clip"]["error"])
         self.assertIn("shorter stretch", replies["save"]["error"])
         shutil.rmtree(folder, ignore_errors=True)
+
+    def test_saved_clips_need_a_folder_nobody_else_can_swap(self):
+        folder = os.path.join(helpers.VIDEOS, "UniFi Protect")
+        shutil.rmtree(folder, ignore_errors=True)
+        os.makedirs(helpers.VIDEOS, exist_ok=True)
+        try:
+            # Anyone may rename things in the folder above: refused...
+            os.chmod(helpers.VIDEOS, 0o777)
+            with self.assertRaisesRegex(h.ProtectError, "not yours alone"):
+                h.saved_clips_dir()
+            # ...unless it is sticky, like /tmp, where only one's own can be.
+            os.chmod(helpers.VIDEOS, 0o1777)
+            self.assertEqual(h.saved_clips_dir(), folder)
+            os.chmod(helpers.VIDEOS, 0o755)
+            os.chmod(folder, 0o777)
+            with self.assertRaisesRegex(h.ProtectError, "anyone may write"):
+                h.saved_clips_dir()
+        finally:
+            os.chmod(helpers.VIDEOS, 0o755)
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_a_config_unreadable_for_a_moment_is_read_again(self):
+        h.save_config(self.config)
+        server, out = self.timeline_server()
+        server.config_stamp = None      # as if the file had just changed
+        with mock.patch.object(h, "load_config", side_effect=h.ProtectError("being rewritten")):
+            server.refresh_config()
+        self.assertEqual([c["id"] for c in server.config["consoles"]], ["nvr"])
+        self.assertIsNone(server.config_stamp)
+        server.refresh_config()
+        self.assertEqual(server.config_stamp, server.stamp())
+
+    def test_a_save_does_not_take_a_worker_from_the_stills(self):
+        server, out = self.timeline_server()
+        ran = {}
+        server.handle = lambda request: ran.setdefault(request["op"], threading.current_thread().name)
+        server.serve([json.dumps({"id": n, "op": op}) for n, op in enumerate(("save", "still", "clip"))], wait=True)
+        self.assertEqual(len(set(name.rsplit("_", 1)[0] for name in ran.values())), 3)
+
+    def test_a_save_may_take_longer_than_a_clip(self):
+        server, out = self.timeline_server()
+        asked = {}
+
+        class Slow:
+            def export(self, camera_id, start, end, quality, path, limit=None, spend=None, deadline=None):
+                asked.update(limit=limit, deadline=deadline)
+                h.write_atomic(path, MP4)
+
+        server.session = lambda console_id: (self.console, Slow())
+        folder = tempfile.mkdtemp()
+        start = time.time() - 3600
+        with mock.patch.object(h, "saved_clips_dir", lambda: folder):
+            server.handle({"id": 1, "op": "save", "uid": f"nvr_{CAMERA}", "start": start, "end": start + 600,
+                           "quality": "high"})
+        shutil.rmtree(folder, ignore_errors=True)
+        self.assertTrue(self.replies(out)[1]["ok"])
+        self.assertEqual(asked, {"limit": h.SAVED_CLIP_MAX_BYTES, "deadline": h.SAVED_CLIP_DEADLINE})
+        self.assertGreater(h.SAVED_CLIP_DEADLINE, h.CLIP_DEADLINE)
 
     def test_a_saved_clip_is_named_safely(self):
         folder = tempfile.mkdtemp()
@@ -721,7 +789,7 @@ class RecordingsAgainstFakeConsole(unittest.TestCase):
         gate = threading.Lock()
 
         class Slow:
-            def export(self, camera_id, start, end, quality, path, limit=None, spend=None):
+            def export(self, camera_id, start, end, quality, path, limit=None, spend=None, deadline=None):
                 with gate:
                     state["running"] += 1
                     state["calls"] += 1
