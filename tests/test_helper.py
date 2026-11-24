@@ -469,6 +469,41 @@ class ConsoleInput(unittest.TestCase):
         # Neither had it: neither gets it.
         self.assertEqual(keys(h.merge_cameras([cam("a_x"), cam("b_y")], [])), {"a_x": "a_x", "b_y": "b_y"})
 
+    def test_who_holds_a_mac_outlives_demo_mode_and_an_unreadable_config(self):
+        mac = "aabbccddeeff"
+        config = {"consoles": [{"id": "nvr", "name": "NVR", "host": "h1", "apiKey": "k"},
+                               {"id": "gw", "name": "GW", "host": "h2", "apiKey": "k"}], "timeoutSec": 2}
+        listed = {}
+
+        def fetch(console, config):
+            return {"cameras": [dict(c) for c in listed.get(console["id"], [])], "error": None}
+
+        def cam(console, online=True):
+            return {"uid": f"{console}_x", "id": "x", "console": console, "mac": mac, "online": online,
+                    "consoleName": console, "name": "Door"}
+
+        def keys(state):
+            return {c["uid"]: h.camera_key(c) for c in state["cameras"]}
+
+        with mock.patch.object(h, "fetch_console", fetch), mock.patch.object(h, "write_json") as written, \
+                mock.patch.object(h, "previous_state", lambda: written.call_args[0][1] if written.called else {}):
+            listed.update(nvr=[cam("nvr")])
+            self.assertEqual(keys(h.poll_cameras(config)), {"nvr_x": mac})
+            # The camera list is replaced meanwhile: a poll that cannot
+            # read the config, and demo mode's own cameras.
+            with mock.patch.object(h, "load_config", side_effect=h.ProtectError("unreadable")):
+                self.assertEqual(h.poll_cameras()["cameras"], [])
+            with mock.patch.object(h, "demo_on", lambda: True):
+                listed.update(demo=[dict(cam("demo"), mac="001122334455")])
+                demo = h.poll_cameras({"consoles": [{"id": "demo", "name": "Demo", "host": "d"}], "timeoutSec": 2})
+                self.assertEqual(keys(demo), {"demo_x": "001122334455"})
+            # Another console claims the MAC while the camera is offline...
+            listed.update(nvr=[cam("nvr", online=False)], gw=[cam("gw")])
+            self.assertEqual(keys(h.poll_cameras(config)), {"gw_x": mac})
+            # ...and the camera has it back when it returns.
+            listed.update(nvr=[cam("nvr")])
+            self.assertEqual(keys(h.poll_cameras(config)), {"nvr_x": mac, "gw_x": "gw_x"})
+
     def test_snapshots_of_cameras_no_longer_listed_are_removed(self):
         os.makedirs(h.SNAP_DIR, exist_ok=True)
         for uid in ("nvr_a", "nvr_gone"):

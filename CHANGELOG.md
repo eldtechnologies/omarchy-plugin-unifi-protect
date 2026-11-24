@@ -47,8 +47,9 @@ From a security review of the whole plugin before this release.
 - **Timeline memory:** clips being fetched share a budget (300 MB) and
   each is limited to 200 MB, so a console sending endless video cannot
   fill the runtime directory, which the whole desktop session uses.
-- **Saved clips:** the folder must be your own and not a link; files are
-  created anew, never through a link; a save cut off by closing the
+- **Saved clips:** the folder must be your own and not a link, with
+  nobody else able to write in it or rename it away; files are created
+  anew, never through a link; a save cut off by closing the
   window no longer leaves its half-written file behind.
 - **Smaller limits:** one time budget per API request across its
   retries, smaller caps on JSON answers, a length limit on stream URLs,
